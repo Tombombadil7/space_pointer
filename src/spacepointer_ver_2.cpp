@@ -2,7 +2,7 @@
  * PROJECT: Universal Space Pointer v7.0
  * FEATURES: 
  * - Auto IP-Geolocation & Manual Phone GPS Sync
- * - Real-time Satellite (SGP4) & Planetary Tracking (Astronomy Lib)
+ * - Real-time Satellite (Sgp4) & Planetary Tracking (Astronomy Lib)
  * - Live Leaflet.js Map Interface
  * - Custom NORAD ID tracking
  * - IMU BNO055 Compensation (Yaw & Pitch) 
@@ -14,7 +14,7 @@
 #include <ArduinoJson.h>
 #include <FastAccelStepper.h>
 #include <Adafruit_BNO055.h>
-#include <SGP4.h>
+#include <Sgp4.h>
 #include <astronomy.h>
 
 // --- הגדרות חומרה (פינים) ---
@@ -28,26 +28,43 @@ AsyncWebServer server(80);
 FastAccelStepperEngine engine = FastAccelStepperEngine();
 FastAccelStepper *stepperAz = NULL, *stepperEl = NULL;
 Adafruit_BNO055 bno = Adafruit_BNO055(55);
-SGP4 satSGP4;
+Sgp4 satSgp4;
 
-// --- מצב מערכת ---
 struct {
-    double lat, lon, alt;       // מיקום הצופה [cite: 10, 57]
-    double targetAz, targetEl;   // זוויות מטרה לביצוע [cite: 5, 36]
-    double satLat, satLon;       // מיקום הלוויין על המפה
-    char name[25] = "ISS";
-    double satSpeed;       // km/s
-    double satAltKm;       // km above Earth surface
-    passinfo nextPass;     // AOS, TCA, LOS data
-    bool passValid = false;
+  // observer location
+  double lat, lon, alt;
+
+  // pointing targets
+  double targetAz, targetEl;
+
+  // satellite map position
+  double satLat, satLon;
+
+  // display data
+  double satSpeed;       // km/s
+  double satAltKm;       // km above Earth surface (satellites) or from Earth center (planets)
+  double satDist;        // km from observer
+
+  // next pass / rise+set
+  bool   nextPassValid  = false;
+  time_t nextPassAOS    = 0;   // unix timestamp — rise time or satellite AOS
+  time_t nextPassLOS    = 0;   // unix timestamp — set time or satellite LOS
+  double nextPassMaxEl  = 0;   // degrees — satellite only, 0 for planets
+
 } sys;
 
-enum TargetType { TYPE_SATELLITE, TYPE_PLANET };
-struct {
-    TargetType type;
-    union { long noradID; Astronomy_Body_t body; };
-    char name[25];
-} current = {TYPE_SATELLITE, .noradID = 25544, "ISS"};
+struct TargetState {
+  TargetType type;
+  union { long noradID; Astronomy_BodyCode body; };
+  char name[25];
+};
+TargetState current = {TYPE_SATELLITE, {.noradID = 25544}, "ISS"};
+
+void DisplayTask(void * p);
+void updateIPLocation();
+void fetchTLE();
+void PhysicsTask(void * p);
+
 
 // --- ממשק משתמש HTML (מאוחסן בזיכרון הפלאש) ---
 const char index_html[] PROGMEM = R"rawliteral(
@@ -209,7 +226,7 @@ const char index_html[] PROGMEM = R"rawliteral(
   </body>
   </html>)rawliteral";
 
-  
+
 // --- לוגיקת שרת וחישובים ---
 
 void updateIPLocation() {
@@ -231,14 +248,15 @@ void fetchTLE() {
     if(http.GET() == 200) {
         StaticJsonDocument<1024> doc;
         deserializeJson(doc, http.getString());
-        satSGP4.setSite(sys.lat, sys.lon, sys.alt);
-        satSGP4.init(current.name, doc["line1"], doc["line2"]);
+        satSgp4.setSite(sys.lat, sys.lon, sys.alt);
+        satSgp4.init(current.name, doc["line1"], doc["line2"]);
     }
     http.end();
 }
 
 void setup() {
     Serial.begin(115200);
+    xTaskCreatePinnedToCore(DisplayTask, "Display", 8000, NULL, 1, NULL, 1); // Core 1 for display updates and next pass calculations
     WiFiManager wm;
     wm.autoConnect("SpaceTracker_AP");
 
@@ -248,12 +266,12 @@ void setup() {
     engine.init();
     stepperAz = engine.stepperConnectToPin(AZ_STEP_PIN);
     stepperEl = engine.stepperConnectToPin(EL_STEP_PIN);
-    if(stepperAz) { stepperAz->setDirectionPin(AZ_DIR_PIN); stepperAz->setAcceleration(8000); stepperAz->setMaxSpeed(4000); }
-    if(stepperEl) { stepperEl->setDirectionPin(EL_DIR_PIN); stepperEl->setAcceleration(8000); stepperEl->setMaxSpeed(4000); }
+    if(stepperAz) { stepperAz->setDirectionPin(AZ_DIR_PIN); stepperAz->setAcceleration(8000); stepperAz->setSpeedInHz(4000); }
+    if(stepperEl) { stepperEl->setDirectionPin(EL_DIR_PIN); stepperEl->setAcceleration(8000); stepperEl->setSpeedInHz(4000); }
     
     bno.begin(); // אתחול חיישן הכוון 
     // הגדרת כתובות שרת (Endpoints)
-    server.on("/", HTTP_GET, [](AsyncWebServerRequest *r){ r->send_P(200, "text/html", index_html); });
+    server.on("/", HTTP_GET, [](AsyncWebServerRequest *r){ r->send(200, "text/html", index_html); });
     
     server.on("/updateLoc", HTTP_GET, [](AsyncWebServerRequest *r){
         sys.lat = r->arg("lat").toDouble(); sys.lon = r->arg("lon").toDouble(); sys.alt = r->arg("alt").toDouble();
@@ -262,20 +280,22 @@ void setup() {
     });
 
     server.on("/set", HTTP_GET, [](AsyncWebServerRequest *r){
-        int type = r->arg("type").toInt();
-        String name = r->arg("name");
-        long val = r->arg("val").toInt();
-        
-        if(type == 0) { 
-            current = {TYPE_SATELLITE, .noradID = val}; 
-            strncpy(current.name, name.c_str(), 20); 
-            fetchTLE(); 
-        } else { 
-            current = {TYPE_PLANET, .body = (Astronomy_Body_t)val}; 
-            strncpy(current.name, name.c_str(), 20); 
-        }
-        r->send(200, "text/plain", "OK");
-    });
+      int type = r->arg("type").toInt();
+      String name = r->arg("name");
+      long val = r->arg("val").toInt();
+      
+      if(type == 0) { 
+          current.type = TYPE_SATELLITE;
+          current.noradID = val;
+          strncpy(current.name, name.c_str(), 20); 
+          fetchTLE(); 
+      } else { 
+          current.type = TYPE_PLANET;
+          current.body = (Astronomy_BodyCode)val;
+          strncpy(current.name, name.c_str(), 20); 
+      }
+      r->send(200, "text/plain", "OK");
+  });
 
     server.on("/data", HTTP_GET, [](AsyncWebServerRequest *r){
       StaticJsonDocument<512> doc;  // bump from 256 — more fields now
@@ -286,8 +306,8 @@ void setup() {
       doc["sLat"]  = sys.satLat;
       doc["sLon"]  = sys.satLon;
       doc["speed"] = sys.satSpeed;
-      doc["alt"]   = satSGP4.satAlt;   // km above Earth
-      doc["dist"]  = satSGP4.satDist;  // km from observer
+      doc["alt"]   = satSgp4.satAlt;   // km above Earth
+      doc["dist"]  = satSgp4.satDist;  // km from observer
   
       if (sys.nextPassValid) {
           struct tm *aos = gmtime(&sys.nextPassAOS);
@@ -318,21 +338,21 @@ void PhysicsTask(void * p) {
 
         if (current.type == TYPE_SATELLITE) {
             // ── 1. Primary position ──────────────────────────────
-            satSGP4.findRunningTime(t->tm_year+1900, t->tm_mon+1, t->tm_mday,
+            satSgp4.findRunningTime(t->tm_year+1900, t->tm_mon+1, t->tm_mday,
                                     t->tm_hour, t->tm_min, t->tm_sec);
-            sys.targetAz = satSGP4.satAz;
-            sys.targetEl = satSGP4.satEl;
-            sys.satLat   = satSGP4.satLat;
-            sys.satLon   = satSGP4.satLon;
+            sys.targetAz = satSgp4.satAz;
+            sys.targetEl = satSgp4.satEl;
+            sys.satLat   = satSgp4.satLat;
+            sys.satLon   = satSgp4.satLon;
 
             // ── 2. Speed: position 1s later, then rewind ─────────
-            double lat1 = satSGP4.satLat, lon1 = satSGP4.satLon, alt1 = satSGP4.satAlt;
-            satSGP4.findRunningTime(t->tm_year+1900, t->tm_mon+1, t->tm_mday,
+            double lat1 = satSgp4.satLat, lon1 = satSgp4.satLon, alt1 = satSgp4.satAlt;
+            satSgp4.findRunningTime(t->tm_year+1900, t->tm_mon+1, t->tm_mday,
                                     t->tm_hour, t->tm_min, t->tm_sec + 1);
-            double dlat = (satSGP4.satLat - lat1) * DEG_TO_RAD * 6371.0;
-            double dlon = (satSGP4.satLon - lon1) * DEG_TO_RAD * 6371.0
+            double dlat = (satSgp4.satLat - lat1) * DEG_TO_RAD * 6371.0;
+            double dlon = (satSgp4.satLon - lon1) * DEG_TO_RAD * 6371.0
                           * cos(lat1 * DEG_TO_RAD);
-            double dalt = satSGP4.satAlt - alt1;
+            double dalt = satSgp4.satAlt - alt1;
             sys.satSpeed = sqrt(dlat*dlat + dlon*dlon + dalt*dalt); // km/s
 
           } else {
@@ -382,62 +402,73 @@ void PhysicsTask(void * p) {
 
 void loop() {} // ריק - הכל מנוהל ב-Tasks
 
-// New task — add this function and register it in setup():
 void DisplayTask(void * p) {
-    // Initialize your display here (e.g. tft.init())
-    static uint32_t lastPassCalc = 0;
+  // Initialize your display here (e.g. tft.init())
+  static uint32_t lastPassCalc = 0;
 
-    for(;;) {
-        // ── Next pass: expensive, run every 30s ──────────────────
-        // Inside DisplayTask, replace the satellite-only guard:
+  for(;;) {
 
-        if (millis() - lastPassCalc > 30000) {
-            time_t now; time(&now);
-        
-            if (current.type == TYPE_SATELLITE) {
-                // ... existing SGP4 nextpass code unchanged ...
-        
-            } else {
-                // ── planet rise/set via Astronomy library ──────────────
-                struct tm *utc = gmtime(&now);
-                Astronomy_Time_t aTime = Astronomy_MakeTime(
-                    utc->tm_year+1900, utc->tm_mon+1, utc->tm_mday,
-                    utc->tm_hour, utc->tm_min, (double)utc->tm_sec);
-                Astronomy_Observer_t obs = { sys.lat, sys.lon, sys.alt };
-        
-                // search up to 1 day ahead for next rise
-                Astronomy_SearchResult rise = Astronomy_SearchRiseSet(
-                    current.body, obs, DIRECTION_RISE, aTime, 1.0);
-                Astronomy_SearchResult set  = Astronomy_SearchRiseSet(
-                    current.body, obs, DIRECTION_SET,  aTime, 1.0);
-        
-                if (rise.status == ASTRO_SUCCESS && set.status == ASTRO_SUCCESS) {
-                    // convert Astronomy_Time_t → unix timestamp
-                    sys.nextPassAOS   = (time_t)((rise.time.ut + 2440587.5 - 2440587.5) * 86400.0);
-                    // simpler: use the tt field directly
-                    sys.nextPassAOS   = (time_t)(rise.time.ut * 86400.0 + 946727935.816); // J2000 → unix
-                    sys.nextPassLOS   = (time_t)(set.time.ut  * 86400.0 + 946727935.816);
-                    sys.nextPassMaxEl = 0; // not meaningful for planets, calculate separately if wanted
-                    sys.nextPassValid = true;
-                } else {
-                    sys.nextPassValid = false; // circumpolar or always below horizon
-                }
-            }
-            lastPassCalc = millis();
-        }
+      // ── Next pass / rise+set: expensive, run every 30s ───────
+      if (millis() - lastPassCalc > 30000) {
+          time_t now; time(&now);
 
-        // ── Draw to display ──────────────────────────────────────
-        // tft.fillScreen(TFT_BLACK);
-        // tft.printf("Az: %.1f  El: %.1f\n", sys.targetAz, sys.targetEl);
-        // tft.printf("Speed: %.2f km/s\n", sys.satSpeed);
-        // tft.printf("Alt:   %.0f km\n",   satSGP4.satAlt);
-        // tft.printf("Dist:  %.0f km\n",   satSGP4.satDist);
-        // if (sys.nextPassValid) {
-        //     struct tm *aos = gmtime(&sys.nextPassAOS);
-        //     tft.printf("Next pass: %02d:%02d UTC (max %.0f deg)\n",
-        //                aos->tm_hour, aos->tm_min, sys.nextPassMaxEl);
-        // }
+          if (current.type == TYPE_SATELLITE) {
+              satSgp4.initpredpoint(now, 0.0);
+              passinfo overpass;
+              sys.nextPassValid = satSgp4.nextpass(&overpass, 20);
+              if (sys.nextPassValid) {
+                  sys.nextPassAOS   = (time_t)((overpass.jdstart - 2440587.5) * 86400.0);
+                  sys.nextPassLOS   = (time_t)((overpass.jdstop  - 2440587.5) * 86400.0);
+                  sys.nextPassMaxEl = overpass.maxelevation;
+              }
 
-        vTaskDelay(2000 / portTICK_PERIOD_MS);  // refresh display 2x/sec
-    }
+          } else {
+              // planet rise/set via Astronomy library
+              struct tm *utc = gmtime(&now);
+              Astronomy_Time_t aTime = Astronomy_MakeTime(
+                  utc->tm_year+1900, utc->tm_mon+1, utc->tm_mday,
+                  utc->tm_hour, utc->tm_min, (double)utc->tm_sec);
+              Astronomy_Observer_t obs = { sys.lat, sys.lon, sys.alt };
+
+              Astronomy_SearchResult rise = Astronomy_SearchRiseSet(
+                  current.body, obs, DIRECTION_RISE, aTime, 1.0);
+              Astronomy_SearchResult set  = Astronomy_SearchRiseSet(
+                  current.body, obs, DIRECTION_SET,  aTime, 1.0);
+
+              if (rise.status == ASTRO_SUCCESS && set.status == ASTRO_SUCCESS) {
+                  // J2000.0 UT days → Unix timestamp (946727935 = unix time of J2000.0)
+                  sys.nextPassAOS   = (time_t)(rise.time.ut * 86400.0 + 946727935.816);
+                  sys.nextPassLOS   = (time_t)(set.time.ut  * 86400.0 + 946727935.816);
+                  sys.nextPassMaxEl = 0;   // not applicable for planets
+                  sys.nextPassValid = true;
+              } else {
+                  sys.nextPassValid = false;  // circumpolar or always below horizon
+              }
+          }
+
+          lastPassCalc = millis();
+      }
+
+      // ── Draw to display ──────────────────────────────────────
+      // tft.fillScreen(TFT_BLACK);
+      // tft.setCursor(0, 0);
+      // tft.printf(">> %s\n", current.name);
+      // tft.printf("Az: %.1f  El: %.1f\n", sys.targetAz, sys.targetEl);
+      // tft.printf("Speed: %.2f km/s\n",   sys.satSpeed);
+      // tft.printf("Alt:   %.0f km\n",      sys.satAltKm);
+      // tft.printf("Dist:  %.0f km\n",      sys.satDist);
+      // if (sys.nextPassValid) {
+      //     struct tm *aos = gmtime(&sys.nextPassAOS);
+      //     struct tm *los = gmtime(&sys.nextPassLOS);
+      //     if (current.type == TYPE_SATELLITE) {
+      //         tft.printf("Pass:  %02d:%02d UTC (max %.0f deg)\n",
+      //                    aos->tm_hour, aos->tm_min, sys.nextPassMaxEl);
+      //     } else {
+      //         tft.printf("Rise:  %02d:%02d UTC\n", aos->tm_hour, aos->tm_min);
+      //         tft.printf("Set:   %02d:%02d UTC\n", los->tm_hour, los->tm_min);
+      //     }
+      // }
+
+      vTaskDelay(2000 / portTICK_PERIOD_MS);
+  }
 }
