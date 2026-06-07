@@ -254,7 +254,10 @@ void fetchTLE() {
         StaticJsonDocument<1024> doc;
         deserializeJson(doc, http.getString());
         satSgp4.site(sys.lat, sys.lon, sys.alt);
-        satSgp4.init(current.name, doc["line1"].as<const char*>(), doc["line2"].as<const char*>());
+        char line1[130], line2[130];
+        strncpy(line1, doc["line1"].as<const char*>(), sizeof(line1));
+        strncpy(line2, doc["line2"].as<const char*>(), sizeof(line2));
+        satSgp4.init(current.name, line1, line2);
     }
     http.end();
 }
@@ -343,8 +346,7 @@ void PhysicsTask(void * p) {
 
         if (current.type == TYPE_SATELLITE) {
             // ── 1. Primary position ──────────────────────────────
-            satSgp4.findsat(t->tm_year+1900, t->tm_mon+1, t->tm_mday,
-                                    t->tm_hour, t->tm_min, t->tm_sec);
+            satSgp4.findsat((unsigned long)now);
             sys.targetAz = satSgp4.satAz;
             sys.targetEl = satSgp4.satEl;
             sys.satLat   = satSgp4.satLat;
@@ -352,8 +354,7 @@ void PhysicsTask(void * p) {
 
             // ── 2. Speed: position 1s later, then rewind ─────────
             double lat1 = satSgp4.satLat, lon1 = satSgp4.satLon, alt1 = satSgp4.satAlt;
-            satSgp4.findsat(t->tm_year+1900, t->tm_mon+1, t->tm_mday,
-                                    t->tm_hour, t->tm_min, t->tm_sec + 1);
+            satSgp4.findsat((unsigned long)(now + 1));
             double dlat = (satSgp4.satLat - lat1) * DEG_TO_RAD * 6371.0;
             double dlon = (satSgp4.satLon - lon1) * DEG_TO_RAD * 6371.0
                           * cos(lat1 * DEG_TO_RAD);
