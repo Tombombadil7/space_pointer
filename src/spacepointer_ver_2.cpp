@@ -53,9 +53,14 @@ struct {
 
 } sys;
 
+enum TargetType {
+  TYPE_SATELLITE = 0,
+  TYPE_PLANET    = 1
+};
+
 struct TargetState {
   TargetType type;
-  union { long noradID; Astronomy_BodyCode body; };
+  union { long noradID; int body; };
   char name[25];
 };
 TargetState current = {TYPE_SATELLITE, {.noradID = 25544}, "ISS"};
@@ -248,8 +253,8 @@ void fetchTLE() {
     if(http.GET() == 200) {
         StaticJsonDocument<1024> doc;
         deserializeJson(doc, http.getString());
-        satSgp4.setSite(sys.lat, sys.lon, sys.alt);
-        satSgp4.init(current.name, doc["line1"], doc["line2"]);
+        satSgp4.site(sys.lat, sys.lon, sys.alt);
+        satSgp4.init(current.name, doc["line1"].as<const char*>(), doc["line2"].as<const char*>());
     }
     http.end();
 }
@@ -291,7 +296,7 @@ void setup() {
           fetchTLE(); 
       } else { 
           current.type = TYPE_PLANET;
-          current.body = (Astronomy_BodyCode)val;
+          current.body = (astro_body_t)val;
           strncpy(current.name, name.c_str(), 20); 
       }
       r->send(200, "text/plain", "OK");
@@ -338,7 +343,7 @@ void PhysicsTask(void * p) {
 
         if (current.type == TYPE_SATELLITE) {
             // ── 1. Primary position ──────────────────────────────
-            satSgp4.findRunningTime(t->tm_year+1900, t->tm_mon+1, t->tm_mday,
+            satSgp4.findsat(t->tm_year+1900, t->tm_mon+1, t->tm_mday,
                                     t->tm_hour, t->tm_min, t->tm_sec);
             sys.targetAz = satSgp4.satAz;
             sys.targetEl = satSgp4.satEl;
@@ -347,7 +352,7 @@ void PhysicsTask(void * p) {
 
             // ── 2. Speed: position 1s later, then rewind ─────────
             double lat1 = satSgp4.satLat, lon1 = satSgp4.satLon, alt1 = satSgp4.satAlt;
-            satSgp4.findRunningTime(t->tm_year+1900, t->tm_mon+1, t->tm_mday,
+            satSgp4.findsat(t->tm_year+1900, t->tm_mon+1, t->tm_mday,
                                     t->tm_hour, t->tm_min, t->tm_sec + 1);
             double dlat = (satSgp4.satLat - lat1) * DEG_TO_RAD * 6371.0;
             double dlon = (satSgp4.satLon - lon1) * DEG_TO_RAD * 6371.0
@@ -357,29 +362,29 @@ void PhysicsTask(void * p) {
 
           } else {
             // ── position at t ──────────────────────────────────────────
-            Astronomy_Time_t aTime = Astronomy_MakeTime(
+            astro_time_t aTime = Astronomy_MakeTime(
                 t->tm_year+1900, t->tm_mon+1, t->tm_mday,
                 t->tm_hour, t->tm_min, (double)t->tm_sec);
-            Astronomy_Observer_t obs = { sys.lat, sys.lon, sys.alt };
+            astro_observer_t obs = { sys.lat, sys.lon, sys.alt };
         
             // distance from Earth center (AU) → km
-            Astronomy_Equatorial_t equ1 = Astronomy_Equator(current.body, &aTime, obs, ABERRATION);
+            astro_equatorial_t equ1 = Astronomy_Equator((astro_body_t)current.body, &aTime, obs, EQUATOR_OF_DATE, ABERRATION);
             double distAU = equ1.dist;                        // AU
             sys.satAltKm  = distAU * 149597870.7;             // km from Earth center
             sys.satDist   = sys.satAltKm;                     // reuse same field for /data
         
-            Astronomy_Horizontal_t hor1 = Astronomy_Horizontal(equ1, obs, aTime);
+            astro_horizon_t hor1 = Astronomy_Horizon(&aTime, obs, equ1.ra, equ1.dec, REFRACTION_NORMAL);
             sys.targetAz = hor1.azimuth;
             sys.targetEl = hor1.altitude;
         
             // ── position at t+1s ──────────────────────────────────────
-            Astronomy_Time_t aTime2 = Astronomy_MakeTime(
+            astro_time_t aTime2 = Astronomy_MakeTime(
                 t->tm_year+1900, t->tm_mon+1, t->tm_mday,
                 t->tm_hour, t->tm_min, (double)t->tm_sec + 1.0/86400.0);
-            Astronomy_Equatorial_t equ2 = Astronomy_Equator(current.body, &aTime2, obs, ABERRATION);
+            astro_equatorial_t equ2 = Astronomy_Equator((astro_body_t)current.body, &aTime2, obs, EQUATOR_OF_DATE, ABERRATION);
             double distAU2 = equ2.dist;
             double dDist   = (distAU2 - distAU) * 149597870.7; // km radial
-            Astronomy_Horizontal_t hor2 = Astronomy_Horizontal(equ2, obs, aTime2);
+            astro_horizon_t hor2 = Astronomy_Horizon(&aTime2, obs, equ2.ra, equ2.dec, REFRACTION_NORMAL);
         
             // angular movement (degrees) → arc length (km)
             double dAz  = (hor2.azimuth - hor1.azimuth) * DEG_TO_RAD * sys.satAltKm;
@@ -413,7 +418,7 @@ void DisplayTask(void * p) {
           time_t now; time(&now);
 
           if (current.type == TYPE_SATELLITE) {
-              satSgp4.initpredpoint(now, 0.0);
+              satSgp4.initpredpoint((unsigned long)now, 0.0);
               passinfo overpass;
               sys.nextPassValid = satSgp4.nextpass(&overpass, 20);
               if (sys.nextPassValid) {
@@ -425,15 +430,15 @@ void DisplayTask(void * p) {
           } else {
               // planet rise/set via Astronomy library
               struct tm *utc = gmtime(&now);
-              Astronomy_Time_t aTime = Astronomy_MakeTime(
+              astro_time_t aTime = Astronomy_MakeTime(
                   utc->tm_year+1900, utc->tm_mon+1, utc->tm_mday,
                   utc->tm_hour, utc->tm_min, (double)utc->tm_sec);
-              Astronomy_Observer_t obs = { sys.lat, sys.lon, sys.alt };
+              astro_observer_t obs = { sys.lat, sys.lon, sys.alt };
 
-              Astronomy_SearchResult rise = Astronomy_SearchRiseSet(
-                  current.body, obs, DIRECTION_RISE, aTime, 1.0);
-              Astronomy_SearchResult set  = Astronomy_SearchRiseSet(
-                  current.body, obs, DIRECTION_SET,  aTime, 1.0);
+              astro_search_result_t rise = Astronomy_SearchRiseSet(
+                  (astro_body_t)current.body, obs, DIRECTION_RISE, aTime, 1.0);
+              astro_search_result_t set  = Astronomy_SearchRiseSet(
+                  (astro_body_t)current.body, obs, DIRECTION_SET,  aTime, 1.0);
 
               if (rise.status == ASTRO_SUCCESS && set.status == ASTRO_SUCCESS) {
                   // J2000.0 UT days → Unix timestamp (946727935 = unix time of J2000.0)
