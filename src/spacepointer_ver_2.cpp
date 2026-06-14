@@ -12,21 +12,35 @@
 #include <ESPAsyncWebServer.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
-#include <FastAccelStepper.h>
+#include <AS5600.h> // I2C magnetic encoder for elevation feedback
+// (install: https://github.com/RobTillaart/AS5600)
 #include <Adafruit_BNO055.h>
 #include <Sgp4.h>
 #include <astronomy.h>
 
-// --- הגדרות חומרה (פינים) ---
-#define AZ_STEP_PIN 12
-#define AZ_DIR_PIN  13
-#define EL_STEP_PIN 14
-#define EL_DIR_PIN  15
+// --- all global structures and definitions ---
+// ── Pin definitions ────────────────────────────────────────────────────
+// Azimuth A4988
+#define AZ_STEP_PIN    12
+#define AZ_DIR_PIN     13
+#define AZ_EN_PIN      25    // LOW = enabled; pull LOW permanently if unused
 
-// --- אובייקטים גלובליים ---
+// Elevation A4988
+#define EL_STEP_PIN    14
+#define EL_DIR_PIN     15
+#define EL_EN_PIN      26    // LOW = enabled; pull LOW permanently if unused
+// MS pins: tie physically to 3.3V for 1/16 microstepping (no code needed)
+// A4988: MS1=HIGH, MS2=HIGH, MS3=HIGH → 1/16 step
+
+// ── Motor constants ─────────────────────────────────────────────────────
+// 28BYJ-48 bipolar: 2048 full steps/rev × 16 microsteps = 32768 microsteps/rev
+#define MICROSTEPS_PER_REV  32768UL
+#define STEP_PULSE_US     50      // µs per pulse
+#define MOTOR_TASK_MS     25      // MotorTask period in ms
+#define MAX_STEPS_PER_TICK  ((MOTOR_TASK_MS * 1000) / (STEP_PULSE_US * 2 * 2))
+// = (25000) / (200) = 125 steps max — leaves a small margin for overhead
+
 AsyncWebServer server(80);
-FastAccelStepperEngine engine = FastAccelStepperEngine();
-FastAccelStepper *stepperAz = NULL, *stepperEl = NULL;
 Adafruit_BNO055 bno = Adafruit_BNO055(55);
 Sgp4 satSgp4;
 
@@ -64,14 +78,29 @@ struct TargetState {
   char name[25];
 };
 TargetState current = {TYPE_SATELLITE, {.noradID = 25544}, "ISS"};
+struct PID {
+  float integral = 0, lastErr = 0;
+  float kp, ki, kd, deadband;
+};
+struct MotorTarget { float az = 0; float el = 0; } motorTarget;
+
+PID pidAz = {2.5f, 0.02f, 0.4f, 1.5f};   // tune these after first run
+PID pidEl = {3.0f, 0.03f, 0.5f, 1.0f};
+SemaphoreHandle_t targetMutex;
+SemaphoreHandle_t i2cMutex;
+// ── AS5600 encoder ──────────────────────────────────────────────────────
+AS5600 encoder;   // default I2C address 0x36, shares bus with BNO055 (0x28)
 
 void DisplayTask(void * p);
 void updateIPLocation();
 void fetchTLE();
 void PhysicsTask(void * p);
+void stepMotor(int stepPin, int dirPin, bool forward);
+int pidOutput(PID &p, float error, float dt);
+float wrapAngle(float e);
+void MotorTask(void * p);
 
 
-// --- ממשק משתמש HTML (מאוחסן בזיכרון הפלאש) ---
 const char index_html[] PROGMEM = R"rawliteral(
   <!DOCTYPE HTML><html>
   <head>
@@ -232,117 +261,149 @@ const char index_html[] PROGMEM = R"rawliteral(
   </html>)rawliteral";
 
 
-// --- לוגיקת שרת וחישובים ---
-
-void updateIPLocation() {
-    /* מבצע איכון ראשוני לפי כתובת IP כברירת מחדל  */
-    HTTPClient http;
-    http.begin("http://ip-api.com/json/");
-    if (http.GET() == 200) {
-        StaticJsonDocument<512> doc;
-        deserializeJson(doc, http.getString());
-        sys.lat = doc["lat"]; sys.lon = doc["lon"]; sys.alt = 50.0;
-    }
-    http.end();
-}
-
-void fetchTLE() {
-    /* מושך נתוני מסלול מעודכנים מהאינטרנט [cite: 75, 76] */
-    HTTPClient http;
-    http.begin("https://tle.ivanstanojevic.me/api/tle/" + String(current.noradID));
-    if(http.GET() == 200) {
-        StaticJsonDocument<1024> doc;
-        deserializeJson(doc, http.getString());
-        satSgp4.site(sys.lat, sys.lon, sys.alt);
-        char line1[130], line2[130];
-        strncpy(line1, doc["line1"].as<const char*>(), sizeof(line1));
-        strncpy(line2, doc["line2"].as<const char*>(), sizeof(line2));
-        satSgp4.init(current.name, line1, line2);
-    }
-    http.end();
-}
-
-void setup() {
+  void setup() {
+    // ── 1. System Initialization ───────────────────────────────────────
     Serial.begin(115200);
-    xTaskCreatePinnedToCore(DisplayTask, "Display", 8000, NULL, 1, NULL, 1); // Core 1 for display updates and next pass calculations
+    Serial.println("\nStarting Universal Space Pointer...");
+
+    // ── 2. FreeRTOS Primitives ─────────────────────────────────────────
+    targetMutex = xSemaphoreCreateMutex();
+    i2cMutex = xSemaphoreCreateMutex();
+
+    if (targetMutex == NULL || i2cMutex == NULL) {
+        Serial.println("CRITICAL: Failed to create mutexes! Halting.");
+        while(1); 
+    }
+
+    // ── 3. Hardware Initialization ─────────────────────────────────────
+    pinMode(AZ_STEP_PIN, OUTPUT); pinMode(AZ_DIR_PIN, OUTPUT);
+    pinMode(EL_STEP_PIN, OUTPUT); pinMode(EL_DIR_PIN, OUTPUT);
+    pinMode(AZ_EN_PIN, OUTPUT);   digitalWrite(AZ_EN_PIN, LOW);
+    pinMode(EL_EN_PIN, OUTPUT);   digitalWrite(EL_EN_PIN, LOW);
+
+    Wire.begin(); 
+    
+    encoder.begin();
+    if (!encoder.isConnected()) {
+        Serial.println("WARNING: AS5600 not found — check wiring");
+    }
+    encoder.setDirection(AS5600_CLOCK_WISE);
+
+    if (!bno.begin()) {
+        Serial.println("WARNING: BNO055 not found — check wiring");
+    }
+
+    // ── 4. Network & Web Services ──────────────────────────────────────
     WiFiManager wm;
     wm.autoConnect("SpaceTracker_AP");
+    updateIPLocation();
 
-    updateIPLocation(); // איכון ראשוני אוטומטי
-
-    // אתחול מנועים (ליבה 1 מנהלת אותם ברקע) 
-    engine.init();
-    stepperAz = engine.stepperConnectToPin(AZ_STEP_PIN);
-    stepperEl = engine.stepperConnectToPin(EL_STEP_PIN);
-    if(stepperAz) { stepperAz->setDirectionPin(AZ_DIR_PIN); stepperAz->setAcceleration(8000); stepperAz->setSpeedInHz(4000); }
-    if(stepperEl) { stepperEl->setDirectionPin(EL_DIR_PIN); stepperEl->setAcceleration(8000); stepperEl->setSpeedInHz(4000); }
-    
-    bno.begin(); // אתחול חיישן הכוון 
-    // הגדרת כתובות שרת (Endpoints)
     server.on("/", HTTP_GET, [](AsyncWebServerRequest *r){ r->send(200, "text/html", index_html); });
     
     server.on("/updateLoc", HTTP_GET, [](AsyncWebServerRequest *r){
         sys.lat = r->arg("lat").toDouble(); sys.lon = r->arg("lon").toDouble(); sys.alt = r->arg("alt").toDouble();
-        if(current.type == TYPE_SATELLITE) fetchTLE(); // רענון חישוב לווין לפי מיקום חדש
+        if(current.type == TYPE_SATELLITE) {
+            // Dispatch blocking HTTP request to a one-shot task
+            xTaskCreate([](void*){ fetchTLE(); vTaskDelete(NULL); }, "TLE", 8000, NULL, 1, NULL);
+        }
         r->send(200, "text/plain", "OK");
     });
 
     server.on("/set", HTTP_GET, [](AsyncWebServerRequest *r){
-      int type = r->arg("type").toInt();
-      String name = r->arg("name");
-      long val = r->arg("val").toInt();
-      
-      if(type == 0) { 
-          current.type = TYPE_SATELLITE;
-          current.noradID = val;
-          strncpy(current.name, name.c_str(), 20); 
-          fetchTLE(); 
-      } else { 
-          current.type = TYPE_PLANET;
-          current.body = (astro_body_t)val;
-          strncpy(current.name, name.c_str(), 20); 
-      }
-      r->send(200, "text/plain", "OK");
-  });
+        int type = r->arg("type").toInt();
+        String name = r->arg("name");
+        long val = r->arg("val").toInt();
+        
+        if(type == 0) { 
+            current.type = TYPE_SATELLITE;
+            current.noradID = val;
+            strncpy(current.name, name.c_str(), 20); 
+            // Dispatch blocking HTTP request to a one-shot task
+            xTaskCreate([](void*){ fetchTLE(); vTaskDelete(NULL); }, "TLE", 8000, NULL, 1, NULL);
+        } else { 
+            current.type = TYPE_PLANET;
+            current.body = (astro_body_t)val;
+            strncpy(current.name, name.c_str(), 20); 
+        }
+        r->send(200, "text/plain", "OK");
+    });
 
     server.on("/data", HTTP_GET, [](AsyncWebServerRequest *r){
-      StaticJsonDocument<512> doc;  // bump from 256 — more fields now
-      doc["name"]  = current.name;
-      doc["type"]  = current.type;
-      doc["az"]    = sys.targetAz;
-      doc["el"]    = sys.targetEl;
-      doc["sLat"]  = sys.satLat;
-      doc["sLon"]  = sys.satLon;
-      doc["speed"] = sys.satSpeed;
-      doc["alt"]   = satSgp4.satAlt;   // km above Earth
-      doc["dist"]  = satSgp4.satDist;  // km from observer
-  
-      if (sys.nextPassValid) {
-          struct tm *aos = gmtime(&sys.nextPassAOS);
-          char buf[20];
-          snprintf(buf, sizeof(buf), "%02d:%02d UTC", aos->tm_hour, aos->tm_min);
-          doc["nextPass"]   = buf;
-          doc["nextPassEl"] = (int)sys.nextPassMaxEl;
-      } else {
-          doc["nextPass"]   = "--:--";
-          doc["nextPassEl"] = 0;
-      }
-  
-      String out; serializeJson(doc, out);
-      r->send(200, "application/json", out);
-  });
+        StaticJsonDocument<512> doc;
+        doc["name"]  = current.name;
+        doc["type"]  = current.type;
+        doc["az"]    = sys.targetAz;
+        doc["el"]    = sys.targetEl;
+        doc["sLat"]  = sys.satLat;
+        doc["sLon"]  = sys.satLon;
+        doc["speed"] = sys.satSpeed;
+        doc["alt"]   = satSgp4.satAlt;   
+        doc["dist"]  = satSgp4.satDist;  
+    
+        if (sys.nextPassValid) {
+            struct tm *aos = gmtime(&sys.nextPassAOS);
+            char buf[20];
+            snprintf(buf, sizeof(buf), "%02d:%02d UTC", aos->tm_hour, aos->tm_min);
+            doc["nextPass"]   = buf;
+            doc["nextPassEl"] = (int)sys.nextPassMaxEl;
+        } else {
+            doc["nextPass"]   = "--:--";
+            doc["nextPassEl"] = 0;
+        }
+    
+        String out; serializeJson(doc, out);
+        r->send(200, "application/json", out);
+    });
 
     server.begin();
-    configTime(7200, 3600, "pool.ntp.org"); // סנכרון זמן מדויק 
+
+    // ── 5. Time Synchronization ────────────────────────────────────────
+    configTime(7200, 3600, "pool.ntp.org"); 
+    Serial.print("Waiting for NTP time sync...");
+    time_t now;
+    while (time(&now) < 1000000000) { 
+        delay(100);
+        Serial.print(".");
+    }
+    Serial.println("\nTime synchronized!");
+
+    // ── 6. Task Creation ───────────────────────────────────────────────
+    // Core 0: Physics (Bumped priority to 2 to compete fairly with WiFi stack on Core 0)
+    xTaskCreatePinnedToCore(PhysicsTask, "Physics", 15000, NULL, 2, NULL, 0);
     
-    // הרצת משימת הפיזיקה על ליבה 0 כדי לא להפריע למנועים 
-    xTaskCreatePinnedToCore(PhysicsTask, "Physics", 15000, NULL, 1, NULL, 0);
+    // Core 1: Hardware control & UI
+    xTaskCreatePinnedToCore(DisplayTask, "Display", 8000, NULL, 1, NULL, 1);
+    xTaskCreatePinnedToCore(MotorTask, "Motors", 8000, NULL, 2, NULL, 1); 
+}
+
+void loop() {
+    vTaskDelay(portMAX_DELAY); 
+}
+
+float wrapAngle(float e) {          // keep error in -180..+180
+  while (e >  180.f) e -= 360.f;
+  while (e < -180.f) e += 360.f;
+  return e;
+}
+
+int pidOutput(PID &p, float error, float dt) {
+  if (fabsf(error) < p.deadband) { p.integral = 0; return 0; }
+  p.integral  = constrain(p.integral + error * dt, -40.f, 40.f);
+  float deriv = (error - p.lastErr) / dt;
+  p.lastErr   = error;
+  float out   = p.kp * error + p.ki * p.integral + p.kd * deriv;
+  return (int)constrain(out, -(float)MAX_STEPS_PER_TICK, (float)MAX_STEPS_PER_TICK);
 }
 
 void PhysicsTask(void * p) {
-    for(;;) {
-        time_t now; time(&now);
-        struct tm * t = gmtime(&now);
+
+  TickType_t lastWake = xTaskGetTickCount();
+  const float DT = 0.5f;   // seconds — matches vTaskDelay below
+
+  for(;;) {
+      time_t now; time(&now);
+      struct tm * t = gmtime(&now);
+
 
         if (current.type == TYPE_SATELLITE) {
             // ── 1. Primary position ──────────────────────────────
@@ -395,18 +456,53 @@ void PhysicsTask(void * p) {
             sys.satLat = 0; sys.satLon = 0;
         }
 
-        // ── 3. IMU + motors ──────────────────────────────────────
-        sensors_event_t event; bno.getEvent(&event);
-        double heading = event.orientation.x;
-        double tilt    = event.orientation.y;
-        stepperAz->moveTo((long)((sys.targetAz - heading) * 1422.22));
-        stepperEl->moveTo((long)((sys.targetEl - tilt)    * 1422.22));
+        if (xSemaphoreTake(targetMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+          motorTarget.az = (float)sys.targetAz;
+          motorTarget.el = (float)sys.targetEl;
+          xSemaphoreGive(targetMutex);
+      }
 
-        vTaskDelay(500 / portTICK_PERIOD_MS);
+        vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(500));
     }
 }
 
-void loop() {} // ריק - הכל מנוהל ב-Tasks
+
+void MotorTask(void * p) {
+  const float DT = 0.025f;
+  TickType_t lastWake = xTaskGetTickCount();
+  for (;;) {
+      float targetAz, targetEl;
+      if (xSemaphoreTake(targetMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+          targetAz = motorTarget.az;
+          targetEl = motorTarget.el;
+          xSemaphoreGive(targetMutex);
+      }
+      sensors_event_t event;
+      if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+          bno.getEvent(&event);
+          xSemaphoreGive(i2cMutex);
+      }
+      float headingNow = event.orientation.x;
+      float elNow = 0;
+      if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+          elNow = encoder.getRawAngle() * (360.f / 4096.f);
+          xSemaphoreGive(i2cMutex);
+      }
+      if (elNow > 180.f) elNow -= 360.f;
+
+      int azSteps = pidOutput(pidAz, wrapAngle(targetAz - headingNow), DT);
+      int elSteps = pidOutput(pidEl, wrapAngle(targetEl - elNow), DT);
+      bool azFwd = azSteps > 0, elFwd = elSteps > 0;
+      int azN = abs(azSteps), elN = abs(elSteps);
+      int maxN = max(azN, elN);
+      for (int i = 0; i < maxN; i++) {
+          if (i < azN) stepMotor(AZ_STEP_PIN, AZ_DIR_PIN, azFwd);
+          if (i < elN) stepMotor(EL_STEP_PIN, EL_DIR_PIN, elFwd);
+      }
+      vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(25));
+  }
+}
+
 
 void DisplayTask(void * p) {
   // Initialize your display here (e.g. tft.init())
@@ -477,4 +573,44 @@ void DisplayTask(void * p) {
 
       vTaskDelay(2000 / portTICK_PERIOD_MS);
   }
+}
+
+void stepMotor(int stepPin, int dirPin, bool forward) {
+  digitalWrite(dirPin, forward ? HIGH : LOW);
+  delayMicroseconds(2);
+  digitalWrite(stepPin, HIGH);
+  delayMicroseconds(STEP_PULSE_US);
+  digitalWrite(stepPin, LOW);
+  delayMicroseconds(STEP_PULSE_US);
+}
+
+
+// --- לוגיקת שרת וחישובים ---
+
+void updateIPLocation() {
+    /* מבצע איכון ראשוני לפי כתובת IP כברירת מחדל  */
+    HTTPClient http;
+    http.begin("http://ip-api.com/json/");
+    if (http.GET() == 200) {
+        StaticJsonDocument<512> doc;
+        deserializeJson(doc, http.getString());
+        sys.lat = doc["lat"]; sys.lon = doc["lon"]; sys.alt = 50.0;
+    }
+    http.end();
+}
+
+void fetchTLE() {
+    /* מושך נתוני מסלול מעודכנים מהאינטרנט [cite: 75, 76] */
+    HTTPClient http;
+    http.begin("https://tle.ivanstanojevic.me/api/tle/" + String(current.noradID));
+    if(http.GET() == 200) {
+        StaticJsonDocument<1024> doc;
+        deserializeJson(doc, http.getString());
+        satSgp4.site(sys.lat, sys.lon, sys.alt);
+        char line1[130], line2[130];
+        strncpy(line1, doc["line1"].as<const char*>(), sizeof(line1));
+        strncpy(line2, doc["line2"].as<const char*>(), sizeof(line2));
+        satSgp4.init(current.name, line1, line2);
+    }
+    http.end();
 }
