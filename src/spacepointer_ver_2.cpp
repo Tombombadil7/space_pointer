@@ -90,6 +90,11 @@ SemaphoreHandle_t targetMutex;
 SemaphoreHandle_t i2cMutex;
 // ── AS5600 encoder ──────────────────────────────────────────────────────
 AS5600 encoder;   // default I2C address 0x36, shares bus with BNO055 (0x28)
+// LCD — try 0x27 first, some boards use 0x3F
+// Change to LiquidCrystal_I2C lcd(0x3F, 16, 2) if 0x27 doesn't work
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+bool lcdFound = false;   // set in setup(), checked before creating DisplayTask
+
 
 void DisplayTask(void * p);
 void updateIPLocation();
@@ -261,124 +266,160 @@ const char index_html[] PROGMEM = R"rawliteral(
   </html>)rawliteral";
 
 
-  void setup() {
-    // ── 1. System Initialization ───────────────────────────────────────
-    Serial.begin(115200);
-    Serial.println("\nStarting Universal Space Pointer...");
+void setup() {
+  // ── 1. System Initialization ───────────────────────────────────────
+  Serial.begin(115200);
+  Serial.println("\nStarting Universal Space Pointer...");
 
-    // ── 2. FreeRTOS Primitives ─────────────────────────────────────────
-    targetMutex = xSemaphoreCreateMutex();
-    i2cMutex = xSemaphoreCreateMutex();
+  // ── 2. FreeRTOS Primitives ─────────────────────────────────────────
+  targetMutex = xSemaphoreCreateMutex();
+  i2cMutex    = xSemaphoreCreateMutex();
+  if (targetMutex == NULL || i2cMutex == NULL) {
+      Serial.println("CRITICAL: Failed to create mutexes! Halting.");
+      while(1);
+  }
 
-    if (targetMutex == NULL || i2cMutex == NULL) {
-        Serial.println("CRITICAL: Failed to create mutexes! Halting.");
-        while(1); 
-    }
+  // ── 3. Hardware Initialization ─────────────────────────────────────
+  pinMode(AZ_STEP_PIN, OUTPUT); pinMode(AZ_DIR_PIN, OUTPUT);
+  pinMode(EL_STEP_PIN, OUTPUT); pinMode(EL_DIR_PIN, OUTPUT);
+  pinMode(AZ_EN_PIN, OUTPUT);   digitalWrite(AZ_EN_PIN, LOW);
+  pinMode(EL_EN_PIN, OUTPUT);   digitalWrite(EL_EN_PIN, LOW);
 
-    // ── 3. Hardware Initialization ─────────────────────────────────────
-    pinMode(AZ_STEP_PIN, OUTPUT); pinMode(AZ_DIR_PIN, OUTPUT);
-    pinMode(EL_STEP_PIN, OUTPUT); pinMode(EL_DIR_PIN, OUTPUT);
-    pinMode(AZ_EN_PIN, OUTPUT);   digitalWrite(AZ_EN_PIN, LOW);
-    pinMode(EL_EN_PIN, OUTPUT);   digitalWrite(EL_EN_PIN, LOW);
+  // I2C bus — shared by BNO055, AS5600, and LCD
+  Wire.begin(); // SDA=21, SCL=22
+  Wire.setClock(400000);
+  
+  // ── LCD detection ──────────────────────────────────────────────────
+  // Probe the I2C bus for the LCD address before init.
+  // Wire.endTransmission()==0 means a device ACK'd at that address.
+  Wire.beginTransmission(0x27);
+  if (Wire.endTransmission() == 0) {
+      lcdFound = true;
+  } else {
+      // Try the alternate common address
+      Wire.beginTransmission(0x3F);
+      if (Wire.endTransmission() == 0) {
+          lcdFound = true;
+          // Reinitialise the object at the correct address
+          lcd = LiquidCrystal_I2C(0x3F, 16, 2);
+      }
+  }
 
-    Wire.begin(); 
-    
-    encoder.begin();
-    if (!encoder.isConnected()) {
-        Serial.println("WARNING: AS5600 not found — check wiring");
-    }
-    encoder.setDirection(AS5600_CLOCK_WISE);
+  if (lcdFound) {
+      lcd.init();
+      lcd.backlight();
+      lcd.setCursor(0, 0); lcd.print("Space Pointer");
+      lcd.setCursor(0, 1); lcd.print("Booting...");
+      Serial.println("LCD found and initialised");
+  } else {
+      Serial.println("WARNING: LCD not found — DisplayTask will be skipped");
+  }
 
-    if (!bno.begin()) {
-        Serial.println("WARNING: BNO055 not found — check wiring");
-    }
+  // ── AS5600 encoder ─────────────────────────────────────────────────
+  encoder.begin();
+  if (!encoder.isConnected()) {
+      Serial.println("WARNING: AS5600 not found — check wiring");
+  }
+  encoder.setDirection(AS5600_CLOCK_WISE);
 
-    // ── 4. Network & Web Services ──────────────────────────────────────
-    WiFiManager wm;
-    wm.autoConnect("SpaceTracker_AP");
-    updateIPLocation();
+  // ── BNO055 IMU ─────────────────────────────────────────────────────
+  if (!bno.begin()) {
+      Serial.println("WARNING: BNO055 not found — check wiring");
+  }
 
-    server.on("/", HTTP_GET, [](AsyncWebServerRequest *r){ r->send(200, "text/html", index_html); });
-    
-    server.on("/updateLoc", HTTP_GET, [](AsyncWebServerRequest *r){
-        sys.lat = r->arg("lat").toDouble(); sys.lon = r->arg("lon").toDouble(); sys.alt = r->arg("alt").toDouble();
-        if(current.type == TYPE_SATELLITE) {
-            // Dispatch blocking HTTP request to a one-shot task
-            xTaskCreate([](void*){ fetchTLE(); vTaskDelete(NULL); }, "TLE", 8000, NULL, 1, NULL);
-        }
-        r->send(200, "text/plain", "OK");
-    });
+  // ── 4. Network & Web Services ──────────────────────────────────────
+  WiFiManager wm;
+  wm.autoConnect("SpaceTracker_AP");
+  updateIPLocation();
 
-    server.on("/set", HTTP_GET, [](AsyncWebServerRequest *r){
-        int type = r->arg("type").toInt();
-        String name = r->arg("name");
-        long val = r->arg("val").toInt();
-        
-        if(type == 0) { 
-            current.type = TYPE_SATELLITE;
-            current.noradID = val;
-            strncpy(current.name, name.c_str(), 20); 
-            // Dispatch blocking HTTP request to a one-shot task
-            xTaskCreate([](void*){ fetchTLE(); vTaskDelete(NULL); }, "TLE", 8000, NULL, 1, NULL);
-        } else { 
-            current.type = TYPE_PLANET;
-            current.body = (astro_body_t)val;
-            strncpy(current.name, name.c_str(), 20); 
-        }
-        r->send(200, "text/plain", "OK");
-    });
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *r){
+      r->send(200, "text/html", index_html);
+  });
 
-    server.on("/data", HTTP_GET, [](AsyncWebServerRequest *r){
-        StaticJsonDocument<512> doc;
-        doc["name"]  = current.name;
-        doc["type"]  = current.type;
-        doc["az"]    = sys.targetAz;
-        doc["el"]    = sys.targetEl;
-        doc["sLat"]  = sys.satLat;
-        doc["sLon"]  = sys.satLon;
-        doc["speed"] = sys.satSpeed;
-        doc["alt"]   = satSgp4.satAlt;   
-        doc["dist"]  = satSgp4.satDist;  
-    
-        if (sys.nextPassValid) {
-            struct tm *aos = gmtime(&sys.nextPassAOS);
-            char buf[20];
-            snprintf(buf, sizeof(buf), "%02d:%02d UTC", aos->tm_hour, aos->tm_min);
-            doc["nextPass"]   = buf;
-            doc["nextPassEl"] = (int)sys.nextPassMaxEl;
-        } else {
-            doc["nextPass"]   = "--:--";
-            doc["nextPassEl"] = 0;
-        }
-    
-        String out; serializeJson(doc, out);
-        r->send(200, "application/json", out);
-    });
+  server.on("/updateLoc", HTTP_GET, [](AsyncWebServerRequest *r){
+      sys.lat = r->arg("lat").toDouble();
+      sys.lon = r->arg("lon").toDouble();
+      sys.alt = r->arg("alt").toDouble();
+      if (current.type == TYPE_SATELLITE)
+          xTaskCreate([](void*){ fetchTLE(); vTaskDelete(NULL); }, "TLE", 8000, NULL, 1, NULL);
+      r->send(200, "text/plain", "OK");
+  });
 
-    server.begin();
+  server.on("/set", HTTP_GET, [](AsyncWebServerRequest *r){
+      int    type = r->arg("type").toInt();
+      String name = r->arg("name");
+      long   val  = r->arg("val").toInt();
+      if (type == 0) {
+          current.type    = TYPE_SATELLITE;
+          current.noradID = val;
+          strncpy(current.name, name.c_str(), 20);
+          xTaskCreate([](void*){ fetchTLE(); vTaskDelete(NULL); }, "TLE", 8000, NULL, 1, NULL);
+      } else {
+          current.type = TYPE_PLANET;
+          current.body = (astro_body_t)val;
+          strncpy(current.name, name.c_str(), 20);
+      }
+      r->send(200, "text/plain", "OK");
+  });
 
-    // ── 5. Time Synchronization ────────────────────────────────────────
-    configTime(7200, 3600, "pool.ntp.org"); 
-    Serial.print("Waiting for NTP time sync...");
-    time_t now;
-    while (time(&now) < 1000000000) { 
-        delay(100);
-        Serial.print(".");
-    }
-    Serial.println("\nTime synchronized!");
+  server.on("/data", HTTP_GET, [](AsyncWebServerRequest *r){
+      StaticJsonDocument<512> doc;
+      doc["name"]  = current.name;
+      doc["type"]  = current.type;
+      doc["az"]    = sys.targetAz;
+      doc["el"]    = sys.targetEl;
+      doc["sLat"]  = sys.satLat;
+      doc["sLon"]  = sys.satLon;
+      doc["speed"] = sys.satSpeed;
+      doc["alt"]   = satSgp4.satAlt;
+      doc["dist"]  = satSgp4.satDist;
+      if (sys.nextPassValid) {
+          struct tm *aos = gmtime(&sys.nextPassAOS);
+          char buf[20];
+          snprintf(buf, sizeof(buf), "%02d:%02d UTC", aos->tm_hour, aos->tm_min);
+          doc["nextPass"]   = buf;
+          doc["nextPassEl"] = (int)sys.nextPassMaxEl;
+      } else {
+          doc["nextPass"]   = "--:--";
+          doc["nextPassEl"] = 0;
+      }
+      String out; serializeJson(doc, out);
+      r->send(200, "application/json", out);
+  });
 
-    // ── 6. Task Creation ───────────────────────────────────────────────
-    // Core 0: Physics (Bumped priority to 2 to compete fairly with WiFi stack on Core 0)
-    xTaskCreatePinnedToCore(PhysicsTask, "Physics", 15000, NULL, 2, NULL, 0);
-    
-    // Core 1: Hardware control & UI
-    xTaskCreatePinnedToCore(DisplayTask, "Display", 8000, NULL, 1, NULL, 1);
-    xTaskCreatePinnedToCore(MotorTask, "Motors", 8000, NULL, 2, NULL, 1); 
+  server.begin();
+
+  // ── 5. Time Synchronization ────────────────────────────────────────
+  configTime(7200, 3600, "pool.ntp.org");
+  Serial.print("Waiting for NTP time sync...");
+  time_t now;
+  while (time(&now) < 1000000000) { delay(100); Serial.print("."); }
+  Serial.println("\nTime synchronized!");
+
+  if (lcdFound) {
+      lcd.clear();
+      lcd.setCursor(0, 0); lcd.print("WiFi OK");
+      lcd.setCursor(0, 1); lcd.print("Time synced!");
+      delay(1000);
+  }
+
+  // ── 6. Task Creation ───────────────────────────────────────────────
+  // WiFi stack runs on Core 0 — put Physics on Core 1 to avoid contention
+  xTaskCreatePinnedToCore(PhysicsTask, "Physics", 15000, NULL, 2, NULL, 1);
+  xTaskCreatePinnedToCore(MotorTask,   "Motors",  8000,  NULL, 3, NULL, 0);
+
+  // Only create DisplayTask if an LCD was actually found
+  if (lcdFound) {
+      xTaskCreatePinnedToCore(DisplayTask, "Display", 4000, NULL, 1, NULL, 0);
+  } else {
+      Serial.println("DisplayTask skipped — no LCD");
+  }
 }
 
 void loop() {
-    vTaskDelay(portMAX_DELAY); 
+  vTaskDelay(portMAX_DELAY);
 }
+
 
 float wrapAngle(float e) {          // keep error in -180..+180
   while (e >  180.f) e -= 360.f;
@@ -387,12 +428,12 @@ float wrapAngle(float e) {          // keep error in -180..+180
 }
 
 int pidOutput(PID &p, float error, float dt) {
-  if (fabsf(error) < p.deadband) { p.integral = 0; return 0; }
-  p.integral  = constrain(p.integral + error * dt, -40.f, 40.f);
-  float deriv = (error - p.lastErr) / dt;
-  p.lastErr   = error;
-  float out   = p.kp * error + p.ki * p.integral + p.kd * deriv;
-  return (int)constrain(out, -(float)MAX_STEPS_PER_TICK, (float)MAX_STEPS_PER_TICK);
+    if (fabsf(error) < p.deadband) { p.integral = 0; return 0; }
+    p.integral  = constrain(p.integral + error * dt, -40.f, 40.f);
+    float deriv = (error - p.lastErr) / dt;
+    p.lastErr   = error;
+    float out   = p.kp * error + p.ki * p.integral + p.kd * deriv;
+    return (int)constrain(out, -(float)MAX_STEPS_PER_TICK, (float)MAX_STEPS_PER_TICK);
 }
 
 void PhysicsTask(void * p) {
@@ -505,12 +546,13 @@ void MotorTask(void * p) {
 
 
 void DisplayTask(void * p) {
-  // Initialize your display here (e.g. tft.init())
   static uint32_t lastPassCalc = 0;
+  static uint8_t  screen       = 0;   // alternates 0 / 1 every 2s
+  char line0[17], line1[17];
 
-  for(;;) {
+  for (;;) {
 
-      // ── Next pass / rise+set: expensive, run every 30s ───────
+      // ── Next pass / rise+set: recalculate every 30s ───────────────
       if (millis() - lastPassCalc > 30000) {
           time_t now; time(&now);
 
@@ -523,55 +565,85 @@ void DisplayTask(void * p) {
                   sys.nextPassLOS   = (time_t)((overpass.jdstop  - 2440587.5) * 86400.0);
                   sys.nextPassMaxEl = overpass.maxelevation;
               }
-
           } else {
-              // planet rise/set via Astronomy library
               struct tm *utc = gmtime(&now);
               astro_time_t aTime = Astronomy_MakeTime(
                   utc->tm_year+1900, utc->tm_mon+1, utc->tm_mday,
                   utc->tm_hour, utc->tm_min, (double)utc->tm_sec);
               astro_observer_t obs = { sys.lat, sys.lon, sys.alt };
-
               astro_search_result_t rise = Astronomy_SearchRiseSet(
                   (astro_body_t)current.body, obs, DIRECTION_RISE, aTime, 1.0);
               astro_search_result_t set  = Astronomy_SearchRiseSet(
                   (astro_body_t)current.body, obs, DIRECTION_SET,  aTime, 1.0);
-
               if (rise.status == ASTRO_SUCCESS && set.status == ASTRO_SUCCESS) {
-                  // J2000.0 UT days → Unix timestamp (946727935 = unix time of J2000.0)
                   sys.nextPassAOS   = (time_t)(rise.time.ut * 86400.0 + 946727935.816);
                   sys.nextPassLOS   = (time_t)(set.time.ut  * 86400.0 + 946727935.816);
-                  sys.nextPassMaxEl = 0;   // not applicable for planets
+                  sys.nextPassMaxEl = 0;
                   sys.nextPassValid = true;
               } else {
-                  sys.nextPassValid = false;  // circumpolar or always below horizon
+                  sys.nextPassValid = false;
               }
           }
-
           lastPassCalc = millis();
       }
 
-      // ── Draw to display ──────────────────────────────────────
-      // tft.fillScreen(TFT_BLACK);
-      // tft.setCursor(0, 0);
-      // tft.printf(">> %s\n", current.name);
-      // tft.printf("Az: %.1f  El: %.1f\n", sys.targetAz, sys.targetEl);
-      // tft.printf("Speed: %.2f km/s\n",   sys.satSpeed);
-      // tft.printf("Alt:   %.0f km\n",      sys.satAltKm);
-      // tft.printf("Dist:  %.0f km\n",      sys.satDist);
-      // if (sys.nextPassValid) {
-      //     struct tm *aos = gmtime(&sys.nextPassAOS);
-      //     struct tm *los = gmtime(&sys.nextPassLOS);
-      //     if (current.type == TYPE_SATELLITE) {
-      //         tft.printf("Pass:  %02d:%02d UTC (max %.0f deg)\n",
-      //                    aos->tm_hour, aos->tm_min, sys.nextPassMaxEl);
-      //     } else {
-      //         tft.printf("Rise:  %02d:%02d UTC\n", aos->tm_hour, aos->tm_min);
-      //         tft.printf("Set:   %02d:%02d UTC\n", los->tm_hour, los->tm_min);
-      //     }
-      // }
+      // ── Build lines based on current screen ───────────────────────
+      if (screen == 0) {
+          // ── Screen 0: Pointing data ───────────────────────────────
+          // Row 0: "ISS  Az:247.3   "
+          snprintf(line0, sizeof(line0), "%-4.4s Az:%-6.1f",
+                   current.name, sys.targetAz);
 
-      vTaskDelay(2000 / portTICK_PERIOD_MS);
+          // Row 1: elevation + altitude, or next pass if below horizon
+          if (sys.targetEl >= 0) {
+              snprintf(line1, sizeof(line1), "El:%-5.1f %5.0fkm",
+                       sys.targetEl, sys.satAltKm);
+          } else {
+              if (sys.nextPassValid) {
+                  struct tm *aos = gmtime(&sys.nextPassAOS);
+                  snprintf(line1, sizeof(line1), "El:%-4.1f >%02d:%02dUTC",
+                           sys.targetEl, aos->tm_hour, aos->tm_min);
+              } else {
+                  snprintf(line1, sizeof(line1), "El:%-5.1f No pass",
+                           sys.targetEl);
+              }
+          }
+
+      } else {
+          // ── Screen 1: Telemetry data ──────────────────────────────
+          // Row 0: "ISS  7.66 km/s  "
+          snprintf(line0, sizeof(line0), "%-4.4s %6.2fkm/s",
+                   current.name, sys.satSpeed);
+
+          // Row 1: distance — satellites in km, planets in scientific-friendly units
+          if (current.type == TYPE_SATELLITE) {
+              // e.g. "Dist:    421394km"  — always < 999999km for LEO/MEO
+              snprintf(line1, sizeof(line1), "Dist:%9.0fkm",
+                       sys.satDist);
+          } else {
+              // Planets are millions of km — show in M km
+              // e.g. "Dist:   384400Mkm"  (Moon ~384k km, Mars ~225M km)
+              double distMkm = sys.satDist / 1000.0;
+              if (distMkm < 10000.0) {
+                  snprintf(line1, sizeof(line1), "Dist:%7.0f Mkm",
+                           distMkm);
+              } else {
+                  // Very far (outer planets) — show in AU  e.g. "Dist:      5.2 AU"
+                  snprintf(line1, sizeof(line1), "Dist:    %5.2f AU",
+                           sys.satDist / 149597870.7);
+              }
+          }
+      }
+
+      // ── Write to LCD (i2cMutex guards shared I2C bus) ────────────
+      if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+          lcd.setCursor(0, 0); lcd.print(line0);
+          lcd.setCursor(0, 1); lcd.print(line1);
+          xSemaphoreGive(i2cMutex);
+      }
+
+      screen = 1 - screen;   // flip 0→1→0→1...
+      vTaskDelay(pdMS_TO_TICKS(2000));
   }
 }
 
