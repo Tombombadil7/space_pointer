@@ -107,163 +107,176 @@ void MotorTask(void * p);
 
 
 const char index_html[] PROGMEM = R"rawliteral(
-  <!DOCTYPE HTML><html>
-  <head>
-    <title>Universal Space Pointer</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.7.1/dist/leaflet.css" />
-    <script src="https://unpkg.com/leaflet@1.7.1/dist/leaflet.js"></script>
-    <style>
-      body { font-family: 'Segoe UI', Arial; text-align: center; background: #121212; color: white; margin: 0; padding: 15px; }
-      #map { height: 320px; width: 95%; margin: 15px auto; border-radius: 12px; border: 2px solid #444; }
-      .card { background: #1e1e1e; padding: 20px; border-radius: 15px; box-shadow: 0 4px 10px rgba(0,0,0,0.5); max-width: 500px; margin: auto; }
-      .btn { padding: 10px 15px; margin: 5px; cursor: pointer; border-radius: 6px; border: none; background: #3498db; color: white; transition: 0.2s; }
-      .btn:hover { background: #2980b9; }
-      .input-group { margin: 20px 0; display: flex; justify-content: center; gap: 10px; flex-wrap: wrap; }
-      select, input { padding: 8px; border-radius: 5px; border: none; background: #333; color: white; }
-      .data { color: #00ffcc; font-weight: bold; }
-      .label { color: #888; font-size: 0.85em; }
-  
-      /* ── tracking name banner ── */
-      #target-name {
-        font-size: 1.6em; font-weight: bold; letter-spacing: 2px;
-        color: #00ffcc; margin: 0 0 12px; text-transform: uppercase;
-      }
-  
-      /* ── stats grid ── */
-      .stats-grid {
-        display: grid; grid-template-columns: repeat(3, 1fr);
-        gap: 10px; margin: 12px 0;
-      }
-      .stat-box {
-        background: #2a2a2a; border-radius: 10px; padding: 10px 6px;
-        border: 1px solid #333;
-      }
-      .stat-val { font-size: 1.2em; color: #00ffcc; font-weight: bold; }
-      .stat-lbl { font-size: 0.72em; color: #888; margin-top: 3px; }
-  
-      /* ── next pass strip ── */
-      #next-pass-bar {
-        background: #2a2a2a; border-radius: 10px; padding: 10px 14px;
-        margin: 10px 0; font-size: 0.9em; border: 1px solid #333;
-        display: flex; justify-content: space-between; align-items: center;
-      }
-      #next-pass-bar .label { font-size: 0.8em; }
-    </style>
-  </head>
-  <body>
-    <div class="card">
-  
-      <!-- tracking target name -->
-      <p id="target-name">---</p>
-  
-      <div id="map"></div>
-  
-      <!-- az / el row -->
-      <p>
-        <span class="label">Az</span> <span id="az" class="data">0</span>&deg;&nbsp;&nbsp;
-        <span class="label">El</span> <span id="el" class="data">0</span>&deg;
-      </p>
-  
-      <!-- speed / altitude / distance grid -->
-      <div class="stats-grid">
-        <div class="stat-box">
-          <div class="stat-val"><span id="speed">--</span></div>
-          <div class="stat-lbl">km/s speed</div>
+  <!DOCTYPE HTML>
+  <html>
+    <head>
+      <title>Universal Space Pointer</title>
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <link rel="stylesheet" href="https://unpkg.com/leaflet@1.7.1/dist/leaflet.css" />
+      <script src="https://unpkg.com/leaflet@1.7.1/dist/leaflet.js"></script>
+      <style>
+        /* Ensure padding and borders don't increase element widths */
+        * { box-sizing: border-box; }
+        
+        body { font-family: 'Segoe UI', Arial; text-align: center; background: #121212; color: white; margin: 0; padding: 15px; }
+        
+        /* Map uses 100% width of its parent card to avoid overflow */
+        #map { height: 320px; width: 100%; margin: 15px 0; border-radius: 12px; border: 2px solid #444; }
+        
+        /* Width 100% ensures it scales down on mobile, while max-width keeps it neat on PC */
+        .card { background: #1e1e1e; padding: 20px; border-radius: 15px; box-shadow: 0 4px 10px rgba(0,0,0,0.5); width: 100%; max-width: 500px; margin: auto; }
+        
+        .btn { padding: 10px 15px; margin: 5px; cursor: pointer; border-radius: 6px; border: none; background: #3498db; color: white; transition: 0.2s; }
+        .btn:hover { background: #2980b9; }
+        .input-group { margin: 20px 0; display: flex; justify-content: center; gap: 10px; flex-wrap: wrap; }
+        
+        /* Max-width prevents long selections from breaking mobile views */
+        select, input { padding: 8px; border-radius: 5px; border: none; background: #333; color: white; max-width: 100%; }
+        
+        .data { color: #00ffcc; font-weight: bold; }
+        .label { color: #888; font-size: 0.85em; }
+    
+        /* ── tracking name banner ── */
+        #target-name {
+          font-size: 1.6em; font-weight: bold; letter-spacing: 2px;
+          color: #00ffcc; margin: 0 0 12px; text-transform: uppercase;
+          word-wrap: break-word; /* Prevents long names from breaking layout */
+        }
+    
+        /* ── stats grid ── */
+        .stats-grid {
+          display: grid; grid-template-columns: repeat(3, 1fr);
+          gap: 10px; margin: 12px 0;
+        }
+        .stat-box {
+          background: #2a2a2a; border-radius: 10px; padding: 10px 6px;
+          border: 1px solid #333;
+          min-width: 0; /* Allows grid items to shrink properly if needed */
+        }
+        .stat-val { font-size: 1.2em; color: #00ffcc; font-weight: bold; word-wrap: break-word; }
+        .stat-lbl { font-size: 0.72em; color: #888; margin-top: 3px; }
+    
+        /* ── next pass strip ── */
+        #next-pass-bar {
+          background: #2a2a2a; border-radius: 10px; padding: 10px 14px;
+          margin: 10px 0; font-size: 0.9em; border: 1px solid #333;
+          display: flex; justify-content: space-between; align-items: center;
+          flex-wrap: wrap; /* Allows stacking on extremely narrow screens */
+          gap: 10px;
+        }
+        #next-pass-bar .label { font-size: 0.8em; }
+      </style>
+    </head>
+    <body>
+      <div class="card">
+    
+        <p id="target-name">---</p>
+    
+        <div id="map"></div>
+    
+        <p>
+          <span class="label">Az</span> <span id="az" class="data">0</span>&deg;&nbsp;&nbsp;
+          <span class="label">El</span> <span id="el" class="data">0</span>&deg;
+        </p>
+    
+        <div class="stats-grid">
+          <div class="stat-box">
+            <div class="stat-val"><span id="speed">--</span></div>
+            <div class="stat-lbl">km/s speed</div>
+          </div>
+          <div class="stat-box">
+            <div class="stat-val"><span id="alt">--</span></div>
+            <div class="stat-lbl" data-lbl="alt">km altitude</div>
+          </div>
+          <div class="stat-box">
+            <div class="stat-val"><span id="dist">--</span></div>
+            <div class="stat-lbl" data-lbl="dist">km distance</div>
+          </div>
         </div>
-        <div class="stat-box">
-          <div class="stat-val"><span id="alt">--</span></div>
-          <div class="stat-lbl" data-lbl="alt">km altitude</div>
+    
+        <div id="next-pass-bar">
+          <span><span class="label" data-lbl="pass">Next pass</span> <span id="nextPass" class="data">--:--</span></span>
+          <span><span class="label" data-lbl="lose">Max el</span> <span id="nextPassEl" class="data">--</span></span>
         </div>
-        <div class="stat-box">
-          <div class="stat-val"><span id="dist">--</span></div>
-          <div class="stat-lbl" data-lbl="dist">km distance</div>
+    
+        <button class="btn" style="background:#e67e22" onclick="syncGPS()">Sync Phone GPS</button>
+    
+        <div class="input-group">
+          <select id="commonSats" onchange="if(this.value) setTarget(0, this.options[this.selectedIndex].text, this.value)">
+            <option value="">-- Choose Satellite --</option>
+            <option value="25544">ISS (Space Station)</option>
+            <option value="20580">Hubble Telescope</option>
+            <option value="48274">Tiangong (China)</option>
+            <option value="25867">NOAA 15 (Weather)</option>
+          </select>
+          <button class="btn" onclick="setTarget(1, 'Moon', 0)">Moon</button>
+          <button class="btn" onclick="setTarget(1, 'Mars', 1)">Mars</button>
+          <button class="btn" onclick="setTarget(1, 'Jupiter', 4)">Jupiter</button>
+          <button class="btn" onclick="setTarget(1, 'Saturn', 5)">Saturn</button>
+        </div>
+    
+        <div class="input-group">
+          <input type="number" id="norad" placeholder="Custom NORAD ID">
+          <button class="btn" onclick="setCustomSat()">Track ID</button>
         </div>
       </div>
-  
-      <!-- next visible pass / rise+set -->
-      <div id="next-pass-bar">
-        <span><span class="label" data-lbl="pass">Next pass</span> <span id="nextPass" class="data">--:--</span></span>
-        <span><span class="label" data-lbl="lose">Max el</span> <span id="nextPassEl" class="data">--</span></span>
-      </div>
-  
-      <button class="btn" style="background:#e67e22" onclick="syncGPS()">Sync Phone GPS</button>
-  
-      <div class="input-group">
-        <select id="commonSats" onchange="if(this.value) setTarget(0, this.options[this.selectedIndex].text, this.value)">
-          <option value="">-- Choose Satellite --</option>
-          <option value="25544">ISS (Space Station)</option>
-          <option value="20580">Hubble Telescope</option>
-          <option value="48274">Tiangong (China)</option>
-          <option value="25867">NOAA 15 (Weather)</option>
-        </select>
-        <button class="btn" onclick="setTarget(1, 'Moon', 0)">Moon</button>
-        <button class="btn" onclick="setTarget(1, 'Mars', 1)">Mars</button>
-        <button class="btn" onclick="setTarget(1, 'Jupiter', 4)">Jupiter</button>
-        <button class="btn" onclick="setTarget(1, 'Saturn', 5)">Saturn</button>
-      </div>
-  
-      <div class="input-group">
-        <input type="number" id="norad" placeholder="Custom NORAD ID">
-        <button class="btn" onclick="setCustomSat()">Track ID</button>
-      </div>
-    </div>
-  
-    <script>
-      var map = L.map('map').setView([0, 0], 2);
-      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png').addTo(map);
-      var marker = L.marker([0, 0]).addTo(map);
-  
-      function setTarget(type, name, val) { fetch('/set?type='+type+'&name='+name+'&val='+val); }
-      function setCustomSat() {
-        var id = document.getElementById('norad').value;
-        if(id) setTarget(0, 'Custom', id);
-      }
-      function syncGPS() {
-        navigator.geolocation.getCurrentPosition(function(p) {
-          fetch('/updateLoc?lat='+p.coords.latitude+'&lon='+p.coords.longitude+'&alt='+(p.coords.altitude||50));
-          alert("GPS Updated!");
-        });
-      }
-  
-      setInterval(function() {
-        fetch('/data').then(function(res) { return res.json(); }).then(function(d) {
-          var isSat = d.type === 0;
-  
-          // name + pointing
-          document.getElementById('target-name').innerText = d.name;
-          document.getElementById('az').innerText = d.az.toFixed(2);
-          document.getElementById('el').innerText = d.el.toFixed(2);
-  
-          // speed (same for both — always km/s)
-          document.getElementById('speed').innerText = d.speed > 0 ? d.speed.toFixed(2) : '--';
-  
-          // altitude label: "km altitude" for sats, "km from Earth" for planets
-          document.querySelector('[data-lbl="alt"]').innerText  = isSat ? 'km altitude'   : 'km from Earth';
-          document.getElementById('alt').innerText = d.alt > 0 ? Math.round(d.alt) : '--';
-  
-          // distance label: "km distance" for sats, same "km from Earth" for planets
-          document.querySelector('[data-lbl="dist"]').innerText = isSat ? 'km distance'   : 'km from observer';
-          document.getElementById('dist').innerText = d.dist > 0 ? Math.round(d.dist) : '--';
-  
-          // next pass row: labels and value format differ by type
-          document.querySelector('[data-lbl="pass"]').innerText = isSat ? 'Next pass' : 'Rises at';
-          document.querySelector('[data-lbl="lose"]').innerText = isSat ? 'Max el'    : 'Sets at';
-          document.getElementById('nextPass').innerText = d.nextPass || '--:--';
-          if (isSat) {
-            document.getElementById('nextPassEl').innerText = d.nextPassEl > 0 ? d.nextPassEl + '\u00b0' : '--';
-          } else {
-            document.getElementById('nextPassEl').innerText = d.nextPassLOS || '--:--';
-          }
-  
-          // map: only move for satellites
-          marker.setLatLng([d.sLat, d.sLon]);
-          if (isSat) map.panTo([d.sLat, d.sLon]);
-        });
-      }, 2000);
-    </script>
-  </body>
-  </html>)rawliteral";
+    
+      <script>
+        var map = L.map('map').setView([0, 0], 2);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png').addTo(map);
+        var marker = L.marker([0, 0]).addTo(map);
+    
+        function setTarget(type, name, val) { fetch('/set?type='+type+'&name='+name+'&val='+val); }
+        function setCustomSat() {
+          var id = document.getElementById('norad').value;
+          if(id) setTarget(0, 'Custom', id);
+        }
+        function syncGPS() {
+          navigator.geolocation.getCurrentPosition(function(p) {
+            fetch('/updateLoc?lat='+p.coords.latitude+'&lon='+p.coords.longitude+'&alt='+(p.coords.altitude||50));
+            alert("GPS Updated!");
+          });
+        }
+    
+        setInterval(function() {
+          fetch('/data').then(function(res) { return res.json(); }).then(function(d) {
+            var isSat = d.type === 0;
+    
+            // name + pointing
+            document.getElementById('target-name').innerText = d.name;
+            document.getElementById('az').innerText = d.az.toFixed(2);
+            document.getElementById('el').innerText = d.el.toFixed(2);
+    
+            // speed (same for both — always km/s)
+            document.getElementById('speed').innerText = d.speed > 0 ? d.speed.toFixed(2) : '--';
+    
+            // altitude label: "km altitude" for sats, "km from Earth" for planets
+            document.querySelector('[data-lbl="alt"]').innerText  = isSat ? 'km altitude'   : 'km from Earth';
+            document.getElementById('alt').innerText = d.alt > 0 ? Math.round(d.alt) : '--';
+    
+            // distance label: "km distance" for sats, same "km from Earth" for planets
+            document.querySelector('[data-lbl="dist"]').innerText = isSat ? 'km distance'   : 'km from observer';
+            document.getElementById('dist').innerText = d.dist > 0 ? Math.round(d.dist) : '--';
+    
+            // next pass row: labels and value format differ by type
+            document.querySelector('[data-lbl="pass"]').innerText = isSat ? 'Next pass' : 'Rises at';
+            document.querySelector('[data-lbl="lose"]').innerText = isSat ? 'Max el'    : 'Sets at';
+            document.getElementById('nextPass').innerText = d.nextPass || '--:--';
+            if (isSat) {
+              document.getElementById('nextPassEl').innerText = d.nextPassEl > 0 ? d.nextPassEl + '\u00b0' : '--';
+            } else {
+              document.getElementById('nextPassEl').innerText = d.nextPassLOS || '--:--';
+            }
+    
+            // map: only move for satellites
+            marker.setLatLng([d.sLat, d.sLon]);
+            if (isSat) map.panTo([d.sLat, d.sLon]);
+          });
+        }, 2000);
+      </script>
+    </body>
+  </html>
+  )rawliteral";
 
 
 void setup() {
@@ -288,7 +301,7 @@ void setup() {
   // I2C bus — shared by BNO055, AS5600, and LCD
   Wire.begin(); // SDA=21, SCL=22
   Wire.setClock(400000);
-  
+
   // ── LCD detection ──────────────────────────────────────────────────
   // Probe the I2C bus for the LCD address before init.
   // Wire.endTransmission()==0 means a device ACK'd at that address.
