@@ -481,7 +481,14 @@ void setup() {
           }
           next.type = TYPE_SATELLITE;
           next.noradID = val;
-          snprintf(next.name, sizeof(next.name), "NORAD %ld", val);
+          String requestedName = r->arg("name");
+          requestedName.trim();
+          if (requestedName.length() > 0) {
+              requestedName.toCharArray(next.name, sizeof(next.name));
+              next.name[sizeof(next.name) - 1] = 0;
+          } else {
+              snprintf(next.name, sizeof(next.name), "NORAD %ld", val);
+          }
       } else {
           if (!TrackingMath::supportedPlanetBody((int)val)) {
               r->send(400, "text/plain", "Unsupported planetary body.");
