@@ -419,8 +419,8 @@ void setup() {
       }
       double lat, lon, alt;
       if (!parseDoubleArg(r, "lat", lat) || !parseDoubleArg(r, "lon", lon) ||
-          !parseDoubleArg(r, "alt", alt) || lat < -90.0 || lat > 90.0 ||
-          lon < -180.0 || lon > 180.0 || alt < -500.0 || alt > 10000.0) {
+          !parseDoubleArg(r, "alt", alt) ||
+          !TrackingMath::validObserver(lat, lon, alt)) {
           r->send(400, "text/plain", "Invalid location. Check latitude, longitude and altitude.");
           return;
       }
@@ -456,20 +456,20 @@ void setup() {
       const String typeArg = r->arg("type");
       const String valArg = r->arg("val");
       long type = strtol(typeArg.c_str(), &end, 10);
-      if (end == typeArg.c_str() || *end != '\\0' || (type != 0 && type != 1)) {
+      if (end == typeArg.c_str() || *end != '\0' || (type != 0 && type != 1)) {
           r->send(400, "text/plain", "Invalid target type.");
           return;
       }
       end = nullptr;
       long val = strtol(valArg.c_str(), &end, 10);
-      if (end == valArg.c_str() || *end != '\\0') {
+      if (end == valArg.c_str() || *end != '\0') {
           r->send(400, "text/plain", "Invalid target ID.");
           return;
       }
 
       TargetState next = {};
       if (type == TYPE_SATELLITE) {
-          if (val < 1 || val > 999999) {
+          if (!TrackingMath::validNoradId(val)) {
               r->send(400, "text/plain", "NORAD ID is outside the accepted range.");
               return;
           }
@@ -477,14 +477,13 @@ void setup() {
           next.noradID = val;
           snprintf(next.name, sizeof(next.name), "NORAD %ld", val);
       } else {
-          const char *name = planetName((int)val);
-          if (name == nullptr) {
+          if (!TrackingMath::supportedPlanetBody((int)val)) {
               r->send(400, "text/plain", "Unsupported planetary body.");
               return;
           }
           next.type = TYPE_PLANET;
           next.body = (int)val;
-          strlcpy(next.name, name, sizeof(next.name));
+          strlcpy(next.name, planetName((int)val), sizeof(next.name));
       }
 
       if (xSemaphoreTake(targetMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
@@ -625,8 +624,7 @@ bool getObserverSnapshot(double &lat, double &lon, double &alt) {
   if (sysMutex == NULL || xSemaphoreTake(sysMutex, pdMS_TO_TICKS(20)) != pdTRUE) return false;
   lat = sys.lat; lon = sys.lon; alt = sys.alt;
   xSemaphoreGive(sysMutex);
-  return isfinite(lat) && isfinite(lon) && isfinite(alt) &&
-         lat >= -90.0 && lat <= 90.0 && lon >= -180.0 && lon <= 180.0;
+  return TrackingMath::validObserver(lat, lon, alt);
 }
 
 bool parseDoubleArg(AsyncWebServerRequest *request, const char *name, double &value) {
@@ -634,7 +632,7 @@ bool parseDoubleArg(AsyncWebServerRequest *request, const char *name, double &va
   const String arg = request->arg(name);
   char *end = nullptr;
   value = strtod(arg.c_str(), &end);
-  return end != arg.c_str() && *end == '\\0' && isfinite(value);
+  return end != arg.c_str() && *end == '\0' && isfinite(value);
 }
 
 const char *planetName(int body) {
@@ -798,12 +796,20 @@ void PhysicsTask(void * p) {
           sys.satDist = satDist;
           xSemaphoreGive(sysMutex);
 
+          bool motorTargetWritten = false;
           if (xSemaphoreTake(targetMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-              motorTarget.az = (float)targetAz;
-              motorTarget.el = (float)targetEl;
+              const bool stillSelected =
+                  current.type == target.type &&
+                  ((target.type == TYPE_SATELLITE && current.noradID == target.noradID) ||
+                   (target.type == TYPE_PLANET && current.body == target.body));
+              if (stillSelected) {
+                  motorTarget.az = (float)targetAz;
+                  motorTarget.el = (float)targetEl;
+                  motorTargetWritten = true;
+              }
               xSemaphoreGive(targetMutex);
           }
-          targetCalculationReady = true;
+          targetCalculationReady = motorTargetWritten;
       } else {
           targetCalculationReady = false;
       }
@@ -821,8 +827,10 @@ void MotorTask(void * p) {
 
   for (;;) {
       float targetAz = 0.0f, targetEl = 0.0f;
+      TargetState activeTarget = {};
       bool targetRead = false;
       if (xSemaphoreTake(targetMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+          activeTarget = current;
           targetAz = motorTarget.az;
           targetEl = motorTarget.el;
           targetRead = true;
@@ -833,7 +841,6 @@ void MotorTask(void * p) {
           resetPIDs();
           pidResetRequested = false;
       }
-      const TargetState activeTarget = getTargetSnapshot();
       const bool orbitalDataReady = activeTarget.type != TYPE_SATELLITE || tleReady;
       if (!targetRead || !timeReady || !observerReady || !targetCalculationReady ||
           !orbitalDataReady || !bnoReady || !encoderReady || !isfinite(targetAz) ||
@@ -1055,8 +1062,8 @@ void fetchTLE() {
             if (status == HTTP_CODE_OK) {
                 StaticJsonDocument<1024> doc;
                 const DeserializationError error = deserializeJson(doc, http.getString());
-                const char *rawLine1 = doc["line1"] | (const char *)nullptr;
-                const char *rawLine2 = doc["line2"] | (const char *)nullptr;
+                const char *rawLine1 = doc["line1"].as<const char *>();
+                const char *rawLine2 = doc["line2"].as<const char *>();
 
                 if (!error && rawLine1 != nullptr && rawLine2 != nullptr &&
                     strlen(rawLine1) >= 69 && strlen(rawLine2) >= 69 &&
@@ -1081,7 +1088,7 @@ void fetchTLE() {
                     Serial.println("ERROR: TLE response was invalid or incomplete.");
                 }
             } else {
-                Serial.printf("ERROR: TLE server returned HTTP %d\\n", status);
+                Serial.printf("ERROR: TLE server returned HTTP %d\n", status);
             }
             http.end();
         }
