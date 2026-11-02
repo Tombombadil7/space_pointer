@@ -9,6 +9,11 @@
  */
 
 #include <WiFiManager.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <math.h>
+#include <stdlib.h>
+#include <string.h>
 #include <ESPAsyncWebServer.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
@@ -23,17 +28,17 @@
 // Azimuth A4988
 #define AZ_STEP_PIN    12
 #define AZ_DIR_PIN     13
-#define AZ_EN_PIN      25    // LOW = enabled; pull LOW permanently if unused
+#define AZ_EN_PIN      16    // LOW = enabled; GPIO16 on ESP32-S3-DevKitC-1
 
 // Elevation A4988
 #define EL_STEP_PIN    14
 #define EL_DIR_PIN     15
-#define EL_EN_PIN      26    // LOW = enabled; pull LOW permanently if unused
+#define EL_EN_PIN      17    // LOW = enabled; GPIO17 on ESP32-S3-DevKitC-1
 // MS pins: tie physically to 3.3V for 1/16 microstepping (no code needed)
 // A4988: MS1=HIGH, MS2=HIGH, MS3=HIGH → 1/16 step
 
 // ── Motor constants ─────────────────────────────────────────────────────
-// 28BYJ-48 bipolar: 2048 full steps/rev × 16 microsteps = 32768 microsteps/rev
+// Set this for the actual bipolar motor, gearbox, and microstep configuration.
 #define MICROSTEPS_PER_REV  32768UL
 #define STEP_PULSE_US     50      // µs per pulse
 #define MOTOR_TASK_MS     25      // MotorTask period in ms
@@ -84,10 +89,34 @@ struct PID {
 };
 struct MotorTarget { float az = 0; float el = 0; } motorTarget;
 
-PID pidAz = {2.5f, 0.02f, 0.4f, 1.5f};   // tune these after first run
-PID pidEl = {3.0f, 0.03f, 0.5f, 1.0f};
-SemaphoreHandle_t targetMutex;
-SemaphoreHandle_t i2cMutex;
+PID pidAz = {0.0f, 0.0f, 2.5f, 0.02f, 0.4f, 1.5f};
+PID pidEl = {0.0f, 0.0f, 3.0f, 0.03f, 0.5f, 1.0f};
+SemaphoreHandle_t targetMutex;   // protects current and motorTarget
+SemaphoreHandle_t i2cMutex;      // protects the shared I2C bus
+SemaphoreHandle_t sysMutex;      // protects observer and telemetry state
+SemaphoreHandle_t sgp4Mutex;     // protects the shared SGP4 instance
+SemaphoreHandle_t tleFetchMutex;
+
+volatile bool bnoReady = false;
+volatile bool encoderReady = false;
+volatile bool observerReady = false;
+volatile bool timeReady = false;
+volatile bool tleReady = false;
+
+// Change both credentials before deploying outside a trusted test network.
+static const char *CONTROL_USER = "admin";
+static const char *CONTROL_PASSWORD = "spacepointer-change-me";
+static const char *SETUP_AP_PASSWORD = "SpacePointerSetup";
+
+struct TelemetrySnapshot {
+  double lat, lon, alt;
+  double targetAz, targetEl;
+  double satLat, satLon;
+  double satSpeed, satAltKm, satDist;
+  bool nextPassValid;
+  time_t nextPassAOS, nextPassLOS;
+  double nextPassMaxEl;
+};
 // ── AS5600 encoder ──────────────────────────────────────────────────────
 AS5600 encoder;   // default I2C address 0x36, shares bus with BNO055 (0x28)
 // LCD — try 0x27 first, some boards use 0x3F
@@ -97,8 +126,16 @@ bool lcdFound = false;   // set in setup(), checked before creating DisplayTask
 
 
 void DisplayTask(void * p);
-void updateIPLocation();
+bool updateIPLocation();
 void fetchTLE();
+bool startTLEFetchTask();
+TargetState getTargetSnapshot();
+TelemetrySnapshot getTelemetrySnapshot();
+bool getObserverSnapshot(double &lat, double &lon, double &alt);
+bool parseDoubleArg(AsyncWebServerRequest *request, const char *name, double &value);
+void disableMotors();
+void resetPIDs();
+const char *planetName(int body);
 void PhysicsTask(void * p);
 void stepMotor(int stepPin, int dirPin, bool forward);
 int pidOutput(PID &p, float error, float dt);
@@ -209,8 +246,8 @@ const char index_html[] PROGMEM = R"rawliteral(
             <option value="48274">Tiangong (China)</option>
             <option value="25867">NOAA 15 (Weather)</option>
           </select>
-          <button class="btn" onclick="setTarget(1, 'Moon', 0)">Moon</button>
-          <button class="btn" onclick="setTarget(1, 'Mars', 1)">Mars</button>
+          <button class="btn" onclick="setTarget(1, 'Moon', 10)">Moon</button>
+          <button class="btn" onclick="setTarget(1, 'Mars', 3)">Mars</button>
           <button class="btn" onclick="setTarget(1, 'Jupiter', 4)">Jupiter</button>
           <button class="btn" onclick="setTarget(1, 'Saturn', 5)">Saturn</button>
         </div>
@@ -226,15 +263,20 @@ const char index_html[] PROGMEM = R"rawliteral(
         L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png').addTo(map);
         var marker = L.marker([0, 0]).addTo(map);
     
-        function setTarget(type, name, val) { fetch('/set?type='+type+'&name='+name+'&val='+val); }
+        function setTarget(type, name, val) {
+          fetch('/set?type='+type+'&name='+encodeURIComponent(name)+'&val='+val)
+            .then(function(r) { if (!r.ok) throw new Error('Target update failed: '+r.status); })
+            .catch(function(e) { alert(e.message); });
+        }
         function setCustomSat() {
           var id = document.getElementById('norad').value;
           if(id) setTarget(0, 'Custom', id);
         }
         function syncGPS() {
           navigator.geolocation.getCurrentPosition(function(p) {
-            fetch('/updateLoc?lat='+p.coords.latitude+'&lon='+p.coords.longitude+'&alt='+(p.coords.altitude||50));
-            alert("GPS Updated!");
+            fetch('/updateLoc?lat='+p.coords.latitude+'&lon='+p.coords.longitude+'&alt='+(p.coords.altitude||50))
+              .then(function(r) { if (!r.ok) throw new Error('Location update failed: '+r.status); alert("GPS Updated!"); })
+              .catch(function(e) { alert(e.message); });
           });
         }
     
@@ -285,21 +327,27 @@ void setup() {
   Serial.println("\nStarting Universal Space Pointer...");
 
   // ── 2. FreeRTOS Primitives ─────────────────────────────────────────
-  targetMutex = xSemaphoreCreateMutex();
-  i2cMutex    = xSemaphoreCreateMutex();
-  if (targetMutex == NULL || i2cMutex == NULL) {
+  targetMutex   = xSemaphoreCreateMutex();
+  i2cMutex      = xSemaphoreCreateMutex();
+  sysMutex      = xSemaphoreCreateMutex();
+  sgp4Mutex     = xSemaphoreCreateMutex();
+  tleFetchMutex = xSemaphoreCreateMutex();
+  if (targetMutex == NULL || i2cMutex == NULL || sysMutex == NULL ||
+      sgp4Mutex == NULL || tleFetchMutex == NULL) {
       Serial.println("CRITICAL: Failed to create mutexes! Halting.");
-      while(1);
+      while (1) { delay(1000); }
   }
 
   // ── 3. Hardware Initialization ─────────────────────────────────────
   pinMode(AZ_STEP_PIN, OUTPUT); pinMode(AZ_DIR_PIN, OUTPUT);
   pinMode(EL_STEP_PIN, OUTPUT); pinMode(EL_DIR_PIN, OUTPUT);
-  pinMode(AZ_EN_PIN, OUTPUT);   digitalWrite(AZ_EN_PIN, LOW);
-  pinMode(EL_EN_PIN, OUTPUT);   digitalWrite(EL_EN_PIN, LOW);
+  pinMode(AZ_EN_PIN, OUTPUT);   digitalWrite(AZ_EN_PIN, HIGH); // disabled
+  pinMode(EL_EN_PIN, OUTPUT);   digitalWrite(EL_EN_PIN, HIGH); // disabled
+  pinMode(AZ_STEP_PIN, OUTPUT); digitalWrite(AZ_STEP_PIN, LOW);
+  pinMode(EL_STEP_PIN, OUTPUT); digitalWrite(EL_STEP_PIN, LOW);
 
-  // I2C bus — shared by BNO055, AS5600, and LCD
-  Wire.begin(); // SDA=21, SCL=22
+  // ESP32-S3 DevKitC-1 I2C mapping; all three peripherals share this bus.
+  Wire.begin(8, 9); // SDA=GPIO8, SCL=GPIO9
   Wire.setClock(400000);
 
   // ── LCD detection ──────────────────────────────────────────────────
@@ -330,84 +378,184 @@ void setup() {
 
   // ── AS5600 encoder ─────────────────────────────────────────────────
   encoder.begin();
-  if (!encoder.isConnected()) {
-      Serial.println("WARNING: AS5600 not found — check wiring");
+  encoderReady = encoder.isConnected();
+  if (!encoderReady) {
+      Serial.println("WARNING: AS5600 not found — motor control will stay disabled");
+  } else {
+      encoder.setDirection(AS5600_CLOCK_WISE);
   }
-  encoder.setDirection(AS5600_CLOCK_WISE);
 
   // ── BNO055 IMU ─────────────────────────────────────────────────────
-  if (!bno.begin()) {
-      Serial.println("WARNING: BNO055 not found — check wiring");
+  bnoReady = bno.begin();
+  if (!bnoReady) {
+      Serial.println("WARNING: BNO055 not found — motor control will stay disabled");
   }
 
   // ── 4. Network & Web Services ──────────────────────────────────────
   WiFiManager wm;
-  wm.autoConnect("SpaceTracker_AP");
-  updateIPLocation();
+  if (!wm.autoConnect("SpaceTracker_AP", SETUP_AP_PASSWORD)) {
+      Serial.println("ERROR: Wi-Fi connection/configuration failed; motors remain disabled.");
+      disableMotors();
+      while (1) { delay(1000); }
+  }
+  observerReady = updateIPLocation();
+  if (!observerReady) {
+      Serial.println("WARNING: IP geolocation failed; use Sync Phone GPS before tracking.");
+  }
 
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *r){
       r->send(200, "text/html", index_html);
   });
 
   server.on("/updateLoc", HTTP_GET, [](AsyncWebServerRequest *r){
-      sys.lat = r->arg("lat").toDouble();
-      sys.lon = r->arg("lon").toDouble();
-      sys.alt = r->arg("alt").toDouble();
-      if (current.type == TYPE_SATELLITE)
-          xTaskCreate([](void*){ fetchTLE(); vTaskDelete(NULL); }, "TLE", 8000, NULL, 1, NULL);
-      r->send(200, "text/plain", "OK");
+      if (!r->authenticate(CONTROL_USER, CONTROL_PASSWORD)) {
+          r->requestAuthentication();
+          return;
+      }
+      double lat, lon, alt;
+      if (!parseDoubleArg(r, "lat", lat) || !parseDoubleArg(r, "lon", lon) ||
+          !parseDoubleArg(r, "alt", alt) || lat < -90.0 || lat > 90.0 ||
+          lon < -180.0 || lon > 180.0 || alt < -500.0 || alt > 10000.0) {
+          r->send(400, "text/plain", "Invalid location. Check latitude, longitude and altitude.");
+          return;
+      }
+      if (xSemaphoreTake(sysMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+          r->send(503, "text/plain", "System busy; retry location update.");
+          return;
+      }
+      sys.lat = lat; sys.lon = lon; sys.alt = alt;
+      xSemaphoreGive(sysMutex);
+      observerReady = true;
+
+      TargetState target = getTargetSnapshot();
+      if (target.type == TYPE_SATELLITE) {
+          if (!startTLEFetchTask()) {
+              r->send(503, "text/plain", "Could not start TLE refresh; motors remain disabled.");
+              return;
+          }
+      }
+      r->send(202, "text/plain", "Location accepted.");
   });
 
   server.on("/set", HTTP_GET, [](AsyncWebServerRequest *r){
-      int    type = r->arg("type").toInt();
-      String name = r->arg("name");
-      long   val  = r->arg("val").toInt();
-      if (type == 0) {
-          current.type    = TYPE_SATELLITE;
-          current.noradID = val;
-          strncpy(current.name, name.c_str(), 20);
-          xTaskCreate([](void*){ fetchTLE(); vTaskDelete(NULL); }, "TLE", 8000, NULL, 1, NULL);
-      } else {
-          current.type = TYPE_PLANET;
-          current.body = (astro_body_t)val;
-          strncpy(current.name, name.c_str(), 20);
+      if (!r->authenticate(CONTROL_USER, CONTROL_PASSWORD)) {
+          r->requestAuthentication();
+          return;
       }
-      r->send(200, "text/plain", "OK");
+      if (!r->hasArg("type") || !r->hasArg("val")) {
+          r->send(400, "text/plain", "Missing target type or value.");
+          return;
+      }
+      char *end = nullptr;
+      const String typeArg = r->arg("type");
+      const String valArg = r->arg("val");
+      long type = strtol(typeArg.c_str(), &end, 10);
+      if (end == typeArg.c_str() || *end != '\\0' || (type != 0 && type != 1)) {
+          r->send(400, "text/plain", "Invalid target type.");
+          return;
+      }
+      end = nullptr;
+      long val = strtol(valArg.c_str(), &end, 10);
+      if (end == valArg.c_str() || *end != '\\0') {
+          r->send(400, "text/plain", "Invalid target ID.");
+          return;
+      }
+
+      TargetState next = {};
+      if (type == TYPE_SATELLITE) {
+          if (val < 1 || val > 999999) {
+              r->send(400, "text/plain", "NORAD ID is outside the accepted range.");
+              return;
+          }
+          next.type = TYPE_SATELLITE;
+          next.noradID = val;
+          snprintf(next.name, sizeof(next.name), "NORAD %ld", val);
+      } else {
+          const char *name = planetName((int)val);
+          if (name == nullptr) {
+              r->send(400, "text/plain", "Unsupported planetary body.");
+              return;
+          }
+          next.type = TYPE_PLANET;
+          next.body = (int)val;
+          strlcpy(next.name, name, sizeof(next.name));
+      }
+
+      if (xSemaphoreTake(targetMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+          r->send(503, "text/plain", "Target controller busy; retry.");
+          return;
+      }
+      current = next;
+      motorTarget.az = 0;
+      motorTarget.el = 0;
+      xSemaphoreGive(targetMutex);
+      resetPIDs();
+
+      if (next.type == TYPE_SATELLITE) {
+          if (!startTLEFetchTask()) {
+              r->send(503, "text/plain", "Could not start TLE download; motors remain disabled.");
+              return;
+          }
+      }
+      r->send(202, "text/plain", "Target accepted.");
   });
 
   server.on("/data", HTTP_GET, [](AsyncWebServerRequest *r){
+      const TargetState target = getTargetSnapshot();
+      const TelemetrySnapshot data = getTelemetrySnapshot();
       StaticJsonDocument<512> doc;
-      doc["name"]  = current.name;
-      doc["type"]  = current.type;
-      doc["az"]    = sys.targetAz;
-      doc["el"]    = sys.targetEl;
-      doc["sLat"]  = sys.satLat;
-      doc["sLon"]  = sys.satLon;
-      doc["speed"] = sys.satSpeed;
-      doc["alt"]   = satSgp4.satAlt;
-      doc["dist"]  = satSgp4.satDist;
-      if (sys.nextPassValid) {
-          struct tm *aos = gmtime(&sys.nextPassAOS);
-          char buf[20];
-          snprintf(buf, sizeof(buf), "%02d:%02d UTC", aos->tm_hour, aos->tm_min);
-          doc["nextPass"]   = buf;
-          doc["nextPassEl"] = (int)sys.nextPassMaxEl;
+      doc["name"]  = target.name;
+      doc["type"]  = target.type;
+      doc["az"]    = data.targetAz;
+      doc["el"]    = data.targetEl;
+      doc["sLat"]  = data.satLat;
+      doc["sLon"]  = data.satLon;
+      doc["speed"] = data.satSpeed;
+      doc["alt"]   = data.satAltKm;
+      doc["dist"]  = data.satDist;
+      if (data.nextPassValid) {
+          char aos[24], los[24];
+          struct tm aosUtc, losUtc;
+          gmtime_r(&data.nextPassAOS, &aosUtc);
+          gmtime_r(&data.nextPassLOS, &losUtc);
+          snprintf(aos, sizeof(aos), "%02d:%02d UTC", aosUtc.tm_hour, aosUtc.tm_min);
+          snprintf(los, sizeof(los), "%02d:%02d UTC", losUtc.tm_hour, losUtc.tm_min);
+          doc["nextPass"] = aos;
+          doc["nextPassLOS"] = los;
+          doc["nextPassEl"] = (int)data.nextPassMaxEl;
       } else {
-          doc["nextPass"]   = "--:--";
+          doc["nextPass"] = "--:--";
+          doc["nextPassLOS"] = "--:--";
           doc["nextPassEl"] = 0;
       }
-      String out; serializeJson(doc, out);
+      String out;
+      serializeJson(doc, out);
       r->send(200, "application/json", out);
   });
 
   server.begin();
 
   // ── 5. Time Synchronization ────────────────────────────────────────
-  configTime(7200, 3600, "pool.ntp.org");
+  // Astronomy calculations are based on UTC; do not apply local timezone offsets.
+  configTime(0, 0, "pool.ntp.org");
   Serial.print("Waiting for NTP time sync...");
-  time_t now;
-  while (time(&now) < 1000000000) { delay(100); Serial.print("."); }
-  Serial.println("\nTime synchronized!");
+  time_t now = 0;
+  const uint32_t ntpStart = millis();
+  while (time(&now) < 1000000000 && millis() - ntpStart < 45000) {
+      delay(250);
+      Serial.print(".");
+  }
+  timeReady = (time(&now) >= 1000000000);
+  if (timeReady) {
+      Serial.println("\\nTime synchronized (UTC)!");
+  } else {
+      Serial.println("\\nWARNING: NTP sync timed out; motor tracking remains disabled.");
+  }
+
+  // Load the default ISS TLE before the physics task can use the SGP4 object.
+  if (timeReady && observerReady) {
+      fetchTLE();
+  }
 
   if (lcdFound) {
       lcd.clear();
@@ -418,8 +566,14 @@ void setup() {
 
   // ── 6. Task Creation ───────────────────────────────────────────────
   // WiFi stack runs on Core 0 — put Physics on Core 1 to avoid contention
-  xTaskCreatePinnedToCore(PhysicsTask, "Physics", 15000, NULL, 2, NULL, 1);
-  xTaskCreatePinnedToCore(MotorTask,   "Motors",  8000,  NULL, 3, NULL, 0);
+  if (xTaskCreatePinnedToCore(PhysicsTask, "Physics", 15000, NULL, 2, NULL, 1) != pdPASS) {
+      Serial.println("CRITICAL: Physics task creation failed.");
+      disableMotors();
+  }
+  if (xTaskCreatePinnedToCore(MotorTask, "Motors", 8000, NULL, 3, NULL, 0) != pdPASS) {
+      Serial.println("CRITICAL: Motor task creation failed.");
+      disableMotors();
+  }
 
   // Only create DisplayTask if an LCD was actually found
   if (lcdFound) {
@@ -434,14 +588,93 @@ void loop() {
 }
 
 
-float wrapAngle(float e) {          // keep error in -180..+180
-  while (e >  180.f) e -= 360.f;
+
+TargetState getTargetSnapshot() {
+  TargetState result = {};
+  if (targetMutex != NULL && xSemaphoreTake(targetMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+      result = current;
+      xSemaphoreGive(targetMutex);
+  }
+  return result;
+}
+
+TelemetrySnapshot getTelemetrySnapshot() {
+  TelemetrySnapshot result = {};
+  if (sysMutex != NULL && xSemaphoreTake(sysMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+      result.lat = sys.lat; result.lon = sys.lon; result.alt = sys.alt;
+      result.targetAz = sys.targetAz; result.targetEl = sys.targetEl;
+      result.satLat = sys.satLat; result.satLon = sys.satLon;
+      result.satSpeed = sys.satSpeed; result.satAltKm = sys.satAltKm;
+      result.satDist = sys.satDist;
+      result.nextPassValid = sys.nextPassValid;
+      result.nextPassAOS = sys.nextPassAOS; result.nextPassLOS = sys.nextPassLOS;
+      result.nextPassMaxEl = sys.nextPassMaxEl;
+      xSemaphoreGive(sysMutex);
+  }
+  return result;
+}
+
+bool getObserverSnapshot(double &lat, double &lon, double &alt) {
+  if (sysMutex == NULL || xSemaphoreTake(sysMutex, pdMS_TO_TICKS(20)) != pdTRUE) return false;
+  lat = sys.lat; lon = sys.lon; alt = sys.alt;
+  xSemaphoreGive(sysMutex);
+  return isfinite(lat) && isfinite(lon) && isfinite(alt) &&
+         lat >= -90.0 && lat <= 90.0 && lon >= -180.0 && lon <= 180.0;
+}
+
+bool parseDoubleArg(AsyncWebServerRequest *request, const char *name, double &value) {
+  if (!request->hasArg(name)) return false;
+  const String arg = request->arg(name);
+  char *end = nullptr;
+  value = strtod(arg.c_str(), &end);
+  return end != arg.c_str() && *end == '\\0' && isfinite(value);
+}
+
+const char *planetName(int body) {
+  switch (body) {
+    case BODY_MOON: return "Moon";
+    case BODY_MARS: return "Mars";
+    case BODY_JUPITER: return "Jupiter";
+    case BODY_SATURN: return "Saturn";
+    default: return nullptr;
+  }
+}
+
+void disableMotors() {
+  digitalWrite(AZ_EN_PIN, HIGH);
+  digitalWrite(EL_EN_PIN, HIGH);
+}
+
+void resetPIDs() {
+  pidAz.integral = 0; pidAz.lastErr = 0;
+  pidEl.integral = 0; pidEl.lastErr = 0;
+}
+
+bool startTLEFetchTask() {
+  tleReady = false;
+  return xTaskCreate([](void *) {
+      fetchTLE();
+      vTaskDelete(NULL);
+  }, "TLE", 10000, NULL, 1, NULL) == pdPASS;
+}
+
+float wrapAngle(float e) {
+  if (!isfinite(e)) return 0.0f;
+  while (e > 180.f) e -= 360.f;
   while (e < -180.f) e += 360.f;
   return e;
 }
 
 int pidOutput(PID &p, float error, float dt) {
-    if (fabsf(error) < p.deadband) { p.integral = 0; return 0; }
+    if (!isfinite(error) || !isfinite(dt) || dt <= 0.0f) {
+        p.integral = 0; p.lastErr = 0;
+        return 0;
+    }
+    if (fabsf(error) < p.deadband) {
+        p.integral = 0;
+        p.lastErr = error;
+        return 0;
+    }
     p.integral  = constrain(p.integral + error * dt, -40.f, 40.f);
     float deriv = (error - p.lastErr) / dt;
     p.lastErr   = error;
