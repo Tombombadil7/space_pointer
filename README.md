@@ -2,7 +2,7 @@
 
 An experimental ESP32-S3 project for pointing a two-axis motorized mount at selected satellites and solar-system objects. The firmware combines orbital/astronomical calculations with an IMU, a magnetic rotary encoder, stepper-motor drivers, an LCD, and a browser-based control panel.
 
-> **Project status:** prototype / work in progress. This README documents the current repository. A static code review found build, pin-mapping, and runtime issues that should be resolved before connecting motor power. A successful PlatformIO build or full hardware test has not been verified.
+> **Project status:** prototype / work in progress. The `fix/esp32s3-tracking-safety` branch contains a software remediation pass and automated build/test workflows. The firmware has not yet been verified on the physical mount. Do not connect motor power until the pin map, motor wiring, current limits, mechanics, and emergency-stop arrangement have been checked.
 
 ## Intended features
 
@@ -36,9 +36,9 @@ The code indicates the following intended bill of materials:
 1. **28BYJ-48 compatibility:** a common stock 28BYJ-48 is a five-wire unipolar motor. An A4988 is intended for a four-wire bipolar stepper. Use a genuine four-wire bipolar motor, or deliberately convert a compatible 28BYJ-48 to bipolar wiring before connecting it. Do not connect a stock five-wire motor to an A4988 as-is.
 2. **Motor power:** use a separate, correctly rated motor supply and connect its ground to ESP32 ground. Set each A4988 current limit for the actual motor. Fit the driver's recommended supply decoupling capacitor close to each driver and provide cooling as required.
 3. **Logic levels:** ESP32-S3 GPIOs are 3.3 V logic and are not 5 V tolerant. Check the LCD backpack's I2C pull-up voltage; use 3.3 V pull-ups or a suitable bidirectional I2C level shifter if the backpack pulls SDA/SCL up to 5 V.
-4. **Do not wire the current ENABLE pin assignments yet.** The code currently assigns azimuth ENABLE to GPIO25 and elevation ENABLE to GPIO26. GPIO25 is not exposed as a usable GPIO on the ESP32-S3-DevKitC-1, and GPIO26–GPIO32 are normally reserved for SPI flash/PSRAM on ESP32-S3 modules. Reassign both ENABLE signals to verified, exposed GPIOs before powering the drivers.
-5. **I2C pins:** the source comment says SDA=21 and SCL=22, which is the familiar generic-ESP32 mapping, not the ESP32-S3-DevKitC-1 Arduino default. The S3 board mapping uses SDA=8 and SCL=9. Wire the BNO055, AS5600, and LCD to the same I2C bus, and preferably make the pin choice explicit in code with `Wire.begin(8, 9)` (or another verified mapping).
-6. Add mechanical hard stops, a physical emergency stop, and preferably limit switches before allowing unattended movement. Limit-switch and emergency-stop handling is not implemented in the current firmware.
+4. **Current ENABLE assignments:** the firmware branch uses GPIO16 (azimuth ENABLE) and GPIO17 (elevation ENABLE), as approved for the ESP32-S3-DevKitC-1. Verify the exact module variant and board revision before wiring.
+5. **I2C pins:** the firmware explicitly initializes SDA=GPIO8 and SCL=GPIO9. Connect the BNO055, AS5600, and LCD to this shared bus. Check the LCD backpack pull-up voltage; ESP32-S3 pins are not 5 V tolerant.
+6. Add mechanical hard stops, a physical emergency stop, and preferably limit switches before allowing movement. Limit-switch and emergency-stop handling is not implemented in this firmware. **Important:** when a fault occurs or the target is below the horizon, the firmware disables the A4988 drivers. Disabling a driver removes motor holding torque; counterbalance the elevation axis or add a suitable brake so the telescope cannot fall.
 
 ## Current firmware pin definitions
 
@@ -46,8 +46,8 @@ These are the definitions currently in `src/spacepointer_ver_2.cpp`; they are **
 
 | Axis | STEP | DIR | ENABLE | Review |
 |---|---:|---:|---:|---|
-| Azimuth | GPIO12 | GPIO13 | GPIO25 | STEP/DIR are exposed; GPIO25 is not a usable S3 DevKitC-1 pin. |
-| Elevation | GPIO14 | GPIO15 | GPIO26 | STEP/DIR are exposed; GPIO26 is normally reserved for flash/PSRAM. |
+| Azimuth | GPIO12 | GPIO13 | GPIO16 | Firmware assignment on the approved ESP32-S3 configuration. |
+| Elevation | GPIO14 | GPIO15 | GPIO17 | Firmware assignment on the approved ESP32-S3 configuration. |
 
 The source comments configure A4988 MS1, MS2, and MS3 high for 1/16 microstepping. Confirm the actual driver-board pinout and motor/gearbox step count. The `MICROSTEPS_PER_REV` constant is currently not used to convert pointing angles into calibrated mechanical positions.
 
@@ -75,49 +75,54 @@ pio run -t upload
 pio device monitor -b 115200
 ```
 
-**The current configuration/source needs the fixes listed in “Known issues” before expecting a successful build.** In particular, correct the AS5600 dependency entry and add the missing LiquidCrystal_I2C header include. These build commands are instructions, not a claim that the current commit has already compiled successfully.
+Run the native helper tests as well as the ESP32 build:
+```sh
+pio test -e native
+pio run -e esp32-s3-devkitc-1
+```
+
+The GitHub Actions workflow runs both commands on pushes to the fix branch and on pull requests. A green CI result verifies compilation and the hardware-independent helper tests; it does not replace bench testing, sensor calibration, or safe motor commissioning.
 
 ## First boot and operation
 
 1. Connect the ESP32-S3 to the computer and open the serial monitor at **115200 baud**.
-2. Configure Wi-Fi using the WiFiManager setup access point named `SpaceTracker_AP` when the device has no saved network credentials.
+2. Configure Wi-Fi using the WiFiManager setup access point named `SpaceTracker_AP`. Its current default password is `SpacePointerSetup`.
 3. Once connected to the same Wi-Fi network, find the ESP32's DHCP address in the router's client list and open `http://<ESP32-IP>/` in a browser.
 4. Select a listed satellite or planet, or enter a NORAD ID to request a satellite.
 5. Use **Sync Phone GPS** to send the phone's permitted location to the device. Browser geolocation requires user permission and may be restricted by browsers when the page is served over plain HTTP.
 6. The satellite TLE, IP geolocation, NTP time, Leaflet assets, and map tiles require internet access.
 
-The web server listens on port 80. The HTML page calls the `/data`, `/set`, and `/updateLoc` endpoints.
+The web server listens on port 80. The `/set` and `/updateLoc` control endpoints use HTTP Basic Authentication. The current source defaults are username `admin` and password `spacepointer-change-me`; change both control credentials and the setup AP password before deployment. Basic Authentication over plain HTTP does not encrypt credentials, so keep this device on a trusted local network and do not expose port 80 to the internet. The read-only `/data` endpoint and root page are not authenticated.
 
-## Known issues found in the code review
+## Implemented fixes and remaining commissioning work
 
-These are findings from static inspection of the current source, not a compiler or bench-test report.
+The `fix/esp32s3-tracking-safety` branch includes these software changes:
 
-### Build blockers
+- Corrected the AS5600 PlatformIO dependency and added the missing `Wire.h` and `LiquidCrystal_I2C.h` includes.
+- Changed driver ENABLE pins to GPIO16 and GPIO17; explicitly selected I2C GPIO8/GPIO9.
+- Corrected PID aggregate initialization so integral and previous-error state start at zero and the configured gains land in the intended fields.
+- Corrected the Moon and Mars body IDs (Moon=10, Mars=3) and the one-second planetary look-ahead using `Astronomy_AddDays`.
+- Added a TLE fetch/validation step before satellite calculations, serialized access to SGP4, and restored SGP4 to the current epoch after the velocity look-ahead.
+- Protected target, observer/telemetry, I2C, and SGP4 shared state with mutexes and used snapshots between tasks.
+- Added bounds checks for observer coordinates, NORAD IDs, and supported planetary bodies; added HTTP response/JSON/TLE validation.
+- Kept motor drivers disabled until time, location, orbital solution (for satellites), and both feedback sensors are ready. Sensor/mutex failures and below-horizon targets stop step pulses and disable the drivers.
+- Fixed satellite and planetary telemetry population and added the missing planetary set-time field to `/data`.
+- Added HTTP Basic Authentication to the target/location control endpoints, password-protected WiFiManager setup AP, native helper tests, and GitHub Actions build/test jobs.
 
-- In `platformio.ini`, the AS5600 dependency line begins with the stray word `Installing`. It should be a PlatformIO library specification such as `RobTillaart/AS5600 @ ^0.6.2`.
-- `src/spacepointer_ver_2.cpp` declares and uses `LiquidCrystal_I2C` but does not include `<LiquidCrystal_I2C.h>`. Add the header (and include `<Wire.h>` explicitly for clarity).
+### Still required before hardware operation
 
-### Hardware / motor-control blockers
+- Verify the physical ESP32-S3 module variant, GPIO16/17 availability, and all wiring against the actual board.
+- Use four-wire bipolar steppers with A4988 drivers, set driver current limits for the exact motor model, and use a correctly rated separate motor supply. The common stock five-wire 28BYJ-48 is not directly A4988-compatible.
+- Confirm the AS5600 magnet orientation, BNO055 mounting/alignment, motor directions, azimuth reference, elevation zero, gear ratios, microstep setting, and physical travel range. The firmware does not yet provide a full mount calibration wizard or closed-loop homing.
+- Add physical limit switches and an emergency stop. They are not implemented in software yet. A4988 disable removes holding torque; balance the elevation axis or use a brake to prevent it dropping when the driver is disabled.
+- Replace the example AP and web credentials in the source before deployment. HTTP Basic Authentication is not encrypted on the plain-HTTP connection.
+- IP geolocation currently uses the IP-API HTTP endpoint. Treat this as an approximate startup location; use the phone GPS update for a more accurate observer position.
+- Confirm the SGP4 library's returned altitude/distance units against its documentation and a known satellite pass; the current telemetry code retains the library's documented/public fields and assumes kilometres.
+- Complete a staged bench test: build, sensor-only checks, motor-driver tests with the mount unloaded, then slow tracking tests with hard stops and emergency stop available.
 
-- The ENABLE pins (GPIO25 and GPIO26) are unsuitable for the configured ESP32-S3-DevKitC-1. Reassign them before wiring.
-- The firmware starts the motor task even when the BNO055 or AS5600 is not detected. It also enables the A4988 drivers during setup. If the I2C mutex cannot be acquired, the local BNO055 event is uninitialized; if the target mutex cannot be acquired, the local target angles are uninitialized. These values can then reach the PID controller. Add sensor-validity checks, initialized fallback values, and a fail-safe that disables the drivers.
-- Motor direction, mechanical zero, gear ratio, travel limits, and encoder alignment are not calibrated by the code. The motor/gearbox assumptions need to be verified on the actual mount.
-- **PID initialization is misordered.** The `PID` struct fields are `integral, lastErr, kp, ki, kd, deadband`, but the two four-value aggregate initializers provide values as if the first fields were `kp, ki, kd, deadband`. As written, `kp` becomes 0.4 / 0.5, `ki` becomes 1.5 / 1.0, `kd` stays zero, and `deadband` stays zero; the integral and previous-error state start nonzero. Initialize all six fields explicitly (with integral and lastErr set to zero) before tuning.
+### Validation status
 
-### Target-selection and calculation bugs
-
-- The planet buttons pass incorrect Astronomy Engine body IDs: in the bundled header, `BODY_MERCURY=0`, `BODY_VENUS=1`, `BODY_MARS=3`, `BODY_JUPITER=4`, `BODY_SATURN=5`, and `BODY_MOON=10`. The current UI sends 0 for Moon and 1 for Mars, so those buttons select Mercury and Venus respectively.
-- The planet speed calculation builds the second time with `tm_sec + 1.0/86400.0`. `Astronomy_MakeTime` expects seconds in that argument, so this advances by about 11.6 microseconds, not one second. Use `tm_sec + 1.0` or `Astronomy_AddDays(aTime, 1.0/86400.0)`.
-- The startup path does not fetch the initial ISS TLE before starting `PhysicsTask`. The SGP4 object can therefore be used before it has been initialized; fetch and validate the initial TLE before starting the tracking task.
-- For satellites, the LCD reads `sys.satAltKm` and `sys.satDist`, but the satellite branch of `PhysicsTask` does not populate those fields. The LCD can consequently display zero/stale values even when the web page has satellite data.
-- For planets, `/data` sends altitude and distance from the SGP4 object rather than the planet values calculated into `sys`, so the browser can show stale satellite telemetry. The response also omits `nextPassLOS`, although the browser expects it for the planet “Sets at” display.
-
-### Concurrency, validation, and security
-
-- The asynchronous web handlers, `fetchTLE`, `PhysicsTask`, and `DisplayTask` share `current`, `satSgp4`, and several `sys` fields without a common lock. Target changes or TLE downloads can race with calculations and display updates.
-- Validate NORAD IDs, target types, and location ranges before accepting them. Check HTTP status and JSON deserialization results, and verify that TLE line pointers are non-null before copying them.
-- The local web endpoints that change target/location have no authentication. The setup AP is created without an AP password in the current `autoConnect` call. Keep the device on a trusted network; do not expose it directly to the internet.
-- The `test/` directory contains only PlatformIO's placeholder README; there are no project tests or CI workflows in the repository.
+A successful CI build and native test run should be checked on the pull request before merging. No physical ESP32-S3, motor, encoder, or mount test has been performed by this code review.
 
 ## Repository layout
 
