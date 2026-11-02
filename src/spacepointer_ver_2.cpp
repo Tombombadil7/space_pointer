@@ -102,6 +102,7 @@ volatile bool encoderReady = false;
 volatile bool observerReady = false;
 volatile bool timeReady = false;
 volatile bool tleReady = false;
+volatile bool targetCalculationReady = false;
 
 // Change both credentials before deploying outside a trusted test network.
 static const char *CONTROL_USER = "admin";
@@ -488,6 +489,7 @@ void setup() {
       current = next;
       motorTarget.az = 0;
       motorTarget.el = 0;
+      targetCalculationReady = false;
       xSemaphoreGive(targetMutex);
       resetPIDs();
 
@@ -547,9 +549,9 @@ void setup() {
   }
   timeReady = (time(&now) >= 1000000000);
   if (timeReady) {
-      Serial.println("\\nTime synchronized (UTC)!");
+      Serial.println("\nTime synchronized (UTC)!");
   } else {
-      Serial.println("\\nWARNING: NTP sync timed out; motor tracking remains disabled.");
+      Serial.println("\nWARNING: NTP sync timed out; motor tracking remains disabled.");
   }
 
   // Load the default ISS TLE before the physics task can use the SGP4 object.
@@ -652,6 +654,7 @@ void resetPIDs() {
 
 bool startTLEFetchTask() {
   tleReady = false;
+  targetCalculationReady = false;
   return xTaskCreate([](void *) {
       fetchTLE();
       vTaskDelete(NULL);
@@ -683,215 +686,301 @@ int pidOutput(PID &p, float error, float dt) {
 }
 
 void PhysicsTask(void * p) {
-
   TickType_t lastWake = xTaskGetTickCount();
-  const float DT = 0.5f;   // seconds — matches vTaskDelay below
 
-  for(;;) {
-      time_t now; time(&now);
-      struct tm * t = gmtime(&now);
-
-
-        if (current.type == TYPE_SATELLITE) {
-            // ── 1. Primary position ──────────────────────────────
-            satSgp4.findsat((unsigned long)now);
-            sys.targetAz = satSgp4.satAz;
-            sys.targetEl = satSgp4.satEl;
-            sys.satLat   = satSgp4.satLat;
-            sys.satLon   = satSgp4.satLon;
-
-            // ── 2. Speed: position 1s later, then rewind ─────────
-            double lat1 = satSgp4.satLat, lon1 = satSgp4.satLon, alt1 = satSgp4.satAlt;
-            satSgp4.findsat((unsigned long)(now + 1));
-            double dlat = (satSgp4.satLat - lat1) * DEG_TO_RAD * 6371.0;
-            double dlon = (satSgp4.satLon - lon1) * DEG_TO_RAD * 6371.0
-                          * cos(lat1 * DEG_TO_RAD);
-            double dalt = satSgp4.satAlt - alt1;
-            sys.satSpeed = sqrt(dlat*dlat + dlon*dlon + dalt*dalt); // km/s
-
-          } else {
-            // ── position at t ──────────────────────────────────────────
-            astro_time_t aTime = Astronomy_MakeTime(
-                t->tm_year+1900, t->tm_mon+1, t->tm_mday,
-                t->tm_hour, t->tm_min, (double)t->tm_sec);
-            astro_observer_t obs = { sys.lat, sys.lon, sys.alt };
-        
-            // distance from Earth center (AU) → km
-            astro_equatorial_t equ1 = Astronomy_Equator((astro_body_t)current.body, &aTime, obs, EQUATOR_OF_DATE, ABERRATION);
-            double distAU = equ1.dist;                        // AU
-            sys.satAltKm  = distAU * 149597870.7;             // km from Earth center
-            sys.satDist   = sys.satAltKm;                     // reuse same field for /data
-        
-            astro_horizon_t hor1 = Astronomy_Horizon(&aTime, obs, equ1.ra, equ1.dec, REFRACTION_NORMAL);
-            sys.targetAz = hor1.azimuth;
-            sys.targetEl = hor1.altitude;
-        
-            // ── position at t+1s ──────────────────────────────────────
-            astro_time_t aTime2 = Astronomy_MakeTime(
-                t->tm_year+1900, t->tm_mon+1, t->tm_mday,
-                t->tm_hour, t->tm_min, (double)t->tm_sec + 1.0/86400.0);
-            astro_equatorial_t equ2 = Astronomy_Equator((astro_body_t)current.body, &aTime2, obs, EQUATOR_OF_DATE, ABERRATION);
-            double distAU2 = equ2.dist;
-            double dDist   = (distAU2 - distAU) * 149597870.7; // km radial
-            astro_horizon_t hor2 = Astronomy_Horizon(&aTime2, obs, equ2.ra, equ2.dec, REFRACTION_NORMAL);
-        
-            // angular movement (degrees) → arc length (km)
-            double dAz  = (hor2.azimuth - hor1.azimuth) * DEG_TO_RAD * sys.satAltKm;
-            double dEl  = (hor2.altitude - hor1.altitude) * DEG_TO_RAD * sys.satAltKm;
-            sys.satSpeed = sqrt(dAz*dAz + dEl*dEl + dDist*dDist); // km/s
-        
-            sys.satLat = 0; sys.satLon = 0;
-        }
-
-        if (xSemaphoreTake(targetMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-          motorTarget.az = (float)sys.targetAz;
-          motorTarget.el = (float)sys.targetEl;
-          xSemaphoreGive(targetMutex);
-      }
-
-        vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(500));
-    }
-}
-
-
-void MotorTask(void * p) {
-  const float DT = 0.025f;
-  TickType_t lastWake = xTaskGetTickCount();
   for (;;) {
-      float targetAz, targetEl;
-      if (xSemaphoreTake(targetMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-          targetAz = motorTarget.az;
-          targetEl = motorTarget.el;
-          xSemaphoreGive(targetMutex);
+      if (!timeReady || !observerReady) {
+          targetCalculationReady = false;
+          vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(500));
+          continue;
       }
-      sensors_event_t event;
-      if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-          bno.getEvent(&event);
-          xSemaphoreGive(i2cMutex);
-      }
-      float headingNow = event.orientation.x;
-      float elNow = 0;
-      if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-          elNow = encoder.getRawAngle() * (360.f / 4096.f);
-          xSemaphoreGive(i2cMutex);
-      }
-      if (elNow > 180.f) elNow -= 360.f;
 
-      int azSteps = pidOutput(pidAz, wrapAngle(targetAz - headingNow), DT);
-      int elSteps = pidOutput(pidEl, wrapAngle(targetEl - elNow), DT);
-      bool azFwd = azSteps > 0, elFwd = elSteps > 0;
-      int azN = abs(azSteps), elN = abs(elSteps);
-      int maxN = max(azN, elN);
-      for (int i = 0; i < maxN; i++) {
-          if (i < azN) stepMotor(AZ_STEP_PIN, AZ_DIR_PIN, azFwd);
-          if (i < elN) stepMotor(EL_STEP_PIN, EL_DIR_PIN, elFwd);
+      const TargetState target = getTargetSnapshot();
+      double lat, lon, alt;
+      if (!getObserverSnapshot(lat, lon, alt)) {
+          targetCalculationReady = false;
+          vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(500));
+          continue;
       }
-      vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(25));
+
+      time_t now;
+      time(&now);
+      if (now < 1000000000) {
+          targetCalculationReady = false;
+          vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(500));
+          continue;
+      }
+
+      double targetAz = 0.0, targetEl = 0.0;
+      double satLat = 0.0, satLon = 0.0;
+      double satSpeed = 0.0, satAltKm = 0.0, satDist = 0.0;
+      bool calculationOK = false;
+
+      if (target.type == TYPE_SATELLITE) {
+          if (tleReady && xSemaphoreTake(sgp4Mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+              satSgp4.findsat((unsigned long)now);
+              const double lat1 = satSgp4.satLat;
+              const double lon1 = satSgp4.satLon;
+              const double alt1 = satSgp4.satAlt;
+              const double dist1 = satSgp4.satDist;
+              targetAz = satSgp4.satAz;
+              targetEl = satSgp4.satEl;
+
+              satSgp4.findsat((unsigned long)(now + 1));
+              const double dlat = (satSgp4.satLat - lat1) * DEG_TO_RAD * 6371.0;
+              const double dlon = wrapAngle((float)(satSgp4.satLon - lon1)) *
+                                  DEG_TO_RAD * 6371.0 * cos(lat1 * DEG_TO_RAD);
+              const double dalt = satSgp4.satAlt - alt1;
+              satSpeed = sqrt(dlat*dlat + dlon*dlon + dalt*dalt);
+
+              satSgp4.findsat((unsigned long)now);
+              satLat = lat1;
+              satLon = lon1;
+              satAltKm = alt1;
+              satDist = dist1;
+              xSemaphoreGive(sgp4Mutex);
+              calculationOK = isfinite(targetAz) && isfinite(targetEl) &&
+                              isfinite(satSpeed) && isfinite(satAltKm) &&
+                              isfinite(satDist);
+          }
+      } else {
+          struct tm utc;
+          if (gmtime_r(&now, &utc) != nullptr) {
+              astro_time_t aTime = Astronomy_MakeTime(
+                  utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday,
+                  utc.tm_hour, utc.tm_min, (double)utc.tm_sec);
+              const astro_observer_t obs = {lat, lon, alt};
+              astro_equatorial_t equ1 = Astronomy_Equator(
+                  (astro_body_t)target.body, &aTime, obs,
+                  EQUATOR_OF_DATE, ABERRATION);
+              astro_horizon_t hor1 = Astronomy_Horizon(
+                  &aTime, obs, equ1.ra, equ1.dec, REFRACTION_NORMAL);
+
+              astro_time_t aTime2 = Astronomy_AddDays(aTime, 1.0 / 86400.0);
+              astro_equatorial_t equ2 = Astronomy_Equator(
+                  (astro_body_t)target.body, &aTime2, obs,
+                  EQUATOR_OF_DATE, ABERRATION);
+              astro_horizon_t hor2 = Astronomy_Horizon(
+                  &aTime2, obs, equ2.ra, equ2.dec, REFRACTION_NORMAL);
+
+              const double distanceKm = equ1.dist * 149597870.7;
+              const double dDistance = (equ2.dist - equ1.dist) * 149597870.7;
+              const double dAz = wrapAngle((float)(hor2.azimuth - hor1.azimuth)) *
+                                 DEG_TO_RAD * distanceKm;
+              const double dEl = (hor2.altitude - hor1.altitude) *
+                                 DEG_TO_RAD * distanceKm;
+
+              targetAz = hor1.azimuth;
+              targetEl = hor1.altitude;
+              satSpeed = sqrt(dAz*dAz + dEl*dEl + dDistance*dDistance);
+              satAltKm = distanceKm;
+              satDist = distanceKm;
+              calculationOK = isfinite(targetAz) && isfinite(targetEl) &&
+                              isfinite(satSpeed) && isfinite(distanceKm);
+          }
+      }
+
+      const TargetState latestTarget = getTargetSnapshot();
+      const bool sameTarget = latestTarget.type == target.type &&
+          ((target.type == TYPE_SATELLITE && latestTarget.noradID == target.noradID) ||
+           (target.type == TYPE_PLANET && latestTarget.body == target.body));
+
+      if (calculationOK && sameTarget &&
+          xSemaphoreTake(sysMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+          sys.targetAz = targetAz;
+          sys.targetEl = targetEl;
+          sys.satLat = satLat;
+          sys.satLon = satLon;
+          sys.satSpeed = satSpeed;
+          sys.satAltKm = satAltKm;
+          sys.satDist = satDist;
+          xSemaphoreGive(sysMutex);
+
+          if (xSemaphoreTake(targetMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+              motorTarget.az = (float)targetAz;
+              motorTarget.el = (float)targetEl;
+              xSemaphoreGive(targetMutex);
+          }
+          targetCalculationReady = true;
+      } else {
+          targetCalculationReady = false;
+      }
+
+      vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(500));
   }
 }
 
 
+
+
+void MotorTask(void * p) {
+  const float DT = MOTOR_TASK_MS / 1000.0f;
+  TickType_t lastWake = xTaskGetTickCount();
+
+  for (;;) {
+      float targetAz = 0.0f, targetEl = 0.0f;
+      bool targetRead = false;
+      if (xSemaphoreTake(targetMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+          targetAz = motorTarget.az;
+          targetEl = motorTarget.el;
+          targetRead = true;
+          xSemaphoreGive(targetMutex);
+      }
+
+      if (!targetRead || !timeReady || !observerReady || !targetCalculationReady ||
+          !bnoReady || !encoderReady || !isfinite(targetAz) ||
+          !isfinite(targetEl) || targetEl < 0.0f || targetEl > 90.0f) {
+          disableMotors();
+          resetPIDs();
+          vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(MOTOR_TASK_MS));
+          continue;
+      }
+
+      sensors_event_t event = {};
+      uint16_t encoderRaw = 0;
+      bool sensorsRead = false;
+      if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+          bno.getEvent(&event);
+          encoderRaw = encoder.getRawAngle();
+          sensorsRead = encoder.isConnected();
+          xSemaphoreGive(i2cMutex);
+      }
+
+      const float headingNow = event.orientation.x;
+      if (!sensorsRead || !isfinite(headingNow) || headingNow < 0.0f ||
+          headingNow >= 360.0f || encoderRaw > 4095) {
+          disableMotors();
+          resetPIDs();
+          vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(MOTOR_TASK_MS));
+          continue;
+      }
+
+      float elNow = encoderRaw * (360.0f / 4096.0f);
+      if (elNow > 180.0f) elNow -= 360.0f;
+
+      digitalWrite(AZ_EN_PIN, LOW);
+      digitalWrite(EL_EN_PIN, LOW);
+
+      const int azSteps = pidOutput(pidAz, wrapAngle(targetAz - headingNow), DT);
+      const int elSteps = pidOutput(pidEl, wrapAngle(targetEl - elNow), DT);
+      const bool azFwd = azSteps > 0;
+      const bool elFwd = elSteps > 0;
+      const int azN = abs(azSteps);
+      const int elN = abs(elSteps);
+      const int maxN = max(azN, elN);
+
+      for (int i = 0; i < maxN; i++) {
+          if (i < azN) stepMotor(AZ_STEP_PIN, AZ_DIR_PIN, azFwd);
+          if (i < elN) stepMotor(EL_STEP_PIN, EL_DIR_PIN, elFwd);
+      }
+      vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(MOTOR_TASK_MS));
+  }
+}
+
+
+
+
 void DisplayTask(void * p) {
   static uint32_t lastPassCalc = 0;
-  static uint8_t  screen       = 0;   // alternates 0 / 1 every 2s
+  static uint8_t screen = 0;
   char line0[17], line1[17];
 
   for (;;) {
+      if (timeReady && millis() - lastPassCalc > 30000) {
+          time_t now;
+          time(&now);
+          const TargetState target = getTargetSnapshot();
+          bool passValid = false;
+          time_t aosTime = 0, losTime = 0;
+          double maxElevation = 0.0;
 
-      // ── Next pass / rise+set: recalculate every 30s ───────────────
-      if (millis() - lastPassCalc > 30000) {
-          time_t now; time(&now);
-
-          if (current.type == TYPE_SATELLITE) {
+          if (target.type == TYPE_SATELLITE && tleReady &&
+              xSemaphoreTake(sgp4Mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
               satSgp4.initpredpoint((unsigned long)now, 0.0);
               passinfo overpass;
-              sys.nextPassValid = satSgp4.nextpass(&overpass, 20);
-              if (sys.nextPassValid) {
-                  sys.nextPassAOS   = (time_t)((overpass.jdstart - 2440587.5) * 86400.0);
-                  sys.nextPassLOS   = (time_t)((overpass.jdstop  - 2440587.5) * 86400.0);
-                  sys.nextPassMaxEl = overpass.maxelevation;
+              passValid = satSgp4.nextpass(&overpass, 20);
+              if (passValid) {
+                  aosTime = (time_t)((overpass.jdstart - 2440587.5) * 86400.0);
+                  losTime = (time_t)((overpass.jdstop  - 2440587.5) * 86400.0);
+                  maxElevation = overpass.maxelevation;
               }
-          } else {
-              struct tm *utc = gmtime(&now);
-              astro_time_t aTime = Astronomy_MakeTime(
-                  utc->tm_year+1900, utc->tm_mon+1, utc->tm_mday,
-                  utc->tm_hour, utc->tm_min, (double)utc->tm_sec);
-              astro_observer_t obs = { sys.lat, sys.lon, sys.alt };
-              astro_search_result_t rise = Astronomy_SearchRiseSet(
-                  (astro_body_t)current.body, obs, DIRECTION_RISE, aTime, 1.0);
-              astro_search_result_t set  = Astronomy_SearchRiseSet(
-                  (astro_body_t)current.body, obs, DIRECTION_SET,  aTime, 1.0);
-              if (rise.status == ASTRO_SUCCESS && set.status == ASTRO_SUCCESS) {
-                  sys.nextPassAOS   = (time_t)(rise.time.ut * 86400.0 + 946727935.816);
-                  sys.nextPassLOS   = (time_t)(set.time.ut  * 86400.0 + 946727935.816);
-                  sys.nextPassMaxEl = 0;
-                  sys.nextPassValid = true;
-              } else {
-                  sys.nextPassValid = false;
+              xSemaphoreGive(sgp4Mutex);
+          } else if (target.type == TYPE_PLANET) {
+              double lat, lon, alt;
+              struct tm utc;
+              if (getObserverSnapshot(lat, lon, alt) && gmtime_r(&now, &utc) != nullptr) {
+                  astro_time_t start = Astronomy_MakeTime(
+                      utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday,
+                      utc.tm_hour, utc.tm_min, (double)utc.tm_sec);
+                  const astro_observer_t obs = {lat, lon, alt};
+                  const astro_search_result_t rise = Astronomy_SearchRiseSet(
+                      (astro_body_t)target.body, obs, DIRECTION_RISE, start, 1.0);
+                  const astro_search_result_t set = Astronomy_SearchRiseSet(
+                      (astro_body_t)target.body, obs, DIRECTION_SET, start, 1.0);
+                  if (rise.status == ASTRO_SUCCESS && set.status == ASTRO_SUCCESS) {
+                      aosTime = (time_t)(rise.time.ut * 86400.0 + 946728000.0);
+                      losTime = (time_t)(set.time.ut * 86400.0 + 946728000.0);
+                      passValid = true;
+                  }
               }
+          }
+
+          if (xSemaphoreTake(sysMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+              sys.nextPassValid = passValid;
+              sys.nextPassAOS = aosTime;
+              sys.nextPassLOS = losTime;
+              sys.nextPassMaxEl = maxElevation;
+              xSemaphoreGive(sysMutex);
           }
           lastPassCalc = millis();
       }
 
-      // ── Build lines based on current screen ───────────────────────
+      const TargetState target = getTargetSnapshot();
+      const TelemetrySnapshot data = getTelemetrySnapshot();
       if (screen == 0) {
-          // ── Screen 0: Pointing data ───────────────────────────────
-          // Row 0: "ISS  Az:247.3   "
           snprintf(line0, sizeof(line0), "%-4.4s Az:%-6.1f",
-                   current.name, sys.targetAz);
-
-          // Row 1: elevation + altitude, or next pass if below horizon
-          if (sys.targetEl >= 0) {
+                   target.name, data.targetAz);
+          if (data.targetEl >= 0) {
               snprintf(line1, sizeof(line1), "El:%-5.1f %5.0fkm",
-                       sys.targetEl, sys.satAltKm);
-          } else {
-              if (sys.nextPassValid) {
-                  struct tm *aos = gmtime(&sys.nextPassAOS);
+                       data.targetEl, data.satAltKm);
+          } else if (data.nextPassValid) {
+              struct tm aos;
+              if (gmtime_r(&data.nextPassAOS, &aos) != nullptr) {
                   snprintf(line1, sizeof(line1), "El:%-4.1f >%02d:%02dUTC",
-                           sys.targetEl, aos->tm_hour, aos->tm_min);
+                           data.targetEl, aos.tm_hour, aos.tm_min);
               } else {
-                  snprintf(line1, sizeof(line1), "El:%-5.1f No pass",
-                           sys.targetEl);
+                  snprintf(line1, sizeof(line1), "El:%-5.1f No pass", data.targetEl);
               }
-          }
-
-      } else {
-          // ── Screen 1: Telemetry data ──────────────────────────────
-          // Row 0: "ISS  7.66 km/s  "
-          snprintf(line0, sizeof(line0), "%-4.4s %6.2fkm/s",
-                   current.name, sys.satSpeed);
-
-          // Row 1: distance — satellites in km, planets in scientific-friendly units
-          if (current.type == TYPE_SATELLITE) {
-              // e.g. "Dist:    421394km"  — always < 999999km for LEO/MEO
-              snprintf(line1, sizeof(line1), "Dist:%9.0fkm",
-                       sys.satDist);
           } else {
-              // Planets are millions of km — show in M km
-              // e.g. "Dist:   384400Mkm"  (Moon ~384k km, Mars ~225M km)
-              double distMkm = sys.satDist / 1000.0;
+              snprintf(line1, sizeof(line1), "El:%-5.1f No pass", data.targetEl);
+          }
+      } else {
+          snprintf(line0, sizeof(line0), "%-4.4s %6.2fkm/s",
+                   target.name, data.satSpeed);
+          if (target.type == TYPE_SATELLITE) {
+              snprintf(line1, sizeof(line1), "Dist:%9.0fkm", data.satDist);
+          } else {
+              const double distMkm = data.satDist / 1000.0;
               if (distMkm < 10000.0) {
-                  snprintf(line1, sizeof(line1), "Dist:%7.0f Mkm",
-                           distMkm);
+                  snprintf(line1, sizeof(line1), "Dist:%7.0f Mkm", distMkm);
               } else {
-                  // Very far (outer planets) — show in AU  e.g. "Dist:      5.2 AU"
                   snprintf(line1, sizeof(line1), "Dist:    %5.2f AU",
-                           sys.satDist / 149597870.7);
+                           data.satDist / 149597870.7);
               }
           }
       }
 
-      // ── Write to LCD (i2cMutex guards shared I2C bus) ────────────
       if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
           lcd.setCursor(0, 0); lcd.print(line0);
           lcd.setCursor(0, 1); lcd.print(line1);
           xSemaphoreGive(i2cMutex);
       }
-
-      screen = 1 - screen;   // flip 0→1→0→1...
+      screen = 1 - screen;
       vTaskDelay(pdMS_TO_TICKS(2000));
   }
 }
+
+
 
 void stepMotor(int stepPin, int dirPin, bool forward) {
   digitalWrite(dirPin, forward ? HIGH : LOW);
@@ -905,30 +994,96 @@ void stepMotor(int stepPin, int dirPin, bool forward) {
 
 // --- לוגיקת שרת וחישובים ---
 
-void updateIPLocation() {
-    /* מבצע איכון ראשוני לפי כתובת IP כברירת מחדל  */
+bool updateIPLocation() {
     HTTPClient http;
-    http.begin("http://ip-api.com/json/");
-    if (http.GET() == 200) {
+    http.setTimeout(8000);
+    if (!http.begin("http://ip-api.com/json/")) return false;
+    const int status = http.GET();
+    bool valid = false;
+    if (status == HTTP_CODE_OK) {
         StaticJsonDocument<512> doc;
-        deserializeJson(doc, http.getString());
-        sys.lat = doc["lat"]; sys.lon = doc["lon"]; sys.alt = 50.0;
+        const DeserializationError error = deserializeJson(doc, http.getString());
+        if (!error && doc["status"] == "success") {
+            const double lat = doc["lat"] | NAN;
+            const double lon = doc["lon"] | NAN;
+            if (isfinite(lat) && isfinite(lon) && lat >= -90.0 &&
+                lat <= 90.0 && lon >= -180.0 && lon <= 180.0) {
+                if (xSemaphoreTake(sysMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                    sys.lat = lat;
+                    sys.lon = lon;
+                    sys.alt = 50.0;
+                    xSemaphoreGive(sysMutex);
+                    valid = true;
+                }
+            }
+        }
     }
     http.end();
+    return valid;
 }
 
 void fetchTLE() {
-    /* מושך נתוני מסלול מעודכנים מהאינטרנט [cite: 75, 76] */
-    HTTPClient http;
-    http.begin("https://tle.ivanstanojevic.me/api/tle/" + String(current.noradID));
-    if(http.GET() == 200) {
-        StaticJsonDocument<1024> doc;
-        deserializeJson(doc, http.getString());
-        satSgp4.site(sys.lat, sys.lon, sys.alt);
-        char line1[130], line2[130];
-        strncpy(line1, doc["line1"].as<const char*>(), sizeof(line1));
-        strncpy(line2, doc["line2"].as<const char*>(), sizeof(line2));
-        satSgp4.init(current.name, line1, line2);
+    if (tleFetchMutex == NULL ||
+        xSemaphoreTake(tleFetchMutex, pdMS_TO_TICKS(20000)) != pdTRUE) {
+        tleReady = false;
+        targetCalculationReady = false;
+        disableMotors();
+        return;
     }
-    http.end();
+
+    tleReady = false;
+    targetCalculationReady = false;
+    const TargetState requested = getTargetSnapshot();
+    double lat, lon, alt;
+    bool success = false;
+
+    if (requested.type == TYPE_SATELLITE &&
+        getObserverSnapshot(lat, lon, alt) && requested.noradID > 0) {
+        HTTPClient http;
+        http.setTimeout(12000);
+        const String url = "https://tle.ivanstanojevic.me/api/tle/" + String(requested.noradID);
+        if (http.begin(url)) {
+            const int status = http.GET();
+            if (status == HTTP_CODE_OK) {
+                StaticJsonDocument<1024> doc;
+                const DeserializationError error = deserializeJson(doc, http.getString());
+                const char *rawLine1 = doc["line1"] | (const char *)nullptr;
+                const char *rawLine2 = doc["line2"] | (const char *)nullptr;
+
+                if (!error && rawLine1 != nullptr && rawLine2 != nullptr &&
+                    strlen(rawLine1) >= 69 && strlen(rawLine2) >= 69 &&
+                    rawLine1[0] == '1' && rawLine2[0] == '2') {
+                    char line1[71] = {};
+                    char line2[71] = {};
+                    strlcpy(line1, rawLine1, sizeof(line1));
+                    strlcpy(line2, rawLine2, sizeof(line2));
+
+                    const TargetState latest = getTargetSnapshot();
+                    const bool stillCurrent = latest.type == TYPE_SATELLITE &&
+                                              latest.noradID == requested.noradID;
+                    if (stillCurrent &&
+                        xSemaphoreTake(sgp4Mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+                        satSgp4.site(lat, lon, alt);
+                        satSgp4.init(requested.name, line1, line2);
+                        xSemaphoreGive(sgp4Mutex);
+                        tleReady = true;
+                        success = true;
+                    }
+                } else {
+                    Serial.println("ERROR: TLE response was invalid or incomplete.");
+                }
+            } else {
+                Serial.printf("ERROR: TLE server returned HTTP %d\\n", status);
+            }
+            http.end();
+        }
+    }
+
+    if (!success) {
+        tleReady = false;
+        targetCalculationReady = false;
+        disableMotors();
+        Serial.println("WARNING: TLE update failed; satellite motors remain disabled.");
+    }
+    xSemaphoreGive(tleFetchMutex);
 }
