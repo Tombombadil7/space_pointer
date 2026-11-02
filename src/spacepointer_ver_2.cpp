@@ -798,20 +798,6 @@ void PhysicsTask(void * p) {
                   }
               }
 
-              const double distanceKm = equ1.dist * 149597870.7;
-              const double dDistance = (equ2.dist - equ1.dist) * 149597870.7;
-              const double dAz = wrapAngle((float)(hor2.azimuth - hor1.azimuth)) *
-                                 DEG_TO_RAD * distanceKm;
-              const double dEl = (hor2.altitude - hor1.altitude) *
-                                 DEG_TO_RAD * distanceKm;
-
-              targetAz = hor1.azimuth;
-              targetEl = hor1.altitude;
-              satSpeed = sqrt(dAz*dAz + dEl*dEl + dDistance*dDistance);
-              satAltKm = distanceKm;
-              satDist = distanceKm;
-              calculationOK = isfinite(targetAz) && isfinite(targetEl) &&
-                              isfinite(satSpeed) && isfinite(distanceKm);
           }
       }
 
