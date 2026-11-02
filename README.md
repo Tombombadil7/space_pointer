@@ -100,7 +100,7 @@ These are findings from static inspection of the current source, not a compiler 
 ### Hardware / motor-control blockers
 
 - The ENABLE pins (GPIO25 and GPIO26) are unsuitable for the configured ESP32-S3-DevKitC-1. Reassign them before wiring.
-- The firmware starts the motor task even when the BNO055 or AS5600 is not detected. It also enables the A4988 drivers during setup. A failed sensor read or a failed mutex acquisition can leave the local sensor event uninitialized and then feed an undefined reading into the PID controller. Add sensor-validity checks and a fail-safe that disables the drivers.
+- The firmware starts the motor task even when the BNO055 or AS5600 is not detected. It also enables the A4988 drivers during setup. If the I2C mutex cannot be acquired, the local BNO055 event is uninitialized; if the target mutex cannot be acquired, the local target angles are uninitialized. These values can then reach the PID controller. Add sensor-validity checks, initialized fallback values, and a fail-safe that disables the drivers.
 - Motor direction, mechanical zero, gear ratio, travel limits, and encoder alignment are not calibrated by the code. The motor/gearbox assumptions need to be verified on the actual mount.
 - **PID initialization is misordered.** The `PID` struct fields are `integral, lastErr, kp, ki, kd, deadband`, but the two four-value aggregate initializers provide values as if the first fields were `kp, ki, kd, deadband`. As written, `kp` becomes 0.4 / 0.5, `ki` becomes 1.5 / 1.0, `kd` stays zero, and `deadband` stays zero; the integral and previous-error state start nonzero. Initialize all six fields explicitly (with integral and lastErr set to zero) before tuning.
 
