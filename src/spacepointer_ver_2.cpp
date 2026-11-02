@@ -439,6 +439,8 @@ void setup() {
 
       TargetState target = getTargetSnapshot();
       if (target.type == TYPE_SATELLITE) {
+          tleReady = false;   // invalidate the old observer's SGP4 state immediately
+          targetCalculationReady = false;
           if (!startTLEFetchTask()) {
               r->send(503, "text/plain", "Could not start TLE refresh; motors remain disabled.");
               return;
@@ -494,10 +496,13 @@ void setup() {
           r->send(503, "text/plain", "Target controller busy; retry.");
           return;
       }
+      if (next.type == TYPE_SATELLITE) {
+          tleReady = false;   // never track a newly selected NORAD ID with the previous TLE
+      }
+      targetCalculationReady = false;
       current = next;
       motorTarget.az = 0;
       motorTarget.el = 0;
-      targetCalculationReady = false;
       xSemaphoreGive(targetMutex);
       pidResetRequested = true;
 
