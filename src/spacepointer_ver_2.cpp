@@ -876,9 +876,9 @@ void MotorTask(void * p) {
       uint16_t encoderRaw = 0;
       bool sensorsRead = false;
       if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-          bno.getEvent(&event);
+          const bool headingRead = bno.getEvent(&event);
           encoderRaw = encoder.rawAngle();
-          sensorsRead = encoder.lastError() == AS5600_OK;
+          sensorsRead = headingRead && (encoder.lastError() == AS5600_OK);
           xSemaphoreGive(i2cMutex);
       }
 
