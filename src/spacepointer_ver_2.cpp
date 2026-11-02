@@ -14,6 +14,7 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#include "tracking_math.h"
 #include <ESPAsyncWebServer.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
@@ -42,8 +43,8 @@
 #define MICROSTEPS_PER_REV  32768UL
 #define STEP_PULSE_US     50      // µs per pulse
 #define MOTOR_TASK_MS     25      // MotorTask period in ms
-#define MAX_STEPS_PER_TICK  ((MOTOR_TASK_MS * 1000) / (STEP_PULSE_US * 2 * 2))
-// = (25000) / (200) = 125 steps max — leaves a small margin for overhead
+#define MAX_STEPS_PER_TICK  80
+// Two axes are stepped sequentially; 80 leaves time for task/sensor overhead.
 
 AsyncWebServer server(80);
 Adafruit_BNO055 bno = Adafruit_BNO055(55);
@@ -103,6 +104,7 @@ volatile bool observerReady = false;
 volatile bool timeReady = false;
 volatile bool tleReady = false;
 volatile bool targetCalculationReady = false;
+volatile bool pidResetRequested = false;
 
 // Change both credentials before deploying outside a trusted test network.
 static const char *CONTROL_USER = "admin";
@@ -294,7 +296,7 @@ const char index_html[] PROGMEM = R"rawliteral(
             document.getElementById('speed').innerText = d.speed > 0 ? d.speed.toFixed(2) : '--';
     
             // altitude label: "km altitude" for sats, "km from Earth" for planets
-            document.querySelector('[data-lbl="alt"]').innerText  = isSat ? 'km altitude'   : 'km from Earth';
+            document.querySelector('[data-lbl="alt"]').innerText  = isSat ? 'km altitude' : 'km from observer';
             document.getElementById('alt').innerText = d.alt > 0 ? Math.round(d.alt) : '--';
     
             // distance label: "km distance" for sats, same "km from Earth" for planets
@@ -312,8 +314,10 @@ const char index_html[] PROGMEM = R"rawliteral(
             }
     
             // map: only move for satellites
-            marker.setLatLng([d.sLat, d.sLon]);
-            if (isSat) map.panTo([d.sLat, d.sLon]);
+            if (isSat) {
+              marker.setLatLng([d.sLat, d.sLon]);
+              map.panTo([d.sLat, d.sLon]);
+            }
           });
         }, 2000);
       </script>
@@ -427,6 +431,7 @@ void setup() {
       sys.lat = lat; sys.lon = lon; sys.alt = alt;
       xSemaphoreGive(sysMutex);
       observerReady = true;
+      targetCalculationReady = false;
 
       TargetState target = getTargetSnapshot();
       if (target.type == TYPE_SATELLITE) {
@@ -491,7 +496,7 @@ void setup() {
       motorTarget.el = 0;
       targetCalculationReady = false;
       xSemaphoreGive(targetMutex);
-      resetPIDs();
+      pidResetRequested = true;
 
       if (next.type == TYPE_SATELLITE) {
           if (!startTLEFetchTask()) {
@@ -662,10 +667,7 @@ bool startTLEFetchTask() {
 }
 
 float wrapAngle(float e) {
-  if (!isfinite(e)) return 0.0f;
-  while (e > 180.f) e -= 360.f;
-  while (e < -180.f) e += 360.f;
-  return e;
+  return TrackingMath::wrapAngle(e);
 }
 
 int pidOutput(PID &p, float error, float dt) {
@@ -827,8 +829,14 @@ void MotorTask(void * p) {
           xSemaphoreGive(targetMutex);
       }
 
+      if (pidResetRequested) {
+          resetPIDs();
+          pidResetRequested = false;
+      }
+      const TargetState activeTarget = getTargetSnapshot();
+      const bool orbitalDataReady = activeTarget.type != TYPE_SATELLITE || tleReady;
       if (!targetRead || !timeReady || !observerReady || !targetCalculationReady ||
-          !bnoReady || !encoderReady || !isfinite(targetAz) ||
+          !orbitalDataReady || !bnoReady || !encoderReady || !isfinite(targetAz) ||
           !isfinite(targetEl) || targetEl < 0.0f || targetEl > 90.0f) {
           disableMotors();
           resetPIDs();
