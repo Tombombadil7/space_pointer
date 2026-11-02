@@ -409,6 +409,10 @@ void setup() {
   }
 
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *r){
+      if (!r->authenticate(CONTROL_USER, CONTROL_PASSWORD)) {
+          r->requestAuthentication();
+          return;
+      }
       r->send(200, "text/html", index_html);
   });
 
@@ -581,11 +585,10 @@ void setup() {
       disableMotors();
   }
 
-  // Only create DisplayTask if an LCD was actually found
-  if (lcdFound) {
-      xTaskCreatePinnedToCore(DisplayTask, "Display", 4000, NULL, 1, NULL, 0);
-  } else {
-      Serial.println("DisplayTask skipped — no LCD");
+  // DisplayTask also calculates next rise/set or satellite pass times.
+  // Keep it running even without an LCD; LCD writes are conditionally skipped.
+  if (xTaskCreatePinnedToCore(DisplayTask, "Display", 5000, NULL, 1, NULL, 0) != pdPASS) {
+      Serial.println("WARNING: Display/Pass task creation failed.");
   }
 }
 
@@ -689,6 +692,14 @@ void PhysicsTask(void * p) {
   TickType_t lastWake = xTaskGetTickCount();
 
   for (;;) {
+      if (!timeReady) {
+          time_t syncedTime = 0;
+          time(&syncedTime);
+          if (syncedTime >= 1000000000) {
+              timeReady = true;   // NTP may have synchronized after the startup timeout.
+              Serial.println("NTP time became available; tracking can resume.");
+          }
+      }
       if (!timeReady || !observerReady) {
           targetCalculationReady = false;
           vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(500));
@@ -753,15 +764,34 @@ void PhysicsTask(void * p) {
               astro_equatorial_t equ1 = Astronomy_Equator(
                   (astro_body_t)target.body, &aTime, obs,
                   EQUATOR_OF_DATE, ABERRATION);
-              astro_horizon_t hor1 = Astronomy_Horizon(
-                  &aTime, obs, equ1.ra, equ1.dec, REFRACTION_NORMAL);
+              if (equ1.status == ASTRO_SUCCESS) {
+                  astro_horizon_t hor1 = Astronomy_Horizon(
+                      &aTime, obs, equ1.ra, equ1.dec, REFRACTION_NORMAL);
 
-              astro_time_t aTime2 = Astronomy_AddDays(aTime, 1.0 / 86400.0);
-              astro_equatorial_t equ2 = Astronomy_Equator(
-                  (astro_body_t)target.body, &aTime2, obs,
-                  EQUATOR_OF_DATE, ABERRATION);
-              astro_horizon_t hor2 = Astronomy_Horizon(
-                  &aTime2, obs, equ2.ra, equ2.dec, REFRACTION_NORMAL);
+                  astro_time_t aTime2 = Astronomy_AddDays(aTime, 1.0 / 86400.0);
+                  astro_equatorial_t equ2 = Astronomy_Equator(
+                      (astro_body_t)target.body, &aTime2, obs,
+                      EQUATOR_OF_DATE, ABERRATION);
+                  if (equ2.status == ASTRO_SUCCESS) {
+                      astro_horizon_t hor2 = Astronomy_Horizon(
+                          &aTime2, obs, equ2.ra, equ2.dec, REFRACTION_NORMAL);
+
+                      const double distanceKm = equ1.dist * 149597870.7;
+                      const double dDistance = (equ2.dist - equ1.dist) * 149597870.7;
+                      const double dAz = wrapAngle((float)(hor2.azimuth - hor1.azimuth)) *
+                                         DEG_TO_RAD * distanceKm;
+                      const double dEl = (hor2.altitude - hor1.altitude) *
+                                         DEG_TO_RAD * distanceKm;
+
+                      targetAz = hor1.azimuth;
+                      targetEl = hor1.altitude;
+                      satSpeed = sqrt(dAz*dAz + dEl*dEl + dDistance*dDistance);
+                      satAltKm = distanceKm;
+                      satDist = distanceKm;
+                      calculationOK = isfinite(targetAz) && isfinite(targetEl) &&
+                                      isfinite(satSpeed) && isfinite(distanceKm);
+                  }
+              }
 
               const double distanceKm = equ1.dist * 149597870.7;
               const double dDistance = (equ2.dist - equ1.dist) * 149597870.7;
@@ -985,7 +1015,7 @@ void DisplayTask(void * p) {
           }
       }
 
-      if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+      if (lcdFound && xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
           lcd.setCursor(0, 0); lcd.print(line0);
           lcd.setCursor(0, 1); lcd.print(line1);
           xSemaphoreGive(i2cMutex);
