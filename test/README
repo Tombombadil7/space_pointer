@@ -1,11 +1,13 @@
+# PlatformIO tests
 
-This directory is intended for PlatformIO Test Runner and project tests.
+This folder contains hardware-independent tests for the tracking helpers.
 
-Unit Testing is a software testing method by which individual units of
-source code, sets of one or more MCU program modules together with associated
-control data, usage procedures, and operating procedures, are tested to
-determine whether they are fit for use. Unit testing finds problems early
-in the development cycle.
+Run the tests from the repository root:
 
-More information about PlatformIO Unit Testing:
-- https://docs.platformio.org/en/latest/advanced/unit-testing/index.html
+```sh
+pio test -e native
+```
+
+The current suite checks angular wrapping, finite-value handling, observer-coordinate and altitude limits, NORAD ID ranges, and the accepted Astronomy Engine body IDs.
+
+The native tests do not exercise FreeRTOS scheduling, I2C peripherals, motor drivers, the Astronomy Engine library integration, or real SGP4/TLE data. Those still require an ESP32 build and hardware/bench testing.
