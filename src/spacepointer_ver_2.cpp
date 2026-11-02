@@ -877,8 +877,12 @@ void MotorTask(void * p) {
       bool sensorsRead = false;
       if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
           const bool headingRead = bno.getEvent(&event);
+          uint8_t systemCal = 0, gyroCal = 0, accelCal = 0, magCal = 0;
+          bno.getCalibration(&systemCal, &gyroCal, &accelCal, &magCal);
           encoderRaw = encoder.rawAngle();
-          sensorsRead = headingRead && (encoder.lastError() == AS5600_OK);
+          // Magnetic heading must be fully calibrated before pointing from true-north targets.
+          sensorsRead = headingRead && systemCal == 3 && magCal == 3 &&
+                        (encoder.lastError() == AS5600_OK);
           xSemaphoreGive(i2cMutex);
       }
 
