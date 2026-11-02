@@ -92,7 +92,7 @@ The GitHub Actions workflow runs both commands on pushes to the fix branch and o
 5. Use **Sync Phone GPS** to send the phone's permitted location to the device. Browser geolocation requires user permission and may be restricted by browsers when the page is served over plain HTTP.
 6. The satellite TLE, IP geolocation, NTP time, Leaflet assets, and map tiles require internet access.
 
-The web server listens on port 80. The `/set` and `/updateLoc` control endpoints use HTTP Basic Authentication. The current source defaults are username `admin` and password `spacepointer-change-me`; change both control credentials and the setup AP password before deployment. Basic Authentication over plain HTTP does not encrypt credentials, so keep this device on a trusted local network and do not expose port 80 to the internet. The read-only `/data` endpoint and root page are not authenticated.
+The web server listens on port 80. The dashboard root (`/`), `/set`, and `/updateLoc` require HTTP Basic Authentication. Opening the dashboard prompts the browser to authenticate before its JavaScript can call the control endpoints. The current source defaults are username `admin` and password `spacepointer-change-me`; change both control credentials and the setup AP password before deployment. Basic Authentication over plain HTTP does not encrypt credentials, so keep this device on a trusted local network and do not expose port 80 to the internet. The read-only `/data` endpoint remains unauthenticated.
 
 ## Implemented fixes and remaining commissioning work
 
@@ -105,7 +105,9 @@ The `fix/esp32s3-tracking-safety` branch includes these software changes:
 - Added a TLE fetch/validation step before satellite calculations, serialized access to SGP4, and restored SGP4 to the current epoch after the velocity look-ahead.
 - Protected target, observer/telemetry, I2C, and SGP4 shared state with mutexes and used snapshots between tasks.
 - Added bounds checks for observer coordinates, NORAD IDs, and supported planetary bodies; added HTTP response/JSON/TLE validation.
-- Kept motor drivers disabled until time, location, orbital solution (for satellites), and both feedback sensors are ready. Sensor/mutex failures and below-horizon targets stop step pulses and disable the drivers.
+- Kept motor drivers disabled until time, location, orbital solution (for satellites), and both feedback sensors are ready. Sensor/mutex failures and below-horizon targets stop step pulses and disable the drivers. If NTP synchronizes after the startup timeout, the physics task can now resume automatically.
+- Updated the AS5600 read call to the library's actual `rawAngle()` API and use `lastError()` to reject a failed I2C read.
+- Kept rise/set and satellite-pass calculations running even if the optional LCD is absent; only LCD writes are skipped.
 - Fixed satellite and planetary telemetry population and added the missing planetary set-time field to `/data`.
 - Added HTTP Basic Authentication to the target/location control endpoints, password-protected WiFiManager setup AP, native helper tests, and GitHub Actions build/test jobs.
 
@@ -117,6 +119,7 @@ The `fix/esp32s3-tracking-safety` branch includes these software changes:
 - Add physical limit switches and an emergency stop. They are not implemented in software yet. A4988 disable removes holding torque; balance the elevation axis or use a brake to prevent it dropping when the driver is disabled.
 - Replace the example AP and web credentials in the source before deployment. HTTP Basic Authentication is not encrypted on the plain-HTTP connection.
 - IP geolocation currently uses the IP-API HTTP endpoint. Treat this as an approximate startup location; use the phone GPS update for a more accurate observer position.
+- The default UI page now uses HTTP Basic Authentication too, so the browser authenticates before control fetches are made.
 - Confirm the SGP4 library's returned altitude/distance units against its documentation and a known satellite pass; the current telemetry code retains the library's documented/public fields and assumes kilometres.
 - Complete a staged bench test: build, sensor-only checks, motor-driver tests with the mount unloaded, then slow tracking tests with hard stops and emergency stop available.
 
