@@ -46,4 +46,38 @@ inline bool supportedPlanetBody(int body) {
     return body == 3 || body == 4 || body == 5 || body == 10;
 }
 
+/*
+ * A calculation is usable only for the exact target and observer snapshots
+ * from which it was produced. Zero is reserved to mean "not ready".
+ *
+ * This small value type has no RTOS dependency, so its state transitions can
+ * be tested on a desktop build. In firmware, the caller must protect every
+ * read/write with targetMutex.
+ */
+struct GenerationReadiness {
+    uint32_t targetGeneration = 0;
+    uint32_t observerGeneration = 0;
+
+    void clear() {
+        targetGeneration = 0;
+        observerGeneration = 0;
+    }
+
+    void publish(uint32_t target, uint32_t observer) {
+        // Never publish a partial/invalid version pair.
+        if (target == 0 || observer == 0) {
+            clear();
+            return;
+        }
+        targetGeneration = target;
+        observerGeneration = observer;
+    }
+
+    bool matches(uint32_t target, uint32_t observer) const {
+        return target != 0 && observer != 0 &&
+               targetGeneration == target &&
+               observerGeneration == observer;
+    }
+};
+
 } // namespace TrackingMath
