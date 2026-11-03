@@ -43,6 +43,8 @@
 #define MICROSTEPS_PER_REV  32768UL
 #define STEP_PULSE_US     50      // µs per pulse
 #define MOTOR_TASK_MS     25      // MotorTask period in ms
+// Absolute per-tick limit for an unexpected large correction.
+// Normal tracking corrections should be much smaller; this is not an acceleration ramp.
 #define MAX_STEPS_PER_TICK  80
 
 // Magnetic declination at the physical installation site, in degrees.
@@ -102,14 +104,18 @@ struct TargetState {
   char name[25];
 };
 TargetState current = {TYPE_SATELLITE, {.noradID = 25544}, "ISS"};
+// A deliberately simple proportional controller is enough for slow telescope tracking.
+// It avoids derivative kick and integral wind-up when a new target is selected.
 struct PID {
-  float integral = 0, lastErr = 0;
-  float kp, ki, kd, deadband;
+  float kp;
+  float deadband;
 };
 struct MotorTarget { float az = 0; float el = 0; } motorTarget;
 
-PID pidAz = {0.0f, 0.0f, 2.5f, 0.02f, 0.4f, 1.5f};
-PID pidEl = {0.0f, 0.0f, 3.0f, 0.03f, 0.5f, 1.0f};
+// Modest gains suit the small, repeated corrections used during normal tracking.
+// A narrow deadband filters sensor noise without allowing a large pointing error.
+PID pidAz = {2.5f, 0.05f};
+PID pidEl = {3.0f, 0.05f};
 SemaphoreHandle_t targetMutex;   // protects current and motorTarget
 SemaphoreHandle_t i2cMutex;      // protects the shared I2C bus
 SemaphoreHandle_t sysMutex;      // protects observer and telemetry state
@@ -122,7 +128,6 @@ volatile bool observerReady = false;
 volatile bool timeReady = false;
 volatile bool tleReady = false;
 volatile bool targetCalculationReady = false;
-volatile bool pidResetRequested = false;
 
 // Other tasks may request a safe stop, but only MotorTask writes motor GPIOs.
 // MotorTask consumes this flag and performs the actual ENABLE-pin changes.
@@ -159,11 +164,10 @@ TelemetrySnapshot getTelemetrySnapshot();
 bool getObserverSnapshot(double &lat, double &lon, double &alt);
 bool parseDoubleArg(AsyncWebServerRequest *request, const char *name, double &value);
 void disableMotors();
-void resetPIDs();
 const char *planetName(int body);
 void PhysicsTask(void * p);
 void stepMotor(int stepPin, int dirPin, bool forward);
-int pidOutput(PID &p, float error, float dt);
+int pidOutput(const PID &p, float error);
 float wrapAngle(float e);
 void MotorTask(void * p);
 
@@ -531,7 +535,6 @@ void setup() {
       motorTarget.az = 0;
       motorTarget.el = 0;
       xSemaphoreGive(targetMutex);
-      pidResetRequested = true;
 
       if (next.type == TYPE_SATELLITE) {
           if (!startTLEFetchTask()) {
@@ -684,11 +687,6 @@ void disableMotors() {
   motorStopRequested = true;
 }
 
-void resetPIDs() {
-  pidAz.integral = 0; pidAz.lastErr = 0;
-  pidEl.integral = 0; pidEl.lastErr = 0;
-}
-
 bool startTLEFetchTask() {
   tleReady = false;
   targetCalculationReady = false;
@@ -702,21 +700,21 @@ float wrapAngle(float e) {
   return TrackingMath::wrapAngle(e);
 }
 
-int pidOutput(PID &p, float error, float dt) {
-    if (!isfinite(error) || !isfinite(dt) || dt <= 0.0f) {
-        p.integral = 0; p.lastErr = 0;
-        return 0;
-    }
-    if (fabsf(error) < p.deadband) {
-        p.integral = 0;
-        p.lastErr = error;
-        return 0;
-    }
-    p.integral  = constrain(p.integral + error * dt, -40.f, 40.f);
-    float deriv = (error - p.lastErr) / dt;
-    p.lastErr   = error;
-    float out   = p.kp * error + p.ki * p.integral + p.kd * deriv;
-    return (int)constrain(out, -(float)MAX_STEPS_PER_TICK, (float)MAX_STEPS_PER_TICK);
+int pidOutput(const PID &p, float error) {
+    // Invalid sensor/target math must never turn into a motor command.
+    if (!isfinite(error)) return 0;
+
+    // Ignore tiny errors so sensor noise does not make the mount chatter.
+    if (fabsf(error) <= p.deadband) return 0;
+
+    // Round to the nearest whole step rather than truncating toward zero.
+    const long requestedSteps = lroundf(p.kp * error);
+
+    // Keep a hard ceiling for abnormal errors; this is not a speed ramp.
+    // Normal tracking corrections should be only a few steps per control tick.
+    return (int)constrain((float)requestedSteps,
+                          -(float)MAX_STEPS_PER_TICK,
+                          (float)MAX_STEPS_PER_TICK);
 }
 
 void PhysicsTask(void * p) {
@@ -869,7 +867,6 @@ void PhysicsTask(void * p) {
 
 
 void MotorTask(void * p) {
-  const float DT = MOTOR_TASK_MS / 1000.0f;
   TickType_t lastWake = xTaskGetTickCount();
   bool driversEnabled = false;
 
@@ -885,10 +882,6 @@ void MotorTask(void * p) {
           xSemaphoreGive(targetMutex);
       }
 
-      if (pidResetRequested) {
-          resetPIDs();
-          pidResetRequested = false;
-      }
       const bool orbitalDataReady = activeTarget.type != TYPE_SATELLITE || tleReady;
       if (!targetRead || !timeReady || !observerReady || !targetCalculationReady ||
           !orbitalDataReady || !bnoReady || !encoderReady || !isfinite(targetAz) ||
@@ -899,7 +892,6 @@ void MotorTask(void * p) {
               digitalWrite(EL_EN_PIN, HIGH);
               driversEnabled = false;
           }
-          resetPIDs();
           vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(MOTOR_TASK_MS));
           continue;
       }
@@ -913,7 +905,6 @@ void MotorTask(void * p) {
               digitalWrite(EL_EN_PIN, HIGH);
               driversEnabled = false;
           }
-          resetPIDs();
           vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(MOTOR_TASK_MS));
           continue;
       }
@@ -940,7 +931,6 @@ void MotorTask(void * p) {
               digitalWrite(EL_EN_PIN, HIGH);
               driversEnabled = false;
           }
-          resetPIDs();
           vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(MOTOR_TASK_MS));
           continue;
       }
@@ -965,8 +955,8 @@ void MotorTask(void * p) {
       float headingTrue = fmodf(headingNow + MAGNETIC_DECLINATION_DEG, 360.0f);
       if (headingTrue < 0.0f) headingTrue += 360.0f;
 
-      const int azSteps = pidOutput(pidAz, wrapAngle(targetAz - headingTrue), DT);
-      const int elSteps = pidOutput(pidEl, wrapAngle(targetEl - elNow), DT);
+      const int azSteps = pidOutput(pidAz, wrapAngle(targetAz - headingTrue));
+      const int elSteps = pidOutput(pidEl, wrapAngle(targetEl - elNow));
       const bool azFwd = azSteps > 0;
       const bool elFwd = elSteps > 0;
       const int azN = abs(azSteps);
