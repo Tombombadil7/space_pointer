@@ -685,17 +685,35 @@ int createSpacePointerCertificate(httpsserver::SSLCert &certContext) {
   mbedtls_ctr_drbg_context randomGenerator;
   mbedtls_pk_context privateKey;
   mbedtls_x509write_cert certificateWriter;
+  unsigned char *temporaryKey = nullptr;
+  unsigned char *savedKey = nullptr;
+  unsigned char *temporaryCertificate = nullptr;
+  unsigned char *savedCertificate = nullptr;
+  int keyBytesWritten = 0;
+  int certificateBytesWritten = 0;
+  int result = 0;
+#if MBEDTLS_VERSION_NUMBER < 0x03000000
+  mbedtls_mpi serialNumber;
+  mbedtls_mpi_init(&serialNumber);
+#endif
+
+  // DER-encoded GeneralNames -> dNSName [2] "space-pointer.local".
+  const unsigned char subjectAltName[] = {
+    0x30, 0x15, 0x82, 0x13,
+    's','p','a','c','e','-','p','o','i','n','t','e','r','.','l','o','c','a','l'
+  };
+  const char *personalization = "space-pointer-tls";
+  const char *distinguishedName = "CN=space-pointer.local,O=Universal Space Pointer,C=IL";
 
   mbedtls_entropy_init(&entropy);
   mbedtls_ctr_drbg_init(&randomGenerator);
   mbedtls_pk_init(&privateKey);
   mbedtls_x509write_crt_init(&certificateWriter);
 
-  const char *personalization = "space-pointer-tls";
-  int result = mbedtls_ctr_drbg_seed(&randomGenerator, mbedtls_entropy_func,
-                                     &entropy,
-                                     reinterpret_cast<const unsigned char *>(personalization),
-                                     strlen(personalization));
+  result = mbedtls_ctr_drbg_seed(&randomGenerator, mbedtls_entropy_func,
+                                 &entropy,
+                                 reinterpret_cast<const unsigned char *>(personalization),
+                                 strlen(personalization));
   if (result != 0) {
     Serial.printf("TLS RNG initialization failed: %d\\n", result);
     goto cleanup;
@@ -716,45 +734,36 @@ int createSpacePointerCertificate(httpsserver::SSLCert &certContext) {
   }
 
   // mbedTLS writes DER data at the end of its output buffer.
-  unsigned char *temporaryKey = new (std::nothrow) unsigned char[4096];
+  temporaryKey = new (std::nothrow) unsigned char[4096];
   if (temporaryKey == nullptr) {
     result = -1;
     goto cleanup;
   }
-  const int keyBytesWritten = mbedtls_pk_write_key_der(&privateKey, temporaryKey, 4096);
+  keyBytesWritten = mbedtls_pk_write_key_der(&privateKey, temporaryKey, 4096);
   if (keyBytesWritten <= 0) {
-    delete[] temporaryKey;
     result = keyBytesWritten;
     goto cleanup;
   }
-  unsigned char *savedKey = new (std::nothrow) unsigned char[keyBytesWritten];
+  savedKey = new (std::nothrow) unsigned char[keyBytesWritten];
   if (savedKey == nullptr) {
-    delete[] temporaryKey;
     result = -1;
     goto cleanup;
   }
   memcpy(savedKey, temporaryKey + 4096 - keyBytesWritten, keyBytesWritten);
   delete[] temporaryKey;
+  temporaryKey = nullptr;
 
   mbedtls_x509write_crt_set_version(&certificateWriter, MBEDTLS_X509_CRT_VERSION_3);
   mbedtls_x509write_crt_set_md_alg(&certificateWriter, MBEDTLS_MD_SHA256);
   mbedtls_x509write_crt_set_subject_key(&certificateWriter, &privateKey);
   mbedtls_x509write_crt_set_issuer_key(&certificateWriter, &privateKey);
 
-  const char *distinguishedName = "CN=space-pointer.local,O=Universal Space Pointer,C=IL";
   result = mbedtls_x509write_crt_set_subject_name(&certificateWriter, distinguishedName);
   if (result == 0) result = mbedtls_x509write_crt_set_issuer_name(&certificateWriter, distinguishedName);
   if (result == 0) result = mbedtls_x509write_crt_set_validity(&certificateWriter, "20260101000000", "20351231235959");
   if (result == 0) result = mbedtls_x509write_crt_set_basic_constraints(&certificateWriter, 1, 0);
-
-  // DER-encoded GeneralNames -> dNSName [2] "space-pointer.local".
-  // Keeping the SAN in the certificate allows hostname validation to succeed
-  // once the user has chosen to trust this self-signed certificate.
-  const unsigned char subjectAltName[] = {
-    0x30, 0x15, 0x82, 0x13,
-    's','p','a','c','e','-','p','o','i','n','t','e','r','.','l','o','c','a','l'
-  };
   if (result == 0) {
+    // Modern browsers check Subject Alternative Name, not just Common Name.
     result = mbedtls_x509write_crt_set_extension(
         &certificateWriter, MBEDTLS_OID_SUBJECT_ALT_NAME,
         MBEDTLS_OID_SIZE(MBEDTLS_OID_SUBJECT_ALT_NAME),
@@ -762,66 +771,54 @@ int createSpacePointerCertificate(httpsserver::SSLCert &certContext) {
   }
 
 #if MBEDTLS_VERSION_NUMBER >= 0x03000000
-  // The generated key is unique; a fixed serial is sufficient for this local certificate.
   if (result == 0) {
+    // The RSA key is unique per device; this serial identifies the local certificate.
     const unsigned char serial[] = {0x53, 0x50, 0x32, 0x30, 0x32, 0x36};
     result = mbedtls_x509write_crt_set_serial_raw(&certificateWriter, serial, sizeof(serial));
   }
 #else
-  mbedtls_mpi serialNumber;
-  mbedtls_mpi_init(&serialNumber);
   if (result == 0) result = mbedtls_mpi_fill_random(&serialNumber, 10, mbedtls_ctr_drbg_random, &randomGenerator);
   if (result == 0) result = mbedtls_x509write_crt_set_serial(&certificateWriter, &serialNumber);
 #endif
+  if (result != 0) goto cleanup;
 
-  if (result != 0) {
-    delete[] savedKey;
-#if MBEDTLS_VERSION_NUMBER < 0x03000000
-    mbedtls_mpi_free(&serialNumber);
-#endif
-    goto cleanup;
-  }
-
-  unsigned char *temporaryCertificate = new (std::nothrow) unsigned char[4096];
+  temporaryCertificate = new (std::nothrow) unsigned char[4096];
   if (temporaryCertificate == nullptr) {
-    delete[] savedKey;
     result = -1;
-#if MBEDTLS_VERSION_NUMBER < 0x03000000
-    mbedtls_mpi_free(&serialNumber);
-#endif
     goto cleanup;
   }
-  const int certificateBytesWritten = mbedtls_x509write_crt_der(
+  certificateBytesWritten = mbedtls_x509write_crt_der(
       &certificateWriter, temporaryCertificate, 4096,
       mbedtls_ctr_drbg_random, &randomGenerator);
-#if MBEDTLS_VERSION_NUMBER < 0x03000000
-  mbedtls_mpi_free(&serialNumber);
-#endif
   if (certificateBytesWritten <= 0) {
-    delete[] temporaryCertificate;
-    delete[] savedKey;
     result = certificateBytesWritten;
     goto cleanup;
   }
 
-  unsigned char *savedCertificate = new (std::nothrow) unsigned char[certificateBytesWritten];
+  savedCertificate = new (std::nothrow) unsigned char[certificateBytesWritten];
   if (savedCertificate == nullptr) {
-    delete[] temporaryCertificate;
-    delete[] savedKey;
     result = -1;
     goto cleanup;
   }
   memcpy(savedCertificate, temporaryCertificate + 4096 - certificateBytesWritten,
          certificateBytesWritten);
-  delete[] temporaryCertificate;
 
-  // SSLCert stores pointers rather than copying; these buffers intentionally
-  // remain allocated while the HTTPS server uses them.
+  // SSLCert stores pointers rather than copying. Transfer these buffers to it;
+  // they remain allocated for the lifetime of the HTTPS server.
   certContext.setPK(savedKey, keyBytesWritten);
   certContext.setCert(savedCertificate, certificateBytesWritten);
+  savedKey = nullptr;
+  savedCertificate = nullptr;
   result = 0;
 
 cleanup:
+  delete[] temporaryKey;
+  delete[] savedKey;
+  delete[] temporaryCertificate;
+  delete[] savedCertificate;
+#if MBEDTLS_VERSION_NUMBER < 0x03000000
+  mbedtls_mpi_free(&serialNumber);
+#endif
   mbedtls_x509write_crt_free(&certificateWriter);
   mbedtls_pk_free(&privateKey);
   mbedtls_ctr_drbg_free(&randomGenerator);
@@ -861,12 +858,7 @@ bool configureHttpsCertificate() {
 
   if (!loaded) {
     Serial.println("Generating a local self-signed TLS certificate (first boot may take a while)...");
-    const int result = httpsserver::createSelfSignedCert(
-        localTlsCertificate,
-        httpsserver::KEYSIZE_2048,
-        "CN=space-pointer.local,O=Universal Space Pointer,C=IL",
-        "20260101000000",
-        "20351231235959");
+    const int result = createSpacePointerCertificate(localTlsCertificate);
     if (result != 0) {
       Serial.printf("ERROR: TLS certificate generation failed (0x%02X).\n", result);
       preferences.end();
