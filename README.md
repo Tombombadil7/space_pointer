@@ -84,7 +84,7 @@ Before operating the mount, review these values near the top of `src/spacepointe
 - Wi-Fi credentials are provisioned through the `SpaceTracker_AP` WiFiManager setup portal; they are not hard-coded in this source file.
 - The initial IP-geolocation fallback assigns altitude `50.0` metres. It is an estimate, not a site-specific surveyed altitude. Use the phone location update and verify its altitude if accurate observer height matters.
 - The magnetic declination must correspond to the physical installation site, not the phone's temporary location, unless the mount itself is moved.
-- The firmware currently uses an HTTP local dashboard. Browser geolocation may be unavailable in that insecure context; do not assume that the browser GPS button will work in every browser.
+- The dashboard uses HTTPS on port 443 with a self-signed certificate generated on first boot and stored in NVS. The certificate is named for `space-pointer.local`; browsers will warn that it is not publicly trusted. mDNS advertises `space-pointer.local`, and the Serial Monitor prints an IP-based fallback URL. Browser geolocation still depends on the browser accepting the certificate as a secure context and on user permission.
 
 
 ## Software and dependencies
@@ -116,18 +116,18 @@ pio test -e native
 pio run -e esp32-s3-devkitc-1
 ```
 
-The GitHub Actions workflow runs both commands on pushes to the fix branch and on pull requests. A green CI result verifies compilation and the hardware-independent helper tests; it does not replace bench testing, sensor calibration, or safe motor commissioning.
+The GitHub Actions workflow runs both commands on pushes to the fix branch and on pull requests. The HTTPS dependency is `esp32_idf5_https_server_compat`, a TLS-capable alternative to `ESPAsyncWebServer`; request handling is synchronous, so `loop()` calls `server.handleClient()` frequently. A green CI result verifies compilation and the hardware-independent helper tests; it does not replace bench testing, sensor calibration, or safe motor commissioning.
 
 ## First boot and operation
 
 1. Connect the ESP32-S3 to the computer and open the serial monitor at **115200 baud**.
 2. Configure Wi-Fi using the WiFiManager setup access point named `SpaceTracker_AP`. Its current default password is `SpacePointerSetup`.
-3. Once connected to the same Wi-Fi network, find the ESP32's DHCP address in the router's client list and open `http://<ESP32-IP>/` in a browser.
+3. Connect your phone/computer to the same Wi-Fi network and open `https://space-pointer.local/`. If mDNS is unsupported or blocked, use the HTTPS fallback IP printed in the Serial Monitor: `https://<ESP32-IP>/`.
 4. Select a listed satellite or planet, or enter a NORAD ID to request a satellite.
-5. Use **Sync Phone GPS** to send the phone's permitted location to the device. Browser geolocation requires user permission and may be restricted by browsers when the page is served over plain HTTP.
+5. On the first visit, review the self-signed certificate warning. Some browsers may still block geolocation until the certificate is explicitly trusted/installed. Then use **Sync Phone GPS** and grant location permission. If GPS remains blocked, trust the certificate for `space-pointer.local` on that device or use a browser that accepts it as a secure context.
 6. The satellite TLE, IP geolocation, NTP time, Leaflet assets, and map tiles require internet access.
 
-The web server listens on port 80. The dashboard root (`/`), `/set`, and `/updateLoc` require HTTP Basic Authentication. Opening the dashboard prompts the browser to authenticate before its JavaScript can call the control endpoints. The current source defaults are username `admin` and password `spacepointer-change-me`; change both control credentials and the setup AP password before deployment. Basic Authentication over plain HTTP does not encrypt credentials, so keep this device on a trusted local network and do not expose port 80 to the internet. The read-only `/data` endpoint remains unauthenticated.
+The HTTPS server listens on port 443; no plain-HTTP dashboard is started. The dashboard root (`/`), `/set`, and `/updateLoc` require HTTP Basic Authentication. Opening the dashboard prompts the browser to authenticate before its JavaScript can call the control endpoints. The current source defaults are username `admin` and password `spacepointer-change-me`; change both control credentials and the setup AP password before deployment. HTTPS encrypts traffic, but the self-signed certificate is not automatically trusted by browsers. The read-only `/data` endpoint remains unauthenticated.
 
 ## Implemented fixes and remaining commissioning work
 
@@ -156,8 +156,8 @@ The `fix/satellite-nextpass-minimum-elevation` branch includes these software ch
 - Confirm the AS5600 magnet orientation, BNO055 mounting/alignment, motor directions, azimuth reference, elevation zero, gear ratios, microstep setting, and physical travel range. The firmware does not yet provide a full mount calibration wizard or closed-loop homing.
 - Add physical limit switches and an emergency stop. They are not implemented in software yet. A4988 disable removes holding torque; balance the elevation axis or use a brake to prevent it dropping when the driver is disabled.
 - Replace the example AP and web credentials in the source before deployment. HTTP Basic Authentication is not encrypted on the plain-HTTP connection.
-- IP geolocation currently uses the IP-API HTTP endpoint. Treat this as an approximate startup location; use the phone GPS update for a more accurate observer position.
-- The default UI page now uses HTTP Basic Authentication too, so the browser authenticates before control fetches are made.
+- Initial IP geolocation uses the `https://ipwho.is/` JSON endpoint. It is an approximate fallback; use phone GPS for a more accurate observer position. The third-party endpoint may be rate-limited or unavailable.
+- The dashboard now uses HTTPS with a self-signed certificate generated on first boot and saved in NVS so it remains stable across restarts. The private key is stored in ESP32 flash; physical access to the board may expose it. The dashboard uses HTTP Basic Authentication over TLS, while `/data` remains unauthenticated.
 - Confirm the SGP4 library's returned altitude/distance units against its documentation and a known satellite pass; the current telemetry code retains the library's documented/public fields and assumes kilometres.
 - Complete a staged bench test: build, sensor-only checks, motor-driver tests with the mount unloaded, then slow tracking tests with hard stops and emergency stop available.
 
