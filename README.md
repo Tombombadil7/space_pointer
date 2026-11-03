@@ -2,7 +2,7 @@
 
 An experimental ESP32-S3 project for pointing a two-axis motorized mount at selected satellites and solar-system objects. The firmware combines orbital/astronomical calculations with an IMU, a magnetic rotary encoder, stepper-motor drivers, an LCD, and a browser-based control panel.
 
-> **Project status:** prototype / work in progress. The `fix/esp32s3-tracking-safety` branch contains a software remediation pass and automated build/test workflows. The firmware has not yet been verified on the physical mount. Do not connect motor power until the pin map, motor wiring, current limits, mechanics, and emergency-stop arrangement have been checked.
+> **Project status:** prototype / work in progress. The `fix/satellite-nextpass-minimum-elevation` branch contains the current software remediation pass and automated build/test workflows. The firmware has not yet been verified on the physical mount. Do not connect motor power until the pin map, motor wiring, current limits, mechanics, and emergency-stop arrangement have been checked.
 
 ## Intended features
 
@@ -51,6 +51,44 @@ These are the definitions currently in `src/spacepointer_ver_2.cpp`; they are **
 
 The source comments configure A4988 MS1, MS2, and MS3 high for 1/16 microstepping. Confirm the actual driver-board pinout and motor/gearbox step count. The `MICROSTEPS_PER_REV` constant is currently not used to convert pointing angles into calibrated mechanical positions.
 
+## Manual settings to configure in the source
+
+Before operating the mount, review these values near the top of `src/spacepointer_ver_2.cpp`. They are intentionally kept as simple constants so the installation-specific settings are easy to find.
+
+| Setting | Current default | What you must enter / verify |
+|---|---:|---|
+| `MAGNETIC_DECLINATION_DEG` | `0.0f` | **Enter the magnetic declination at the actual telescope installation location**, in degrees. East is positive; west is negative. Obtain a current value from a trusted magnetic-field model for the installation coordinates and date. The BNO055 measures magnetic heading, while the calculated target azimuth is relative to true north. Zero is only correct where magnetic and true north coincide. |
+| `ENCODER_ZERO_RAW` | `2048` | **Calibrate this value.** Place the telescope tube physically level (0° elevation), read `encoder.rawAngle()` (0–4095) from the sensor, and enter that reading. 2048 is only a placeholder inherited from the old half-turn assumption; it is not a measured calibration. |
+| `ENCODER_DIRECTION` | `1` | **Verify this value.** Move the telescope upward a small amount and observe whether the raw encoder reading increases. Use `1` if it increases, or `-1` if it decreases. Direction is applied in software; do not also call `encoder.setDirection()`. |
+| `CONTROL_USER` | `admin` | Change the web dashboard username before deployment. |
+| `CONTROL_PASSWORD` | `spacepointer-change-me` | **Change this password** to a unique, strong password. Basic Authentication is sent over plain HTTP in this firmware, so it does not protect credentials from someone able to monitor the local network. |
+| `SETUP_AP_PASSWORD` | `SpacePointerSetup` | Change the WiFiManager setup access-point password. Use a password supported by the Wi-Fi stack (at least 8 characters). |
+| `current` initial target | ISS / NORAD `25544` | Optional: change the default satellite name and NORAD catalog ID if you want another initial target. |
+| LCD constructor | `0x27` | Usually leave as-is: setup probes `0x27` and then `0x3F` automatically. |
+| `MICROSTEPS_PER_REV` | `32768UL` | Check against the actual motor full-step angle, gearbox ratio, and A4988 microstep setting. **This constant is currently not used for angular positioning**, so changing it alone does not calibrate the mount. |
+| `STEP_PULSE_US` / `MOTOR_TASK_MS` / `MAX_STEPS_PER_TICK` | `50` µs / `25` ms / `8` steps | Pulse timing and a conservative per-tick correction cap. The cap limits large target changes; it is not an acceleration ramp. Change it only after unloaded bench testing. |
+| `pidAz.kp` | `2.5` | Proportional gain for the azimuth axis, in **steps per degree**. The controller multiplies the azimuth pointing error (degrees) by this value to calculate a requested number of motor steps. A larger value commands more steps for the same error; a smaller value makes corrections gentler. This is an experimental starting value, not a mechanically calibrated value. |
+| `pidEl.kp` | `3.0` | Proportional gain for the elevation axis, also in **steps per degree**. It has the same role as `pidAz.kp`, but can be tuned independently because the two axes may have different motors, gearing, and loads. This is an experimental starting value, not a mechanically calibrated value. |
+| `pidAz.deadband` / `pidEl.deadband` | `0.05°` / `0.05°` | Minimum error (in degrees) that must be exceeded before that axis requests movement. Errors at or below the deadband are treated as zero, helping prevent motor chatter caused by small sensor fluctuations. A larger deadband reduces unnecessary corrections but allows more pointing error; a smaller one tracks more tightly but may react to noise. |
+
+### Safe AS5600 calibration procedure
+
+1. Keep motor power disconnected and place the telescope tube level using a reliable physical level.
+2. Read the AS5600 raw angle over Serial (or temporarily print `encoder.rawAngle()` after a successful read).
+3. Copy that exact 0–4095 reading into `ENCODER_ZERO_RAW`.
+4. Move the tube upward by hand a small, safe amount and check the raw reading. Set `ENCODER_DIRECTION` to `1` or `-1` as described above.
+5. Rebuild and verify the reported elevation manually at level and at a second known angle before connecting motor power.
+
+**Important:** this software calibration establishes the encoder's angular zero and sign only. It does not establish mechanical travel limits, perform homing, or prevent the mount from hitting a hard stop. Do not infer safe travel limits from these settings.
+
+### Location and network settings
+
+- Wi-Fi credentials are provisioned through the `SpaceTracker_AP` WiFiManager setup portal; they are not hard-coded in this source file.
+- The initial IP-geolocation fallback assigns altitude `50.0` metres. It is an estimate, not a site-specific surveyed altitude. Use the phone location update and verify its altitude if accurate observer height matters.
+- The magnetic declination must correspond to the physical installation site, not the phone's temporary location, unless the mount itself is moved.
+- The firmware currently uses an HTTP local dashboard. Browser geolocation may be unavailable in that insecure context; do not assume that the browser GPS button will work in every browser.
+
+
 ## Software and dependencies
 
 - PlatformIO (PlatformIO Core or the VS Code PlatformIO extension)
@@ -96,17 +134,20 @@ The web server listens on port 80. The dashboard root (`/`), `/set`, and `/updat
 
 ## Implemented fixes and remaining commissioning work
 
-The `fix/esp32s3-tracking-safety` branch includes these software changes:
+The `fix/satellite-nextpass-minimum-elevation` branch includes these software changes:
 
 - Corrected the AS5600 PlatformIO dependency and added the missing `Wire.h` and `LiquidCrystal_I2C.h` includes.
 - Changed driver ENABLE pins to GPIO16 and GPIO17; explicitly selected I2C GPIO8/GPIO9.
-- Corrected PID aggregate initialization so integral and previous-error state start at zero and the configured gains land in the intended fields.
+- Replaced the derivative/integral PID with a small proportional controller: this avoids derivative kick on target changes, keeps normal tracking corrections small, and caps unusually large corrections per control tick.
 - Corrected the Moon and Mars body IDs (Moon=10, Mars=3) and the one-second planetary look-ahead using `Astronomy_AddDays`.
 - Added a TLE fetch/validation step before satellite calculations, serialized access to SGP4, and restored SGP4 to the current epoch after the velocity look-ahead.
 - Protected target, observer/telemetry, I2C, and SGP4 shared state with mutexes and used snapshots between tasks.
 - Added bounds checks for observer coordinates, NORAD IDs, and supported planetary bodies; added HTTP response/JSON/TLE validation.
-- Kept motor drivers disabled until time, location, orbital solution (for satellites), and both feedback sensors are ready. Sensor/mutex failures and below-horizon targets stop step pulses and disable the drivers. If NTP synchronizes after the startup timeout, the physics task can now resume automatically.
+- Kept motor drivers disabled until time, location, orbital solution (for satellites), and both feedback sensors are ready; runtime motor GPIO writes are now owned exclusively by MotorTask, while other tasks can only request a stop. Sensor/mutex failures and below-horizon targets stop step pulses and disable the drivers. If NTP synchronizes after the startup timeout, the physics task can now resume automatically.
 - Updated the AS5600 read call to the library's actual `rawAngle()` API and use `lastError()` to reject a failed I2C read.
+- Added configurable AS5600 zero-angle and direction calibration, and converted encoder readings relative to the calibrated horizontal position.
+- Added magnetic-declination compensation to convert BNO055 magnetic heading to true-north heading (the default declination remains a placeholder that must be configured for the installation site).
+- Corrected satellite next-pass prediction to pass the 20-degree minimum elevation to the proper SGP4 argument and check prediction initialization.
 - Kept rise/set and satellite-pass calculations running even if the optional LCD is absent; only LCD writes are skipped.
 - Fixed satellite and planetary telemetry population and added the missing planetary set-time field to `/data`.
 - Added HTTP Basic Authentication to the target/location control endpoints, password-protected WiFiManager setup AP, native helper tests, and GitHub Actions build/test jobs.

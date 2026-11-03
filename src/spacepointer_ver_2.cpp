@@ -43,7 +43,27 @@
 #define MICROSTEPS_PER_REV  32768UL
 #define STEP_PULSE_US     50      // µs per pulse
 #define MOTOR_TASK_MS     25      // MotorTask period in ms
-#define MAX_STEPS_PER_TICK  80
+// Absolute per-tick limit for an unexpected large correction.
+// Normal tracking corrections should be much smaller; this is not an acceleration ramp.
+#define MAX_STEPS_PER_TICK  8
+
+// Magnetic declination at the physical installation site, in degrees.
+// East is positive; west is negative. Set this using a current magnetic
+// declination model for the telescope's location. The BNO055 reports
+// magnetic-north heading, while Astronomy Engine calculates true-north azimuth.
+// A zero value is only correct where magnetic and true north coincide.
+#define MAGNETIC_DECLINATION_DEG  0.0f
+
+// AS5600 elevation calibration.
+// Set ENCODER_ZERO_RAW to the raw sensor reading when the telescope tube is
+// physically level (0 degrees elevation). The default 2048 preserves the
+// previous assumption that the sensor's half-turn position is level.
+// Set ENCODER_DIRECTION to +1 or -1 after checking which way the raw reading
+// changes when the telescope is moved upward. Do not use AS5600.setDirection()
+// as well: direction is applied explicitly below.
+#define ENCODER_ZERO_RAW       2048
+#define ENCODER_DIRECTION      1
+
 // Two axes are stepped sequentially; 80 leaves time for task/sensor overhead.
 
 AsyncWebServer server(80);
@@ -84,14 +104,18 @@ struct TargetState {
   char name[25];
 };
 TargetState current = {TYPE_SATELLITE, {.noradID = 25544}, "ISS"};
-struct PID {
-  float integral = 0, lastErr = 0;
-  float kp, ki, kd, deadband;
+// A deliberately simple proportional controller is enough for slow telescope tracking.
+// It avoids derivative kick and integral wind-up when a new target is selected.
+struct PController {
+  float kp;
+  float deadband;
 };
 struct MotorTarget { float az = 0; float el = 0; } motorTarget;
 
-PID pidAz = {0.0f, 0.0f, 2.5f, 0.02f, 0.4f, 1.5f};
-PID pidEl = {0.0f, 0.0f, 3.0f, 0.03f, 0.5f, 1.0f};
+// Modest gains suit the small, repeated corrections used during normal tracking.
+// A narrow deadband filters sensor noise without allowing a large pointing error.
+PController pidAz = {2.5f, 0.05f};
+PController pidEl = {3.0f, 0.05f};
 SemaphoreHandle_t targetMutex;   // protects current and motorTarget
 SemaphoreHandle_t i2cMutex;      // protects the shared I2C bus
 SemaphoreHandle_t sysMutex;      // protects observer and telemetry state
@@ -104,7 +128,10 @@ volatile bool observerReady = false;
 volatile bool timeReady = false;
 volatile bool tleReady = false;
 volatile bool targetCalculationReady = false;
-volatile bool pidResetRequested = false;
+
+// Other tasks may request a safe stop, but only MotorTask writes motor GPIOs.
+// MotorTask consumes this flag and performs the actual ENABLE-pin changes.
+volatile bool motorStopRequested = true;
 
 // Change both credentials before deploying outside a trusted test network.
 static const char *CONTROL_USER = "admin";
@@ -137,11 +164,10 @@ TelemetrySnapshot getTelemetrySnapshot();
 bool getObserverSnapshot(double &lat, double &lon, double &alt);
 bool parseDoubleArg(AsyncWebServerRequest *request, const char *name, double &value);
 void disableMotors();
-void resetPIDs();
 const char *planetName(int body);
 void PhysicsTask(void * p);
 void stepMotor(int stepPin, int dirPin, bool forward);
-int pidOutput(PID &p, float error, float dt);
+int pidOutput(const PController &p, float error);
 float wrapAngle(float e);
 void MotorTask(void * p);
 
@@ -297,9 +323,7 @@ const char index_html[] PROGMEM = R"rawliteral(
     
             // altitude label: "km altitude" for sats, "km from Earth" for planets
             document.querySelector('[data-lbl="alt"]').innerText  = isSat ? 'km altitude' : 'km from observer';
-            document.getElementById('alt').innerText = d.alt > 0 ? Math.round(d.alt) : '--';
-    
-            // distance label: "km distance" for sats, same "km from Earth" for planets
+            document.getElementById('alt').innerText = d.alt > 0 ? Math.round(d.alt) : '--';                // distance label: "km distance" for sats, same "km from Earth" for planets
             document.querySelector('[data-lbl="dist"]').innerText = isSat ? 'km distance'   : 'km from observer';
             document.getElementById('dist').innerText = d.dist > 0 ? Math.round(d.dist) : '--';
     
@@ -346,6 +370,8 @@ void setup() {
   // ── 3. Hardware Initialization ─────────────────────────────────────
   pinMode(AZ_STEP_PIN, OUTPUT); pinMode(AZ_DIR_PIN, OUTPUT);
   pinMode(EL_STEP_PIN, OUTPUT); pinMode(EL_DIR_PIN, OUTPUT);
+  // Set a safe initial electrical state before the FreeRTOS motor task starts.
+  // After startup, MotorTask is the only task allowed to write motor GPIOs.
   pinMode(AZ_EN_PIN, OUTPUT);   digitalWrite(AZ_EN_PIN, HIGH); // disabled
   pinMode(EL_EN_PIN, OUTPUT);   digitalWrite(EL_EN_PIN, HIGH); // disabled
   pinMode(AZ_STEP_PIN, OUTPUT); digitalWrite(AZ_STEP_PIN, LOW);
@@ -386,8 +412,6 @@ void setup() {
   encoderReady = encoder.isConnected();
   if (!encoderReady) {
       Serial.println("WARNING: AS5600 not found — motor control will stay disabled");
-  } else {
-      encoder.setDirection(AS5600_CLOCK_WISE);
   }
 
   // ── BNO055 IMU ─────────────────────────────────────────────────────
@@ -511,7 +535,6 @@ void setup() {
       motorTarget.az = 0;
       motorTarget.el = 0;
       xSemaphoreGive(targetMutex);
-      pidResetRequested = true;
 
       if (next.type == TYPE_SATELLITE) {
           if (!startTLEFetchTask()) {
@@ -597,10 +620,8 @@ void setup() {
       disableMotors();
   }
 
-  // DisplayTask also calculates next rise/set or satellite pass times.
-  // Keep it running even without an LCD; LCD writes are conditionally skipped.
-  if (xTaskCreatePinnedToCore(DisplayTask, "Display", 5000, NULL, 1, NULL, 0) != pdPASS) {
-      Serial.println("WARNING: Display/Pass task creation failed.");
+  // DisplayTask also calculates next rise/set or satellite pass times.  // Keep it running even without an LCD; LCD writes are conditionally skipped.
+  if (xTaskCreatePinnedToCore(DisplayTask, "Display", 5000, NULL, 1, NULL, 0) != pdPASS) {      Serial.println("WARNING: Display/Pass task creation failed.");
   }
 }
 
@@ -660,14 +681,10 @@ const char *planetName(int body) {
   }
 }
 
+// Request a stop from any task. This function deliberately does not touch GPIO:
+// MotorTask owns all motor outputs and will disable the drivers on its next tick.
 void disableMotors() {
-  digitalWrite(AZ_EN_PIN, HIGH);
-  digitalWrite(EL_EN_PIN, HIGH);
-}
-
-void resetPIDs() {
-  pidAz.integral = 0; pidAz.lastErr = 0;
-  pidEl.integral = 0; pidEl.lastErr = 0;
+  motorStopRequested = true;
 }
 
 bool startTLEFetchTask() {
@@ -683,21 +700,21 @@ float wrapAngle(float e) {
   return TrackingMath::wrapAngle(e);
 }
 
-int pidOutput(PID &p, float error, float dt) {
-    if (!isfinite(error) || !isfinite(dt) || dt <= 0.0f) {
-        p.integral = 0; p.lastErr = 0;
-        return 0;
-    }
-    if (fabsf(error) < p.deadband) {
-        p.integral = 0;
-        p.lastErr = error;
-        return 0;
-    }
-    p.integral  = constrain(p.integral + error * dt, -40.f, 40.f);
-    float deriv = (error - p.lastErr) / dt;
-    p.lastErr   = error;
-    float out   = p.kp * error + p.ki * p.integral + p.kd * deriv;
-    return (int)constrain(out, -(float)MAX_STEPS_PER_TICK, (float)MAX_STEPS_PER_TICK);
+int pidOutput(const PController &p, float error) {
+    // Invalid sensor/target math must never turn into a motor command.
+    if (!isfinite(error)) return 0;
+
+    // Ignore tiny errors so sensor noise does not make the mount chatter.
+    if (fabsf(error) <= p.deadband) return 0;
+
+    // Round to the nearest whole step rather than truncating toward zero.
+    const long requestedSteps = lroundf(p.kp * error);
+
+    // Keep a hard ceiling for abnormal errors; this is not a speed ramp.
+    // Normal tracking corrections should be only a few steps per control tick.
+    return (int)constrain((float)requestedSteps,
+                          -(float)MAX_STEPS_PER_TICK,
+                          (float)MAX_STEPS_PER_TICK);
 }
 
 void PhysicsTask(void * p) {
@@ -850,8 +867,8 @@ void PhysicsTask(void * p) {
 
 
 void MotorTask(void * p) {
-  const float DT = MOTOR_TASK_MS / 1000.0f;
   TickType_t lastWake = xTaskGetTickCount();
+  bool driversEnabled = false;
 
   for (;;) {
       float targetAz = 0.0f, targetEl = 0.0f;
@@ -865,16 +882,29 @@ void MotorTask(void * p) {
           xSemaphoreGive(targetMutex);
       }
 
-      if (pidResetRequested) {
-          resetPIDs();
-          pidResetRequested = false;
-      }
       const bool orbitalDataReady = activeTarget.type != TYPE_SATELLITE || tleReady;
       if (!targetRead || !timeReady || !observerReady || !targetCalculationReady ||
           !orbitalDataReady || !bnoReady || !encoderReady || !isfinite(targetAz) ||
           !isfinite(targetEl) || targetEl < 0.0f || targetEl > 90.0f) {
-          disableMotors();
-          resetPIDs();
+          // Only this task changes the driver ENABLE pins during operation.
+          if (driversEnabled) {
+              digitalWrite(AZ_EN_PIN, HIGH);
+              digitalWrite(EL_EN_PIN, HIGH);
+              driversEnabled = false;
+          }
+          vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(MOTOR_TASK_MS));
+          continue;
+      }
+
+      // Consume stop requests raised by networking, TLE, or other tasks.
+      // The request forces at least one complete motor-control tick to remain stopped.
+      if (motorStopRequested) {
+          motorStopRequested = false;
+          if (driversEnabled) {
+              digitalWrite(AZ_EN_PIN, HIGH);
+              digitalWrite(EL_EN_PIN, HIGH);
+              driversEnabled = false;
+          }
           vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(MOTOR_TASK_MS));
           continue;
       }
@@ -896,20 +926,37 @@ void MotorTask(void * p) {
       const float headingNow = event.orientation.x;
       if (!sensorsRead || !isfinite(headingNow) || headingNow < 0.0f ||
           headingNow >= 360.0f || encoderRaw > 4095) {
-          disableMotors();
-          resetPIDs();
+          if (driversEnabled) {
+              digitalWrite(AZ_EN_PIN, HIGH);
+              digitalWrite(EL_EN_PIN, HIGH);
+              driversEnabled = false;
+          }
           vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(MOTOR_TASK_MS));
           continue;
       }
+      // Convert the 12-bit encoder reading into elevation relative to the
+      // calibrated level position. Wrap the difference so small movements
+      // across the sensor's 0/4095 boundary remain continuous.
+      int32_t encoderDelta = (int32_t)encoderRaw - ENCODER_ZERO_RAW;
+      if (encoderDelta > 2048) encoderDelta -= 4096;
+      if (encoderDelta < -2048) encoderDelta += 4096;
 
-      float elNow = encoderRaw * (360.0f / 4096.0f);
-      if (elNow > 180.0f) elNow -= 360.0f;
+      const float elNow = ENCODER_DIRECTION *
+                          encoderDelta * (360.0f / 4096.0f);
 
-      digitalWrite(AZ_EN_PIN, LOW);
-      digitalWrite(EL_EN_PIN, LOW);
+      if (!driversEnabled) {
+          digitalWrite(AZ_EN_PIN, LOW);
+          digitalWrite(EL_EN_PIN, LOW);
+          driversEnabled = true;
+      }
 
-      const int azSteps = pidOutput(pidAz, wrapAngle(targetAz - headingNow), DT);
-      const int elSteps = pidOutput(pidEl, wrapAngle(targetEl - elNow), DT);
+      // Convert the BNO055 magnetic heading to true north before comparing
+      // it with Astronomy Engine's true-north target azimuth.
+      float headingTrue = fmodf(headingNow + MAGNETIC_DECLINATION_DEG, 360.0f);
+      if (headingTrue < 0.0f) headingTrue += 360.0f;
+
+      const int azSteps = pidOutput(pidAz, wrapAngle(targetAz - headingTrue));
+      const int elSteps = pidOutput(pidEl, wrapAngle(targetEl - elNow));
       const bool azFwd = azSteps > 0;
       const bool elFwd = elSteps > 0;
       const int azN = abs(azSteps);
@@ -943,9 +990,13 @@ void DisplayTask(void * p) {
 
           if (target.type == TYPE_SATELLITE && tleReady &&
               xSemaphoreTake(sgp4Mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-              satSgp4.initpredpoint((unsigned long)now, 0.0);
-              passinfo overpass;
-              passValid = satSgp4.nextpass(&overpass, 20);
+              // Search for a pass that reaches at least 20 degrees above the horizon.
+              // The second argument is the search iteration limit, not the elevation.
+              const bool predictionReady =
+                  satSgp4.initpredpoint((unsigned long)now, 0.0);
+              passinfo overpass = {};
+              passValid = predictionReady &&
+                          satSgp4.nextpass(&overpass, 20, false, 20.0);
               if (passValid) {
                   aosTime = (time_t)((overpass.jdstart - 2440587.5) * 86400.0);
                   losTime = (time_t)((overpass.jdstop  - 2440587.5) * 86400.0);
