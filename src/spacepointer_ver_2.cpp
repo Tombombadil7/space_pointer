@@ -106,7 +106,7 @@ struct TargetState {
 TargetState current = {TYPE_SATELLITE, {.noradID = 25544}, "ISS"};
 // A deliberately simple proportional controller is enough for slow telescope tracking.
 // It avoids derivative kick and integral wind-up when a new target is selected.
-struct PID {
+struct PController {
   float kp;
   float deadband;
 };
@@ -114,8 +114,8 @@ struct MotorTarget { float az = 0; float el = 0; } motorTarget;
 
 // Modest gains suit the small, repeated corrections used during normal tracking.
 // A narrow deadband filters sensor noise without allowing a large pointing error.
-PID pidAz = {2.5f, 0.05f};
-PID pidEl = {3.0f, 0.05f};
+PController pidAz = {2.5f, 0.05f};
+PController pidEl = {3.0f, 0.05f};
 SemaphoreHandle_t targetMutex;   // protects current and motorTarget
 SemaphoreHandle_t i2cMutex;      // protects the shared I2C bus
 SemaphoreHandle_t sysMutex;      // protects observer and telemetry state
@@ -167,7 +167,7 @@ void disableMotors();
 const char *planetName(int body);
 void PhysicsTask(void * p);
 void stepMotor(int stepPin, int dirPin, bool forward);
-int pidOutput(const PID &p, float error);
+int pidOutput(const PController &p, float error);
 float wrapAngle(float e);
 void MotorTask(void * p);
 
@@ -700,7 +700,7 @@ float wrapAngle(float e) {
   return TrackingMath::wrapAngle(e);
 }
 
-int pidOutput(const PID &p, float error) {
+int pidOutput(const PController &p, float error) {
     // Invalid sensor/target math must never turn into a motor command.
     if (!isfinite(error)) return 0;
 
