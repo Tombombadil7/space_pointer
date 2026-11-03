@@ -715,13 +715,13 @@ int createSpacePointerCertificate(httpsserver::SSLCert &certContext) {
                                  reinterpret_cast<const unsigned char *>(personalization),
                                  strlen(personalization));
   if (result != 0) {
-    Serial.printf("TLS RNG initialization failed: %d\\n", result);
+    Serial.printf("TLS RNG initialization failed: %d\n", result);
     goto cleanup;
   }
 
   result = mbedtls_pk_setup(&privateKey, mbedtls_pk_info_from_type(MBEDTLS_PK_RSA));
   if (result != 0) {
-    Serial.printf("TLS RSA key setup failed: %d\\n", result);
+    Serial.printf("TLS RSA key setup failed: %d\n", result);
     goto cleanup;
   }
 
@@ -729,7 +729,7 @@ int createSpacePointerCertificate(httpsserver::SSLCert &certContext) {
                                mbedtls_ctr_drbg_random, &randomGenerator,
                                2048, 65537);
   if (result != 0) {
-    Serial.printf("TLS RSA key generation failed: %d\\n", result);
+    Serial.printf("TLS RSA key generation failed: %d\n", result);
     goto cleanup;
   }
 
