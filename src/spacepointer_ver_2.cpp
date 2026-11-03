@@ -63,8 +63,6 @@
 #define ENCODER_ZERO_RAW       2048
 #define ENCODER_DIRECTION      1
 
-// Two axes are stepped sequentially; 80 leaves time for task/sensor overhead.
-
 AsyncWebServer server(80);
 Adafruit_BNO055 bno = Adafruit_BNO055(55);
 Sgp4 satSgp4;
@@ -113,8 +111,8 @@ struct MotorTarget { float az = 0; float el = 0; } motorTarget;
 
 // Modest gains suit the small, repeated corrections used during normal tracking.
 // A narrow deadband filters sensor noise without allowing a large pointing error.
-PController pidAz = {2.5f, 0.05f};
-PController pidEl = {3.0f, 0.05f};
+PController pAz = {2.5f, 0.05f};
+PController pEl = {3.0f, 0.05f};
 SemaphoreHandle_t targetMutex;   // protects current and motorTarget
 SemaphoreHandle_t i2cMutex;      // protects the shared I2C bus
 SemaphoreHandle_t sysMutex;      // protects observer and telemetry state
@@ -138,7 +136,6 @@ static const char *CONTROL_PASSWORD = "spacepointer-change-me";
 static const char *SETUP_AP_PASSWORD = "SpacePointerSetup";
 
 struct TelemetrySnapshot {
-  double lat, lon, alt;
   double targetAz, targetEl;
   double satLat, satLon;
   double satSpeed, satAltKm, satDist;
@@ -162,7 +159,6 @@ void updateNextPass(const TargetState &target, time_t now,
                     double lat, double lon, double alt);
 void stepMotor(int stepPin, int dirPin, bool forward);
 int pidOutput(const PController &p, float error);
-float wrapAngle(float e);
 void MotorTask(void * p);
 
 
@@ -368,8 +364,8 @@ void setup() {
   // After startup, MotorTask is the only task allowed to write motor GPIOs.
   pinMode(AZ_EN_PIN, OUTPUT);   digitalWrite(AZ_EN_PIN, HIGH); // disabled
   pinMode(EL_EN_PIN, OUTPUT);   digitalWrite(EL_EN_PIN, HIGH); // disabled
-  pinMode(AZ_STEP_PIN, OUTPUT); digitalWrite(AZ_STEP_PIN, LOW);
-  pinMode(EL_STEP_PIN, OUTPUT); digitalWrite(EL_STEP_PIN, LOW);
+  digitalWrite(AZ_STEP_PIN, LOW);
+  digitalWrite(EL_STEP_PIN, LOW);
 
   // ESP32-S3 DevKitC-1 I2C mapping; all three peripherals share this bus.
   Wire.begin(8, 9); // SDA=GPIO8, SCL=GPIO9
@@ -601,7 +597,6 @@ TargetState getTargetSnapshot() {
 TelemetrySnapshot getTelemetrySnapshot() {
   TelemetrySnapshot result = {};
   if (sysMutex != NULL && xSemaphoreTake(sysMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-      result.lat = sys.lat; result.lon = sys.lon; result.alt = sys.alt;
       result.targetAz = sys.targetAz; result.targetEl = sys.targetEl;
       result.satLat = sys.satLat; result.satLon = sys.satLon;
       result.satSpeed = sys.satSpeed; result.satAltKm = sys.satAltKm;
@@ -654,25 +649,11 @@ bool startTLEFetchTask() {
   }, "TLE", 10000, NULL, 1, NULL) == pdPASS;
 }
 
-float wrapAngle(float e) {
-  return TrackingMath::wrapAngle(e);
-}
-
 int pidOutput(const PController &p, float error) {
-    // Invalid sensor/target math must never turn into a motor command.
-    if (!isfinite(error)) return 0;
-
-    // Ignore tiny errors so sensor noise does not make the mount chatter.
-    if (fabsf(error) <= p.deadband) return 0;
-
-    // Round to the nearest whole step rather than truncating toward zero.
-    const long requestedSteps = lroundf(p.kp * error);
-
-    // Keep a hard ceiling for abnormal errors; this is not a speed ramp.
-    // Normal tracking corrections should be only a few steps per control tick.
-    return (int)constrain((float)requestedSteps,
-                          -(float)MAX_STEPS_PER_TICK,
-                          (float)MAX_STEPS_PER_TICK);
+    // Keep the motor controller thin: the math is isolated in a portable,
+    // hardware-independent helper so its edge cases can be unit-tested.
+    return TrackingMath::proportionalSteps(
+        p.kp, p.deadband, error, MAX_STEPS_PER_TICK);
 }
 
 // Calculate the next satellite pass or planetary rise/set independently of
@@ -786,7 +767,7 @@ void PhysicsTask(void * p) {
 
               satSgp4.findsat((unsigned long)(now + 1));
               const double dlat = (satSgp4.satLat - lat1) * DEG_TO_RAD * 6371.0;
-              const double dlon = wrapAngle((float)(satSgp4.satLon - lon1)) *
+              const double dlon = TrackingMath::wrapAngle((float)(satSgp4.satLon - lon1)) *
                                   DEG_TO_RAD * 6371.0 * cos(lat1 * DEG_TO_RAD);
               const double dalt = satSgp4.satAlt - alt1;
               satSpeed = sqrt(dlat*dlat + dlon*dlon + dalt*dalt);
@@ -825,7 +806,7 @@ void PhysicsTask(void * p) {
 
                       const double distanceKm = equ1.dist * 149597870.7;
                       const double dDistance = (equ2.dist - equ1.dist) * 149597870.7;
-                      const double dAz = wrapAngle((float)(hor2.azimuth - hor1.azimuth)) *
+                      const double dAz = TrackingMath::wrapAngle((float)(hor2.azimuth - hor1.azimuth)) *
                                          DEG_TO_RAD * distanceKm;
                       const double dEl = (hor2.altitude - hor1.altitude) *
                                          DEG_TO_RAD * distanceKm;
@@ -973,8 +954,8 @@ void MotorTask(void * p) {
       float headingTrue = fmodf(headingNow + MAGNETIC_DECLINATION_DEG, 360.0f);
       if (headingTrue < 0.0f) headingTrue += 360.0f;
 
-      const int azSteps = pidOutput(pidAz, wrapAngle(targetAz - headingTrue));
-      const int elSteps = pidOutput(pidEl, wrapAngle(targetEl - elNow));
+      const int azSteps = pidOutput(pAz, TrackingMath::wrapAngle(targetAz - headingTrue));
+      const int elSteps = pidOutput(pEl, TrackingMath::wrapAngle(targetEl - elNow));
       const bool azFwd = azSteps > 0;
       const bool elFwd = elSteps > 0;
       const int azN = abs(azSteps);
