@@ -110,6 +110,46 @@ void test_proportional_controller_handles_zero_gain_and_zero_step_limit() {
     TEST_ASSERT_EQUAL_INT(0, TrackingMath::proportionalSteps(3.0f, 0.05f, 5.0f, 0));
 }
 
+
+void test_generation_readiness_starts_not_ready() {
+    TrackingMath::GenerationReadiness readiness;
+    TEST_ASSERT_FALSE(readiness.matches(1, 1));
+}
+
+void test_generation_readiness_matches_only_published_pair() {
+    TrackingMath::GenerationReadiness readiness;
+    readiness.publish(7, 12);
+    TEST_ASSERT_TRUE(readiness.matches(7, 12));
+    TEST_ASSERT_FALSE(readiness.matches(7, 13));
+    TEST_ASSERT_FALSE(readiness.matches(8, 12));
+}
+
+void test_generation_readiness_clear_invalidates_previous_pair() {
+    TrackingMath::GenerationReadiness readiness;
+    readiness.publish(4, 9);
+    readiness.clear();
+    TEST_ASSERT_FALSE(readiness.matches(4, 9));
+    TEST_ASSERT_EQUAL_UINT32(0, readiness.targetGeneration);
+    TEST_ASSERT_EQUAL_UINT32(0, readiness.observerGeneration);
+}
+
+void test_generation_readiness_rejects_zero_generations() {
+    TrackingMath::GenerationReadiness readiness;
+    readiness.publish(0, 5);
+    TEST_ASSERT_FALSE(readiness.matches(0, 5));
+    readiness.publish(5, 0);
+    TEST_ASSERT_FALSE(readiness.matches(5, 0));
+    TEST_ASSERT_FALSE(readiness.matches(5, 5));
+}
+
+void test_generation_readiness_republish_replaces_both_generations() {
+    TrackingMath::GenerationReadiness readiness;
+    readiness.publish(1, 2);
+    readiness.publish(3, 4);
+    TEST_ASSERT_FALSE(readiness.matches(1, 2));
+    TEST_ASSERT_TRUE(readiness.matches(3, 4));
+}
+
 int main(int argc, char **argv) {
     UNITY_BEGIN();
     RUN_TEST(test_wraps_across_positive_boundary);
@@ -131,5 +171,10 @@ int main(int argc, char **argv) {
     RUN_TEST(test_observer_validation_rejects_all_out_of_range_edges);
     RUN_TEST(test_norad_validation_accepts_exact_range_edges);
     RUN_TEST(test_proportional_controller_handles_zero_gain_and_zero_step_limit);
+    RUN_TEST(test_generation_readiness_starts_not_ready);
+    RUN_TEST(test_generation_readiness_matches_only_published_pair);
+    RUN_TEST(test_generation_readiness_clear_invalidates_previous_pair);
+    RUN_TEST(test_generation_readiness_rejects_zero_generations);
+    RUN_TEST(test_generation_readiness_republish_replaces_both_generations);
     return UNITY_END();
 }
