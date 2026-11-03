@@ -67,7 +67,9 @@ Before operating the mount, review these values near the top of `src/spacepointe
 | LCD constructor | `0x27` | Usually leave as-is: setup probes `0x27` and then `0x3F` automatically. |
 | `MICROSTEPS_PER_REV` | `32768UL` | Check against the actual motor full-step angle, gearbox ratio, and A4988 microstep setting. **This constant is currently not used for angular positioning**, so changing it alone does not calibrate the mount. |
 | `STEP_PULSE_US` / `MOTOR_TASK_MS` / `MAX_STEPS_PER_TICK` | `50` µs / `25` ms / `8` steps | Pulse timing and a conservative per-tick correction cap. The cap limits large target changes; it is not an acceleration ramp. Change it only after unloaded bench testing. |
-| `pidAz` / `pidEl` | `kp = 2.5` / `3.0`, deadband `0.05°` | Simple proportional tracking gains. The controller rounds small corrections to whole steps and ignores errors inside the narrow deadband to avoid chasing sensor noise. Tune only during slow, safe tracking tests. |
+| `pidAz.kp` | `2.5` | Proportional gain for the azimuth axis, in **steps per degree**. The controller multiplies the azimuth pointing error (degrees) by this value to calculate a requested number of motor steps. A larger value commands more steps for the same error; a smaller value makes corrections gentler. This is an experimental starting value, not a mechanically calibrated value. |
+| `pidEl.kp` | `3.0` | Proportional gain for the elevation axis, also in **steps per degree**. It has the same role as `pidAz.kp`, but can be tuned independently because the two axes may have different motors, gearing, and loads. This is an experimental starting value, not a mechanically calibrated value. |
+| `pidAz.deadband` / `pidEl.deadband` | `0.05°` / `0.05°` | Minimum error (in degrees) that must be exceeded before that axis requests movement. Errors at or below the deadband are treated as zero, helping prevent motor chatter caused by small sensor fluctuations. A larger deadband reduces unnecessary corrections but allows more pointing error; a smaller one tracks more tightly but may react to noise. |
 
 ### Safe AS5600 calibration procedure
 
