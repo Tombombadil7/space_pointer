@@ -124,6 +124,10 @@ volatile bool tleReady = false;
 volatile bool targetCalculationReady = false;
 volatile bool pidResetRequested = false;
 
+// Other tasks may request a safe stop, but only MotorTask writes motor GPIOs.
+// MotorTask consumes this flag and performs the actual ENABLE-pin changes.
+volatile bool motorStopRequested = true;
+
 // Change both credentials before deploying outside a trusted test network.
 static const char *CONTROL_USER = "admin";
 static const char *CONTROL_PASSWORD = "spacepointer-change-me";
@@ -362,6 +366,8 @@ void setup() {
   // ── 3. Hardware Initialization ─────────────────────────────────────
   pinMode(AZ_STEP_PIN, OUTPUT); pinMode(AZ_DIR_PIN, OUTPUT);
   pinMode(EL_STEP_PIN, OUTPUT); pinMode(EL_DIR_PIN, OUTPUT);
+  // Set a safe initial electrical state before the FreeRTOS motor task starts.
+  // After startup, MotorTask is the only task allowed to write motor GPIOs.
   pinMode(AZ_EN_PIN, OUTPUT);   digitalWrite(AZ_EN_PIN, HIGH); // disabled
   pinMode(EL_EN_PIN, OUTPUT);   digitalWrite(EL_EN_PIN, HIGH); // disabled
   pinMode(AZ_STEP_PIN, OUTPUT); digitalWrite(AZ_STEP_PIN, LOW);
@@ -672,9 +678,10 @@ const char *planetName(int body) {
   }
 }
 
+// Request a stop from any task. This function deliberately does not touch GPIO:
+// MotorTask owns all motor outputs and will disable the drivers on its next tick.
 void disableMotors() {
-  digitalWrite(AZ_EN_PIN, HIGH);
-  digitalWrite(EL_EN_PIN, HIGH);
+  motorStopRequested = true;
 }
 
 void resetPIDs() {
@@ -864,6 +871,7 @@ void PhysicsTask(void * p) {
 void MotorTask(void * p) {
   const float DT = MOTOR_TASK_MS / 1000.0f;
   TickType_t lastWake = xTaskGetTickCount();
+  bool driversEnabled = false;
 
   for (;;) {
       float targetAz = 0.0f, targetEl = 0.0f;
@@ -885,7 +893,26 @@ void MotorTask(void * p) {
       if (!targetRead || !timeReady || !observerReady || !targetCalculationReady ||
           !orbitalDataReady || !bnoReady || !encoderReady || !isfinite(targetAz) ||
           !isfinite(targetEl) || targetEl < 0.0f || targetEl > 90.0f) {
-          disableMotors();
+          // Only this task changes the driver ENABLE pins during operation.
+          if (driversEnabled) {
+              digitalWrite(AZ_EN_PIN, HIGH);
+              digitalWrite(EL_EN_PIN, HIGH);
+              driversEnabled = false;
+          }
+          resetPIDs();
+          vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(MOTOR_TASK_MS));
+          continue;
+      }
+
+      // Consume stop requests raised by networking, TLE, or other tasks.
+      // The request forces at least one complete motor-control tick to remain stopped.
+      if (motorStopRequested) {
+          motorStopRequested = false;
+          if (driversEnabled) {
+              digitalWrite(AZ_EN_PIN, HIGH);
+              digitalWrite(EL_EN_PIN, HIGH);
+              driversEnabled = false;
+          }
           resetPIDs();
           vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(MOTOR_TASK_MS));
           continue;
@@ -908,8 +935,13 @@ void MotorTask(void * p) {
       const float headingNow = event.orientation.x;
       if (!sensorsRead || !isfinite(headingNow) || headingNow < 0.0f ||
           headingNow >= 360.0f || encoderRaw > 4095) {
-          disableMotors();
-          resetPIDs();          vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(MOTOR_TASK_MS));
+          if (driversEnabled) {
+              digitalWrite(AZ_EN_PIN, HIGH);
+              digitalWrite(EL_EN_PIN, HIGH);
+              driversEnabled = false;
+          }
+          resetPIDs();
+          vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(MOTOR_TASK_MS));
           continue;
       }
       // Convert the 12-bit encoder reading into elevation relative to the
@@ -922,8 +954,11 @@ void MotorTask(void * p) {
       const float elNow = ENCODER_DIRECTION *
                           encoderDelta * (360.0f / 4096.0f);
 
-      digitalWrite(AZ_EN_PIN, LOW);
-      digitalWrite(EL_EN_PIN, LOW);
+      if (!driversEnabled) {
+          digitalWrite(AZ_EN_PIN, LOW);
+          digitalWrite(EL_EN_PIN, LOW);
+          driversEnabled = true;
+      }
 
       // Convert the BNO055 magnetic heading to true north before comparing
       // it with Astronomy Engine's true-north target azimuth.
