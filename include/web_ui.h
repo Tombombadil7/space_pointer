@@ -70,16 +70,23 @@ const char index_html[] PROGMEM = R"rawliteral(
     <body>
       <div class="card">
     
-        <p id="target-name">---</p>
-    
         <div id="map"></div>
-    
-        <p>
-          <span class="label">Az</span> <span id="az" class="data">0</span>&deg;&nbsp;&nbsp;
-          <span class="label">El</span> <span id="el" class="data">0</span>&deg;
-        </p>
-    
-        <div class="stats-grid">
+
+        <!-- Only the telemetry section is replaced when its API snapshot is unavailable.
+             The map and all target/location controls remain visible and usable. -->
+        <div id="telemetry-error" role="status" aria-live="polite"
+             style="display:none; color:#ff7675; padding:18px 8px;">
+          Telemetry temporarily unavailable. Please retry.
+        </div>
+        <div id="telemetry-content">
+          <p id="target-name">---</p>
+
+          <p>
+            <span class="label">Az</span> <span id="az" class="data">0</span>&deg;&nbsp;&nbsp;
+            <span class="label">El</span> <span id="el" class="data">0</span>&deg;
+          </p>
+
+          <div class="stats-grid">
           <div class="stat-box">
             <div class="stat-val"><span id="speed">--</span></div>
             <div class="stat-lbl">km/s speed</div>
@@ -92,13 +99,14 @@ const char index_html[] PROGMEM = R"rawliteral(
             <div class="stat-val"><span id="dist">--</span></div>
             <div class="stat-lbl" data-lbl="dist">km distance</div>
           </div>
-        </div>
-    
-        <div id="next-pass-bar">
+          </div>
+
+          <div id="next-pass-bar">
           <span><span class="label" data-lbl="pass">Next pass</span> <span id="nextPass" class="data">--:--</span></span>
           <span><span class="label" data-lbl="lose">Max el</span> <span id="nextPassEl" class="data">--</span></span>
+          </div>
         </div>
-    
+
         <button class="btn" style="background:#e67e22" onclick="syncGPS()">Sync Phone GPS</button>
     
         <div class="input-group">
@@ -144,7 +152,14 @@ const char index_html[] PROGMEM = R"rawliteral(
         }
     
         setInterval(function() {
-          fetch('/data').then(function(res) { return res.json(); }).then(function(d) {
+          fetch('/data').then(function(res) {
+            // /data uses HTTP 503 only when the telemetry lock cannot be read.
+            // Show the error inside the telemetry area, not over the whole page.
+            if (!res.ok) throw new Error('Telemetry unavailable');
+            return res.json();
+          }).then(function(d) {
+            document.getElementById('telemetry-error').style.display = 'none';
+            document.getElementById('telemetry-content').style.display = 'block';
             var isSat = d.type === 0;
     
             // name + pointing
@@ -176,6 +191,10 @@ const char index_html[] PROGMEM = R"rawliteral(
               marker.setLatLng([d.sLat, d.sLon]);
               map.panTo([d.sLat, d.sLon]);
             }
+          }).catch(function() {
+            // Keep the map and controls visible; replace only telemetry values.
+            document.getElementById('telemetry-content').style.display = 'none';
+            document.getElementById('telemetry-error').style.display = 'block';
           });
         }, 2000);
       </script>
