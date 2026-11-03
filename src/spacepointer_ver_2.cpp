@@ -14,7 +14,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include "tracking_math.h"
-#include <ESPAsyncWebServer.h>
+#include <ESPWebServerSecure.hpp>
+#include <SSLCert.hpp>
+#include <WiFi.h>
+#include <ESPmDNS.h>
+#include <Preferences.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <AS5600.h> // I2C magnetic encoder for elevation feedback
@@ -65,7 +69,9 @@
 
 // Two axes are stepped sequentially; 80 leaves time for task/sensor overhead.
 
-AsyncWebServer server(80);
+// TLS-enabled server. Requests are handled synchronously in loop(); motor and physics work run in separate tasks.
+ESPWebServerSecure server(443);
+httpsserver::SSLCert localTlsCertificate;
 Adafruit_BNO055 bno = Adafruit_BNO055(55);
 Sgp4 satSgp4;
 
@@ -154,7 +160,9 @@ bool startTLEFetchTask();
 TargetState getTargetSnapshot();
 TelemetrySnapshot getTelemetrySnapshot();
 bool getObserverSnapshot(double &lat, double &lon, double &alt);
-bool parseDoubleArg(AsyncWebServerRequest *request, const char *name, double &value);
+bool parseDoubleArg(const char *name, double &value);
+bool configureHttpsCertificate();
+bool authenticateControlRequest();
 void disableMotors();
 const char *planetName(int body);
 void PhysicsTask(void * p);
@@ -296,11 +304,23 @@ const char index_html[] PROGMEM = R"rawliteral(
           if(id) setTarget(0, 'Custom', id);
         }
         function syncGPS() {
+          // Geolocation requires HTTPS (a secure context) and explicit user permission.
+          if (!navigator.geolocation) {
+            alert('This browser does not provide geolocation.');
+            return;
+          }
           navigator.geolocation.getCurrentPosition(function(p) {
-            fetch('/updateLoc?lat='+p.coords.latitude+'&lon='+p.coords.longitude+'&alt='+(p.coords.altitude||50))
-              .then(function(r) { if (!r.ok) throw new Error('Location update failed: '+r.status); alert("GPS Updated!"); })
+            var altitude = p.coords.altitude;
+            if (altitude === null || !Number.isFinite(altitude)) altitude = 50;
+            fetch('/updateLoc?lat='+p.coords.latitude+'&lon='+p.coords.longitude+'&alt='+altitude)
+              .then(function(r) {
+                if (!r.ok) throw new Error('Location update failed: '+r.status);
+                alert('GPS Updated!');
+              })
               .catch(function(e) { alert(e.message); });
-          });
+          }, function(e) {
+            alert('Could not read phone GPS: '+e.message+' (check HTTPS and location permission).');
+          }, { enableHighAccuracy: true, timeout: 15000, maximumAge: 30000 });
         }
     
         setInterval(function() {
@@ -395,33 +415,43 @@ void setup() {
       disableMotors();
       while (1) { delay(1000); }
   }
+  // Create or restore a stable self-signed certificate before starting HTTPS.
+  if (!configureHttpsCertificate()) {
+      Serial.println("CRITICAL: Could not create/load HTTPS certificate; motors remain disabled.");
+      disableMotors();
+      while (1) { delay(1000); }
+  }
+
+  // Advertise the memorable .local hostname on the local network.
+  if (MDNS.begin("space-pointer")) {
+      MDNS.addService("https", "tcp", 443);
+      Serial.println("mDNS ready: https://space-pointer.local/");
+  } else {
+      Serial.println("WARNING: mDNS setup failed; use the IP URL printed below.");
+  }
+
   observerReady = updateIPLocation();
   if (!observerReady) {
       Serial.println("WARNING: IP geolocation failed; use Sync Phone GPS before tracking.");
   }
 
-  server.on("/", HTTP_GET, [](AsyncWebServerRequest *r){
-      if (!r->authenticate(CONTROL_USER, CONTROL_PASSWORD)) {
-          r->requestAuthentication();
-          return;
-      }
-      r->send(200, "text/html", index_html);
+  // HTTPS only: no unencrypted dashboard or control listener is started.
+  server.on("/", HTTP_GET, [](){
+      if (!authenticateControlRequest()) return;
+      server.send_P(200, PSTR("text/html"), index_html);
   });
 
-  server.on("/updateLoc", HTTP_GET, [](AsyncWebServerRequest *r){
-      if (!r->authenticate(CONTROL_USER, CONTROL_PASSWORD)) {
-          r->requestAuthentication();
-          return;
-      }
+  server.on("/updateLoc", HTTP_GET, [](){
+      if (!authenticateControlRequest()) return;
       double lat, lon, alt;
-      if (!parseDoubleArg(r, "lat", lat) || !parseDoubleArg(r, "lon", lon) ||
-          !parseDoubleArg(r, "alt", alt) ||
+      if (!parseDoubleArg("lat", lat) || !parseDoubleArg("lon", lon) ||
+          !parseDoubleArg("alt", alt) ||
           !TrackingMath::validObserver(lat, lon, alt)) {
-          r->send(400, "text/plain", "Invalid location. Check latitude, longitude and altitude.");
+          server.send(400, "text/plain", "Invalid location. Check latitude, longitude and altitude.");
           return;
       }
       if (xSemaphoreTake(sysMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
-          r->send(503, "text/plain", "System busy; retry location update.");
+          server.send(503, "text/plain", "System busy; retry location update.");
           return;
       }
       sys.lat = lat; sys.lon = lon; sys.alt = alt;
@@ -434,46 +464,43 @@ void setup() {
           tleReady = false;   // invalidate the old observer's SGP4 state immediately
           targetCalculationReady = false;
           if (!startTLEFetchTask()) {
-              r->send(503, "text/plain", "Could not start TLE refresh; motors remain disabled.");
+              server.send(503, "text/plain", "Could not start TLE refresh; motors remain disabled.");
               return;
           }
       }
-      r->send(202, "text/plain", "Location accepted.");
+      server.send(202, "text/plain", "Location accepted.");
   });
 
-  server.on("/set", HTTP_GET, [](AsyncWebServerRequest *r){
-      if (!r->authenticate(CONTROL_USER, CONTROL_PASSWORD)) {
-          r->requestAuthentication();
-          return;
-      }
-      if (!r->hasArg("type") || !r->hasArg("val")) {
-          r->send(400, "text/plain", "Missing target type or value.");
+  server.on("/set", HTTP_GET, [](){
+      if (!authenticateControlRequest()) return;
+      if (!server.hasArg("type") || !server.hasArg("val")) {
+          server.send(400, "text/plain", "Missing target type or value.");
           return;
       }
       char *end = nullptr;
-      const String typeArg = r->arg("type");
-      const String valArg = r->arg("val");
+      const String typeArg = server.arg("type");
+      const String valArg = server.arg("val");
       long type = strtol(typeArg.c_str(), &end, 10);
       if (end == typeArg.c_str() || *end != '\0' || (type != 0 && type != 1)) {
-          r->send(400, "text/plain", "Invalid target type.");
+          server.send(400, "text/plain", "Invalid target type.");
           return;
       }
       end = nullptr;
       long val = strtol(valArg.c_str(), &end, 10);
       if (end == valArg.c_str() || *end != '\0') {
-          r->send(400, "text/plain", "Invalid target ID.");
+          server.send(400, "text/plain", "Invalid target ID.");
           return;
       }
 
       TargetState next = {};
       if (type == TYPE_SATELLITE) {
           if (!TrackingMath::validNoradId(val)) {
-              r->send(400, "text/plain", "NORAD ID is outside the accepted range.");
+              server.send(400, "text/plain", "NORAD ID is outside the accepted range.");
               return;
           }
           next.type = TYPE_SATELLITE;
           next.noradID = val;
-          String requestedName = r->arg("name");
+          String requestedName = server.arg("name");
           requestedName.trim();
           if (requestedName.length() > 0) {
               requestedName.toCharArray(next.name, sizeof(next.name));
@@ -483,7 +510,7 @@ void setup() {
           }
       } else {
           if (!TrackingMath::supportedPlanetBody((int)val)) {
-              r->send(400, "text/plain", "Unsupported planetary body.");
+              server.send(400, "text/plain", "Unsupported planetary body.");
               return;
           }
           next.type = TYPE_PLANET;
@@ -492,7 +519,7 @@ void setup() {
       }
 
       if (xSemaphoreTake(targetMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
-          r->send(503, "text/plain", "Target controller busy; retry.");
+          server.send(503, "text/plain", "Target controller busy; retry.");
           return;
       }
       if (next.type == TYPE_SATELLITE) {
@@ -506,14 +533,14 @@ void setup() {
 
       if (next.type == TYPE_SATELLITE) {
           if (!startTLEFetchTask()) {
-              r->send(503, "text/plain", "Could not start TLE download; motors remain disabled.");
+              server.send(503, "text/plain", "Could not start TLE download; motors remain disabled.");
               return;
           }
       }
-      r->send(202, "text/plain", "Target accepted.");
+      server.send(202, "text/plain", "Target accepted.");
   });
 
-  server.on("/data", HTTP_GET, [](AsyncWebServerRequest *r){
+  server.on("/data", HTTP_GET, [](){
       const TargetState target = getTargetSnapshot();
       const TelemetrySnapshot data = getTelemetrySnapshot();
       StaticJsonDocument<512> doc;
@@ -543,10 +570,18 @@ void setup() {
       }
       String out;
       serializeJson(doc, out);
-      r->send(200, "application/json", out);
+      server.send(200, "application/json", out);
+  });
+
+  server.onNotFound([]() {
+      server.send(404, "text/plain", "Not found.");
   });
 
   server.begin();
+  Serial.println("HTTPS dashboard: https://space-pointer.local/ (if mDNS is supported)");
+  Serial.print("HTTPS fallback URL: https://");
+  Serial.print(WiFi.localIP());
+  Serial.println("/");
 
   // ── 5. Time Synchronization ────────────────────────────────────────
   // Astronomy calculations are based on UTC; do not apply local timezone offsets.
@@ -584,7 +619,10 @@ void setup() {
 }
 
 void loop() {
-  vTaskDelay(portMAX_DELAY);
+  // The TLS server is synchronous: poll it often while the motor and physics
+  // FreeRTOS tasks continue independently.
+  server.handleClient();
+  delay(2);
 }
 
 
@@ -621,12 +659,82 @@ bool getObserverSnapshot(double &lat, double &lon, double &alt) {
   return TrackingMath::validObserver(lat, lon, alt);
 }
 
-bool parseDoubleArg(AsyncWebServerRequest *request, const char *name, double &value) {
-  if (!request->hasArg(name)) return false;
-  const String arg = request->arg(name);
+bool parseDoubleArg(const char *name, double &value) {
+  if (!server.hasArg(name)) return false;
+  const String arg = server.arg(name);
   char *end = nullptr;
   value = strtod(arg.c_str(), &end);
   return end != arg.c_str() && *end == '\0' && isfinite(value);
+}
+
+bool authenticateControlRequest() {
+  // Keep the same credentials, now protected in transit by TLS.
+  if (server.authenticate(CONTROL_USER, CONTROL_PASSWORD)) return true;
+  server.requestAuthentication();
+  return false;
+}
+
+// Persist the self-signed certificate so it remains stable across reboots.
+// This avoids generating a different browser identity each time the ESP32 starts.
+bool configureHttpsCertificate() {
+  Preferences preferences;
+  if (!preferences.begin("space-tls", false)) {
+    Serial.println("ERROR: Could not open NVS for TLS certificate.");
+    return false;
+  }
+
+  const size_t certLength = preferences.getBytesLength("cert");
+  const size_t keyLength = preferences.getBytesLength("key");
+  bool loaded = false;
+
+  // Validate stored lengths before allocating, in case NVS contains bad data.
+  if (certLength > 0 && certLength <= 4096 && keyLength > 0 && keyLength <= 4096) {
+    unsigned char *certBytes = new (std::nothrow) unsigned char[certLength];
+    unsigned char *keyBytes = new (std::nothrow) unsigned char[keyLength];
+    if (certBytes != nullptr && keyBytes != nullptr &&
+        preferences.getBytes("cert", certBytes, certLength) == certLength &&
+        preferences.getBytes("key", keyBytes, keyLength) == keyLength) {
+      localTlsCertificate.setCert(certBytes, certLength);
+      localTlsCertificate.setPK(keyBytes, keyLength);
+      loaded = true;
+      Serial.println("Loaded the existing local TLS certificate from NVS.");
+    } else {
+      delete[] certBytes;
+      delete[] keyBytes;
+    }
+  }
+
+  if (!loaded) {
+    Serial.println("Generating a local self-signed TLS certificate (first boot may take a while)...");
+    const int result = httpsserver::createSelfSignedCert(
+        localTlsCertificate,
+        httpsserver::KEYSIZE_2048,
+        "CN=space-pointer.local,O=Universal Space Pointer,C=IL",
+        "20260101000000",
+        "20351231235959");
+    if (result != 0) {
+      Serial.printf("ERROR: TLS certificate generation failed (0x%02X).\n", result);
+      preferences.end();
+      return false;
+    }
+
+    const bool certSaved = preferences.putBytes("cert", localTlsCertificate.getCertData(),
+                                                localTlsCertificate.getCertLength()) == localTlsCertificate.getCertLength();
+    const bool keySaved = preferences.putBytes("key", localTlsCertificate.getPKData(),
+                                               localTlsCertificate.getPKLength()) == localTlsCertificate.getPKLength();
+    if (!certSaved || !keySaved) {
+      Serial.println("ERROR: Could not persist TLS certificate; check NVS capacity.");
+      preferences.end();
+      return false;
+    }
+    Serial.println("Created and saved the local self-signed TLS certificate.");
+  }
+
+  preferences.end();
+  server.setServerKeyAndCert(
+      localTlsCertificate.getPKData(), localTlsCertificate.getPKLength(),
+      localTlsCertificate.getCertData(), localTlsCertificate.getCertLength());
+  return localTlsCertificate.getPKLength() > 0 && localTlsCertificate.getCertLength() > 0;
 }
 
 const char *planetName(int body) {
@@ -1007,15 +1115,16 @@ void stepMotor(int stepPin, int dirPin, bool forward) {
 bool updateIPLocation() {
     HTTPClient http;
     http.setTimeout(8000);
-    if (!http.begin("http://ip-api.com/json/")) return false;
+    // ipwho.is exposes a no-key JSON endpoint over HTTPS; IP-based location is approximate.
+    if (!http.begin("https://ipwho.is/")) return false;
     const int status = http.GET();
     bool valid = false;
     if (status == HTTP_CODE_OK) {
         StaticJsonDocument<512> doc;
         const DeserializationError error = deserializeJson(doc, http.getString());
-        if (!error && doc["status"] == "success") {
-            const double lat = doc["lat"] | NAN;
-            const double lon = doc["lon"] | NAN;
+        if (!error && doc["success"] == true) {
+            const double lat = doc["latitude"] | NAN;
+            const double lon = doc["longitude"] | NAN;
             if (isfinite(lat) && isfinite(lon) && lat >= -90.0 &&
                 lat <= 90.0 && lon >= -180.0 && lon <= 180.0) {
                 if (xSemaphoreTake(sysMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
