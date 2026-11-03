@@ -128,6 +128,10 @@ SemaphoreHandle_t i2cMutex;      // protects the shared I2C bus
 SemaphoreHandle_t sysMutex;      // protects observer and telemetry state
 SemaphoreHandle_t sgp4Mutex;     // protects the shared SGP4 instance
 SemaphoreHandle_t tleFetchMutex;
+// One long-lived worker handles all TLE refresh requests. Notifications are
+// coalesced while a download is running, so rapid target changes cannot create
+// an unbounded number of short-lived FreeRTOS tasks.
+TaskHandle_t tleFetchTaskHandle = NULL;
 
 volatile bool bnoReady = false;
 volatile bool encoderReady = false;
@@ -158,6 +162,7 @@ AS5600 encoder;   // default I2C address 0x36, shares bus with BNO055 (0x28)
 bool updateIPLocation();
 void fetchTLE();
 bool startTLEFetchTask();
+void TLEFetchTask(void * p);
 TargetState getTargetSnapshot();
 VersionedTargetSnapshot getVersionedTargetSnapshot();
 TelemetrySnapshot getTelemetrySnapshot();
@@ -191,6 +196,14 @@ void setup() {
       sgp4Mutex == NULL || tleFetchMutex == NULL) {
       Serial.println("CRITICAL: Failed to create mutexes! Halting.");
       while (1) { delay(1000); }
+  }
+
+  // Create the TLE worker once during startup. HTTP handlers only notify this
+  // task; they never allocate a new task for each target selection.
+  if (xTaskCreate(TLEFetchTask, "TLEFetch", 10000, NULL, 1,
+                  &tleFetchTaskHandle) != pdPASS) {
+      tleFetchTaskHandle = NULL;
+      Serial.println("WARNING: Could not create TLE worker; satellite refreshes will be unavailable.");
   }
 
   // ── 3. Hardware Initialization ─────────────────────────────────────
@@ -485,13 +498,25 @@ void disableMotors() {
   motorStopRequested = true;
 }
 
+// Ask the persistent worker to refresh TLE data. FreeRTOS task notifications
+// are counted, but the worker clears pending notifications when it wakes; this
+// intentionally coalesces a burst of requests into one refresh of the latest target.
 bool startTLEFetchTask() {
   tleReady = false;
   targetCalculationReady = false;
-  return xTaskCreate([](void *) {
+  if (tleFetchTaskHandle == NULL) return false;
+  xTaskNotifyGive(tleFetchTaskHandle);
+  return true;
+}
+
+// The worker sleeps without consuming CPU until a refresh is requested. If
+// several requests arrive during a download, the next wake handles the latest
+// selected target rather than spawning additional tasks.
+void TLEFetchTask(void * p) {
+  for (;;) {
+      ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
       fetchTLE();
-      vTaskDelete(NULL);
-  }, "TLE", 10000, NULL, 1, NULL) == pdPASS;
+  }
 }
 
 int pidOutput(const PController &p, float error) {
