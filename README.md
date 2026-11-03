@@ -66,7 +66,8 @@ Before operating the mount, review these values near the top of `src/spacepointe
 | `current` initial target | ISS / NORAD `25544` | Optional: change the default satellite name and NORAD catalog ID if you want another initial target. |
 | LCD constructor | `0x27` | Usually leave as-is: setup probes `0x27` and then `0x3F` automatically. |
 | `MICROSTEPS_PER_REV` | `32768UL` | Check against the actual motor full-step angle, gearbox ratio, and A4988 microstep setting. **This constant is currently not used for angular positioning**, so changing it alone does not calibrate the mount. |
-| `STEP_PULSE_US` / `MOTOR_TASK_MS` / `MAX_STEPS_PER_TICK` | `50` / `25` / `80` | Timing and motion-rate parameters, not installation calibration. Do not tune them until basic sensor orientation and mechanical safety are verified. |
+| `STEP_PULSE_US` / `MOTOR_TASK_MS` / `MAX_STEPS_PER_TICK` | `50` µs / `25` ms / `8` steps | Pulse timing and a conservative per-tick correction cap. The cap limits large target changes; it is not an acceleration ramp. Change it only after unloaded bench testing. |
+| `pidAz` / `pidEl` | `kp = 2.5` / `3.0`, deadband `0.05°` | Simple proportional tracking gains. The controller rounds small corrections to whole steps and ignores errors inside the narrow deadband to avoid chasing sensor noise. Tune only during slow, safe tracking tests. |
 
 ### Safe AS5600 calibration procedure
 
@@ -135,7 +136,7 @@ The `fix/satellite-nextpass-minimum-elevation` branch includes these software ch
 
 - Corrected the AS5600 PlatformIO dependency and added the missing `Wire.h` and `LiquidCrystal_I2C.h` includes.
 - Changed driver ENABLE pins to GPIO16 and GPIO17; explicitly selected I2C GPIO8/GPIO9.
-- Corrected PID aggregate initialization so integral and previous-error state start at zero and the configured gains land in the intended fields.
+- Replaced the derivative/integral PID with a small proportional controller: this avoids derivative kick on target changes, keeps normal tracking corrections small, and caps unusually large corrections per control tick.
 - Corrected the Moon and Mars body IDs (Moon=10, Mars=3) and the one-second planetary look-ahead using `Astronomy_AddDays`.
 - Added a TLE fetch/validation step before satellite calculations, serialized access to SGP4, and restored SGP4 to the current epoch after the velocity look-ahead.
 - Protected target, observer/telemetry, I2C, and SGP4 shared state with mutexes and used snapshots between tasks.
