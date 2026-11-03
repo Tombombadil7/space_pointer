@@ -1,6 +1,6 @@
 # PlatformIO tests
 
-This folder contains hardware-independent tests for the tracking helpers.
+This folder contains hardware-independent tests for the tracking math and motor-control helpers.
 
 Run the tests from the repository root:
 
@@ -8,6 +8,10 @@ Run the tests from the repository root:
 pio test -e native
 ```
 
-The current suite checks angular wrapping, finite-value handling, observer-coordinate and altitude limits, NORAD ID ranges, and the accepted Astronomy Engine body IDs.
+The native suite checks:
+- Angular wrapping, including boundary and non-finite inputs.
+- Observer latitude, longitude, and altitude validation, including exact limits.
+- NORAD ID and supported planetary-body validation.
+- Proportional motor-step rounding, deadband behavior, correction limits, and non-finite errors.
 
-The native tests do not exercise FreeRTOS scheduling, I2C peripherals, motor drivers, the Astronomy Engine library integration, or real SGP4/TLE data. Those still require an ESP32 build and hardware/bench testing.
+The native tests do not exercise FreeRTOS scheduling, I2C peripherals, motor drivers, the Astronomy Engine integration, or live SGP4/TLE data. Those still require an ESP32 build and hardware/bench testing.
