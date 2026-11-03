@@ -142,7 +142,8 @@ volatile bool encoderReady = false;
 volatile bool observerReady = false;
 volatile bool timeReady = false;
 volatile bool tleReady = false;
-volatile bool targetCalculationReady = false;
+// Protected by targetMutex. Readiness is valid only for this exact target/location pair.
+TrackingMath::GenerationReadiness calculationReadiness;
 
 // Other tasks may request a safe stop, but only MotorTask writes motor GPIOs.
 // MotorTask consumes this flag and performs the actual ENABLE-pin changes.
@@ -174,6 +175,8 @@ bool getVersionedObserverSnapshot(double &lat, double &lon, double &alt,
                                   uint32_t &generation);
 bool parseDoubleArg(AsyncWebServerRequest *request, const char *name, double &value);
 void disableMotors();
+// Clear readiness after releasing sysMutex; never acquire targetMutex from sysMutex.
+void invalidateCalculationReadiness();
 const char *planetName(int body);
 void PhysicsTask(void * p);
 void updateNextPass(const TargetState &target, uint32_t targetVersion,
@@ -280,12 +283,12 @@ void setup() {
       if (observerGeneration == 0) ++observerGeneration; // Reserve zero for an invalid snapshot.
       xSemaphoreGive(sysMutex);
       observerReady = true;
-      targetCalculationReady = false;
+      invalidateCalculationReadiness();
 
       TargetState target = getTargetSnapshot();
       if (target.type == TYPE_SATELLITE) {
           tleReady = false;   // invalidate the old observer's SGP4 state immediately
-          targetCalculationReady = false;
+          invalidateCalculationReadiness();
           if (!startTLEFetchTask()) {
               r->send(503, "text/plain", "Could not start TLE refresh; motors remain disabled.");
               return;
@@ -351,7 +354,7 @@ void setup() {
       if (next.type == TYPE_SATELLITE) {
           tleReady = false;   // never track a newly selected NORAD ID with the previous TLE
       }
-      targetCalculationReady = false;
+      calculationReadiness.clear(); // targetMutex is already held here.
       current = next;
       ++targetGeneration;
       if (targetGeneration == 0) ++targetGeneration; // Reserve zero for an invalid snapshot.
@@ -451,6 +454,16 @@ void loop() {
 
 
 
+void invalidateCalculationReadiness() {
+  // Call only when sysMutex is not held. Nested locking always follows
+  // targetMutex -> sysMutex, preventing a reverse-order deadlock.
+  if (targetMutex != NULL &&
+      xSemaphoreTake(targetMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+      calculationReadiness.clear();
+      xSemaphoreGive(targetMutex);
+  }
+}
+
 VersionedTargetSnapshot getVersionedTargetSnapshot() {
   VersionedTargetSnapshot result = {};
   if (targetMutex != NULL && xSemaphoreTake(targetMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
@@ -531,7 +544,7 @@ void disableMotors() {
 // intentionally coalesces a burst of requests into one refresh of the latest target.
 bool startTLEFetchTask() {
   tleReady = false;
-  targetCalculationReady = false;
+  invalidateCalculationReadiness();
   if (tleFetchTaskHandle == NULL) return false;
   xTaskNotifyGive(tleFetchTaskHandle);
   return true;
@@ -629,14 +642,15 @@ void PhysicsTask(void * p) {
           }
       }
       if (!timeReady || !observerReady) {
-          targetCalculationReady = false;
+          // MotorTask checks these prerequisites independently. A delayed
+          // physics iteration must not erase a newer successful token.
           vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(500));
           continue;
       }
 
       const VersionedTargetSnapshot targetSnapshot = getVersionedTargetSnapshot();
       if (targetSnapshot.generation == 0) {
-          targetCalculationReady = false;
+          // No consistent target snapshot was available; do not publish a token.
           vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(500));
           continue;
       }
@@ -646,7 +660,7 @@ void PhysicsTask(void * p) {
       uint32_t calculationObserverGeneration = 0;
       if (!getVersionedObserverSnapshot(lat, lon, alt,
                                         calculationObserverGeneration)) {
-          targetCalculationReady = false;
+          // No observer snapshot was available; the motor task will fail safe.
           vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(500));
           continue;
       }
@@ -654,7 +668,7 @@ void PhysicsTask(void * p) {
       time_t now;
       time(&now);
       if (now < 1000000000) {
-          targetCalculationReady = false;
+          // MotorTask independently checks timeReady before enabling the drivers.
           vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(500));
           continue;
       }
@@ -761,6 +775,10 @@ void PhysicsTask(void * p) {
                       sys.satAltKm = satAltKm;
                       sys.satDist = satDist;
                       resultCommitted = true;
+                      // Publish inside the same critical section as telemetry
+                      // and motorTarget, while both source generations are locked.
+                      calculationReadiness.publish(calculationGeneration,
+                                                   calculationObserverGeneration);
                   }
                   xSemaphoreGive(sysMutex);
 
@@ -774,8 +792,8 @@ void PhysicsTask(void * p) {
           }
           xSemaphoreGive(targetMutex);
       }
-      // Never mark a result ready unless it was committed for the current target.
-      targetCalculationReady = resultCommitted;
+      // Failed/stale calculations do not clear readiness: an older failed
+      // iteration must never erase a newer successful generation pair.
 
       vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(500));
   }
@@ -792,18 +810,27 @@ void MotorTask(void * p) {
       float targetAz = 0.0f, targetEl = 0.0f;
       TargetState activeTarget = {};
       bool targetRead = false;
+      bool calculationReady = false;
       uint32_t activeGeneration = 0;
       if (xSemaphoreTake(targetMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
           activeTarget = current;
           activeGeneration = targetGeneration;
           targetAz = motorTarget.az;
           targetEl = motorTarget.el;
-          targetRead = true;
+
+          // Read the live observer generation under the global lock order:
+          // targetMutex first, then sysMutex.
+          if (xSemaphoreTake(sysMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+              calculationReady = calculationReadiness.matches(
+                  targetGeneration, observerGeneration);
+              targetRead = true;
+              xSemaphoreGive(sysMutex);
+          }
           xSemaphoreGive(targetMutex);
       }
 
       const bool orbitalDataReady = activeTarget.type != TYPE_SATELLITE || tleReady;
-      if (!targetRead || !timeReady || !observerReady || !targetCalculationReady ||
+      if (!targetRead || !timeReady || !observerReady || !calculationReady ||
           !orbitalDataReady || !bnoReady || !encoderReady || !isfinite(targetAz) ||
           !isfinite(targetEl) || targetEl < 0.0f || targetEl > 90.0f) {
           // Only this task changes the driver ENABLE pins during operation.
@@ -881,8 +908,13 @@ void MotorTask(void * p) {
       // for this short, bounded step batch so a new target cannot be selected
       // halfway through executing a command from the previous target.
       if (xSemaphoreTake(targetMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-          const bool commandStillCurrent =
-              targetGeneration == activeGeneration && targetCalculationReady &&
+          // Hold both locks through this short bounded pulse batch. This keeps
+          // observerGeneration stable from validation until the motor steps end.
+          const bool systemStateLocked =
+              xSemaphoreTake(sysMutex, pdMS_TO_TICKS(10)) == pdTRUE;
+          const bool commandStillCurrent = systemStateLocked &&
+              targetGeneration == activeGeneration &&
+              calculationReadiness.matches(targetGeneration, observerGeneration) &&
               !motorStopRequested;
           if (commandStillCurrent) {
               if (!driversEnabled) {
@@ -899,6 +931,7 @@ void MotorTask(void * p) {
               digitalWrite(EL_EN_PIN, HIGH);
               driversEnabled = false;
           }
+          if (systemStateLocked) xSemaphoreGive(sysMutex);
           xSemaphoreGive(targetMutex);
       } else if (driversEnabled) {
           // If we cannot verify the command's generation, fail safe and stop.
@@ -959,13 +992,13 @@ void fetchTLE() {
     if (tleFetchMutex == NULL ||
         xSemaphoreTake(tleFetchMutex, pdMS_TO_TICKS(20000)) != pdTRUE) {
         tleReady = false;
-        targetCalculationReady = false;
+        invalidateCalculationReadiness();
         disableMotors();
         return;
     }
 
     tleReady = false;
-    targetCalculationReady = false;
+    invalidateCalculationReadiness();
     const TargetState requested = getTargetSnapshot();
     double lat, lon, alt;
     uint32_t observerVersion = 0;
@@ -1016,7 +1049,7 @@ void fetchTLE() {
 
     if (!success) {
         tleReady = false;
-        targetCalculationReady = false;
+        invalidateCalculationReadiness();
         disableMotors();
         Serial.println("WARNING: TLE update failed; satellite motors remain disabled.");
     }
