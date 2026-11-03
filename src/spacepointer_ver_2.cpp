@@ -8,21 +8,16 @@
  * - IMU BNO055 Compensation (Yaw & Pitch) 
  */
 
-// The TLS compatibility server includes its own WebServer-compatible API.
-// WiFiManager normally includes Arduino's WebServer.h, whose HTTPUploadStatus,
-// HTTPClientStatus and HTTPAuthMethod enums collide with the compatibility
-// server's declarations. Reuse the compatible ESPWebServer class for the
-// temporary Wi-Fi captive portal too, avoiding two conflicting definitions.
-#include <ESPWebServer.hpp>
-using WebServer = ESPWebServer;
-#define WEBSERVER_H
 #include <WiFiManager.h>
 #include <Wire.h>
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
 #include "tracking_math.h"
-#include <ESPWebServerSecure.hpp>
+#include <HTTPSServer.hpp>
+#include <HTTPRequest.hpp>
+#include <HTTPResponse.hpp>
+#include <ResourceNode.hpp>
 #include <SSLCert.hpp>
 #include <WiFi.h>
 #include <ESPmDNS.h>
@@ -80,8 +75,8 @@ using WebServer = ESPWebServer;
 // Two axes are stepped sequentially; 80 leaves time for task/sensor overhead.
 
 // TLS-enabled server. Requests are handled synchronously in loop(); motor and physics work run in separate tasks.
-ESPWebServerSecure server(443);
 httpsserver::SSLCert localTlsCertificate;
+httpsserver::HTTPSServer server(&localTlsCertificate, 443);
 Adafruit_BNO055 bno = Adafruit_BNO055(55);
 Sgp4 satSgp4;
 
@@ -170,9 +165,14 @@ bool startTLEFetchTask();
 TargetState getTargetSnapshot();
 TelemetrySnapshot getTelemetrySnapshot();
 bool getObserverSnapshot(double &lat, double &lon, double &alt);
-bool parseDoubleArg(const char *name, double &value);
+bool parseDoubleArg(httpsserver::HTTPRequest *request, const char *name, double &value);
 bool configureHttpsCertificate();
-bool authenticateControlRequest();
+bool authenticateControlRequest(httpsserver::HTTPRequest *request, httpsserver::HTTPResponse *response);
+void sendHttpResponse(httpsserver::HTTPResponse *response, int status, const char *contentType, const String &body);
+void handleRoot(httpsserver::HTTPRequest *request, httpsserver::HTTPResponse *response);
+void handleUpdateLocation(httpsserver::HTTPRequest *request, httpsserver::HTTPResponse *response);
+void handleSetTarget(httpsserver::HTTPRequest *request, httpsserver::HTTPResponse *response);
+void handleTelemetry(httpsserver::HTTPRequest *request, httpsserver::HTTPResponse *response);
 void disableMotors();
 const char *planetName(int body);
 void PhysicsTask(void * p);
@@ -374,6 +374,162 @@ const char index_html[] PROGMEM = R"rawliteral(
   )rawliteral";
 
 
+// -----------------------------------------------------------------------------
+// HTTPS route handlers
+// -----------------------------------------------------------------------------
+// The native TLS server supplies request and response objects to each callback.
+// Query parameters are read from HTTPRequest::getParams().
+
+void handleRoot(httpsserver::HTTPRequest *request,
+                httpsserver::HTTPResponse *response) {
+  if (!authenticateControlRequest(request, response)) return;
+  response->setStatusCode(200);
+  response->setHeader("Content-Type", "text/html; charset=utf-8");
+  response->print(index_html);
+}
+
+void handleUpdateLocation(httpsserver::HTTPRequest *request,
+                          httpsserver::HTTPResponse *response) {
+  if (!authenticateControlRequest(request, response)) return;
+  double lat, lon, alt;
+  if (!parseDoubleArg(request, "lat", lat) ||
+      !parseDoubleArg(request, "lon", lon) ||
+      !parseDoubleArg(request, "alt", alt) ||
+      !TrackingMath::validObserver(lat, lon, alt)) {
+    sendHttpResponse(response, 400, "text/plain",
+                     "Invalid location. Check latitude, longitude and altitude.");
+    return;
+  }
+
+  if (xSemaphoreTake(sysMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+    sendHttpResponse(response, 503, "text/plain", "System busy; retry location update.");
+    return;
+  }
+  sys.lat = lat; sys.lon = lon; sys.alt = alt;
+  xSemaphoreGive(sysMutex);
+  observerReady = true;
+  targetCalculationReady = false;
+
+  const TargetState target = getTargetSnapshot();
+  if (target.type == TYPE_SATELLITE) {
+    tleReady = false;
+    if (!startTLEFetchTask()) {
+      sendHttpResponse(response, 503, "text/plain",
+                       "Could not start TLE refresh; motors remain disabled.");
+      return;
+    }
+  }
+  sendHttpResponse(response, 202, "text/plain", "Location accepted.");
+}
+
+void handleSetTarget(httpsserver::HTTPRequest *request,
+                     httpsserver::HTTPResponse *response) {
+  if (!authenticateControlRequest(request, response)) return;
+  httpsserver::ResourceParameters *params = request->getParams();
+  std::string typeArgument, valueArgument;
+  if (!params->getQueryParameter("type", typeArgument) ||
+      !params->getQueryParameter("val", valueArgument)) {
+    sendHttpResponse(response, 400, "text/plain", "Missing target type or value.");
+    return;
+  }
+
+  char *end = nullptr;
+  const long type = strtol(typeArgument.c_str(), &end, 10);
+  if (end == typeArgument.c_str() || *end != '\\0' || (type != 0 && type != 1)) {
+    sendHttpResponse(response, 400, "text/plain", "Invalid target type.");
+    return;
+  }
+  end = nullptr;
+  const long value = strtol(valueArgument.c_str(), &end, 10);
+  if (end == valueArgument.c_str() || *end != '\\0') {
+    sendHttpResponse(response, 400, "text/plain", "Invalid target ID.");
+    return;
+  }
+
+  TargetState next = {};
+  if (type == TYPE_SATELLITE) {
+    if (!TrackingMath::validNoradId(value)) {
+      sendHttpResponse(response, 400, "text/plain", "NORAD ID is outside the accepted range.");
+      return;
+    }
+    next.type = TYPE_SATELLITE;
+    next.noradID = value;
+    std::string requestedName;
+    params->getQueryParameter("name", requestedName);
+    String displayName(requestedName.c_str());
+    displayName.trim();
+    if (displayName.length() > 0) {
+      displayName.toCharArray(next.name, sizeof(next.name));
+      next.name[sizeof(next.name) - 1] = 0;
+    } else {
+      snprintf(next.name, sizeof(next.name), "NORAD %ld", value);
+    }
+  } else {
+    if (!TrackingMath::supportedPlanetBody((int)value)) {
+      sendHttpResponse(response, 400, "text/plain", "Unsupported planetary body.");
+      return;
+    }
+    next.type = TYPE_PLANET;
+    next.body = (int)value;
+    strlcpy(next.name, planetName((int)value), sizeof(next.name));
+  }
+
+  if (xSemaphoreTake(targetMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+    sendHttpResponse(response, 503, "text/plain", "Target controller busy; retry.");
+    return;
+  }
+  if (next.type == TYPE_SATELLITE) tleReady = false;
+  targetCalculationReady = false;
+  current = next;
+  motorTarget.az = 0;
+  motorTarget.el = 0;
+  xSemaphoreGive(targetMutex);
+
+  if (next.type == TYPE_SATELLITE && !startTLEFetchTask()) {
+    sendHttpResponse(response, 503, "text/plain",
+                     "Could not start TLE download; motors remain disabled.");
+    return;
+  }
+  sendHttpResponse(response, 202, "text/plain", "Target accepted.");
+}
+
+void handleTelemetry(httpsserver::HTTPRequest *request,
+                     httpsserver::HTTPResponse *response) {
+  (void)request; // The telemetry endpoint intentionally remains read-only and public.
+  const TargetState target = getTargetSnapshot();
+  const TelemetrySnapshot data = getTelemetrySnapshot();
+  StaticJsonDocument<512> doc;
+  doc["name"] = target.name;
+  doc["type"] = target.type;
+  doc["az"] = data.targetAz;
+  doc["el"] = data.targetEl;
+  doc["sLat"] = data.satLat;
+  doc["sLon"] = data.satLon;
+  doc["speed"] = data.satSpeed;
+  doc["alt"] = data.satAltKm;
+  doc["dist"] = data.satDist;
+
+  if (data.nextPassValid) {
+    char aos[24], los[24];
+    struct tm aosUtc, losUtc;
+    gmtime_r(&data.nextPassAOS, &aosUtc);
+    gmtime_r(&data.nextPassLOS, &losUtc);
+    snprintf(aos, sizeof(aos), "%02d:%02d UTC", aosUtc.tm_hour, aosUtc.tm_min);
+    snprintf(los, sizeof(los), "%02d:%02d UTC", losUtc.tm_hour, losUtc.tm_min);
+    doc["nextPass"] = aos;
+    doc["nextPassLOS"] = los;
+    doc["nextPassEl"] = (int)data.nextPassMaxEl;
+  } else {
+    doc["nextPass"] = "--:--";
+    doc["nextPassLOS"] = "--:--";
+    doc["nextPassEl"] = 0;
+  }
+
+  String json;
+  serializeJson(doc, json);
+  sendHttpResponse(response, 200, "application/json", json);
+}
+
 void setup() {
   // ── 1. System Initialization ───────────────────────────────────────
   Serial.begin(115200);
@@ -445,149 +601,22 @@ void setup() {
       Serial.println("WARNING: IP geolocation failed; use Sync Phone GPS before tracking.");
   }
 
-  // HTTPS only: no unencrypted dashboard or control listener is started.
-  server.on("/", HTTP_GET, [](){
-      if (!authenticateControlRequest()) return;
-      server.send_P(200, PSTR("text/html"), index_html);
-  });
+  // Register routes directly with the native ESP-IDF HTTPS server.
+  static httpsserver::ResourceNode rootNode("/", "GET", &handleRoot);
+  static httpsserver::ResourceNode locationNode("/updateLoc", "GET", &handleUpdateLocation);
+  static httpsserver::ResourceNode targetNode("/set", "GET", &handleSetTarget);
+  static httpsserver::ResourceNode telemetryNode("/data", "GET", &handleTelemetry);
+  server.registerNode(&rootNode);
+  server.registerNode(&locationNode);
+  server.registerNode(&targetNode);
+  server.registerNode(&telemetryNode);
 
-  server.on("/updateLoc", HTTP_GET, [](){
-      if (!authenticateControlRequest()) return;
-      double lat, lon, alt;
-      if (!parseDoubleArg("lat", lat) || !parseDoubleArg("lon", lon) ||
-          !parseDoubleArg("alt", alt) ||
-          !TrackingMath::validObserver(lat, lon, alt)) {
-          server.send(400, "text/plain", "Invalid location. Check latitude, longitude and altitude.");
-          return;
-      }
-      if (xSemaphoreTake(sysMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
-          server.send(503, "text/plain", "System busy; retry location update.");
-          return;
-      }
-      sys.lat = lat; sys.lon = lon; sys.alt = alt;
-      xSemaphoreGive(sysMutex);
-      observerReady = true;
-      targetCalculationReady = false;
+  if (!server.start()) {
+      Serial.println("CRITICAL: HTTPS server failed to start; motors remain disabled.");
+      disableMotors();
+      while (1) { delay(1000); }
+  }
 
-      TargetState target = getTargetSnapshot();
-      if (target.type == TYPE_SATELLITE) {
-          tleReady = false;   // invalidate the old observer's SGP4 state immediately
-          targetCalculationReady = false;
-          if (!startTLEFetchTask()) {
-              server.send(503, "text/plain", "Could not start TLE refresh; motors remain disabled.");
-              return;
-          }
-      }
-      server.send(202, "text/plain", "Location accepted.");
-  });
-
-  server.on("/set", HTTP_GET, [](){
-      if (!authenticateControlRequest()) return;
-      if (!server.hasArg("type") || !server.hasArg("val")) {
-          server.send(400, "text/plain", "Missing target type or value.");
-          return;
-      }
-      char *end = nullptr;
-      const String typeArg = server.arg("type");
-      const String valArg = server.arg("val");
-      long type = strtol(typeArg.c_str(), &end, 10);
-      if (end == typeArg.c_str() || *end != '\0' || (type != 0 && type != 1)) {
-          server.send(400, "text/plain", "Invalid target type.");
-          return;
-      }
-      end = nullptr;
-      long val = strtol(valArg.c_str(), &end, 10);
-      if (end == valArg.c_str() || *end != '\0') {
-          server.send(400, "text/plain", "Invalid target ID.");
-          return;
-      }
-
-      TargetState next = {};
-      if (type == TYPE_SATELLITE) {
-          if (!TrackingMath::validNoradId(val)) {
-              server.send(400, "text/plain", "NORAD ID is outside the accepted range.");
-              return;
-          }
-          next.type = TYPE_SATELLITE;
-          next.noradID = val;
-          String requestedName = server.arg("name");
-          requestedName.trim();
-          if (requestedName.length() > 0) {
-              requestedName.toCharArray(next.name, sizeof(next.name));
-              next.name[sizeof(next.name) - 1] = 0;
-          } else {
-              snprintf(next.name, sizeof(next.name), "NORAD %ld", val);
-          }
-      } else {
-          if (!TrackingMath::supportedPlanetBody((int)val)) {
-              server.send(400, "text/plain", "Unsupported planetary body.");
-              return;
-          }
-          next.type = TYPE_PLANET;
-          next.body = (int)val;
-          strlcpy(next.name, planetName((int)val), sizeof(next.name));
-      }
-
-      if (xSemaphoreTake(targetMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
-          server.send(503, "text/plain", "Target controller busy; retry.");
-          return;
-      }
-      if (next.type == TYPE_SATELLITE) {
-          tleReady = false;   // never track a newly selected NORAD ID with the previous TLE
-      }
-      targetCalculationReady = false;
-      current = next;
-      motorTarget.az = 0;
-      motorTarget.el = 0;
-      xSemaphoreGive(targetMutex);
-
-      if (next.type == TYPE_SATELLITE) {
-          if (!startTLEFetchTask()) {
-              server.send(503, "text/plain", "Could not start TLE download; motors remain disabled.");
-              return;
-          }
-      }
-      server.send(202, "text/plain", "Target accepted.");
-  });
-
-  server.on("/data", HTTP_GET, [](){
-      const TargetState target = getTargetSnapshot();
-      const TelemetrySnapshot data = getTelemetrySnapshot();
-      StaticJsonDocument<512> doc;
-      doc["name"]  = target.name;
-      doc["type"]  = target.type;
-      doc["az"]    = data.targetAz;
-      doc["el"]    = data.targetEl;
-      doc["sLat"]  = data.satLat;
-      doc["sLon"]  = data.satLon;
-      doc["speed"] = data.satSpeed;
-      doc["alt"]   = data.satAltKm;
-      doc["dist"]  = data.satDist;
-      if (data.nextPassValid) {
-          char aos[24], los[24];
-          struct tm aosUtc, losUtc;
-          gmtime_r(&data.nextPassAOS, &aosUtc);
-          gmtime_r(&data.nextPassLOS, &losUtc);
-          snprintf(aos, sizeof(aos), "%02d:%02d UTC", aosUtc.tm_hour, aosUtc.tm_min);
-          snprintf(los, sizeof(los), "%02d:%02d UTC", losUtc.tm_hour, losUtc.tm_min);
-          doc["nextPass"] = aos;
-          doc["nextPassLOS"] = los;
-          doc["nextPassEl"] = (int)data.nextPassMaxEl;
-      } else {
-          doc["nextPass"] = "--:--";
-          doc["nextPassLOS"] = "--:--";
-          doc["nextPassEl"] = 0;
-      }
-      String out;
-      serializeJson(doc, out);
-      server.send(200, "application/json", out);
-  });
-
-  server.onNotFound([]() {
-      server.send(404, "text/plain", "Not found.");
-  });
-
-  server.begin();
   Serial.println("HTTPS dashboard: https://space-pointer.local/ (if mDNS is supported)");
   Serial.print("HTTPS fallback URL: https://");
   Serial.print(WiFi.localIP());
@@ -629,9 +658,8 @@ void setup() {
 }
 
 void loop() {
-  // The TLS server is synchronous: poll it often while the motor and physics
-  // FreeRTOS tasks continue independently.
-  server.handleClient();
+  // Process TLS sockets regularly while motor and physics tasks run independently.
+  server.loop();
   delay(2);
 }
 
@@ -669,19 +697,34 @@ bool getObserverSnapshot(double &lat, double &lon, double &alt) {
   return TrackingMath::validObserver(lat, lon, alt);
 }
 
-bool parseDoubleArg(const char *name, double &value) {
-  if (!server.hasArg(name)) return false;
-  const String arg = server.arg(name);
+bool parseDoubleArg(httpsserver::HTTPRequest *request,
+                    const char *name, double &value) {
+  std::string argument;
+  if (!request->getParams()->getQueryParameter(name, argument)) return false;
   char *end = nullptr;
-  value = strtod(arg.c_str(), &end);
-  return end != arg.c_str() && *end == '\0' && isfinite(value);
+  value = strtod(argument.c_str(), &end);
+  return end != argument.c_str() && *end == '\0' && isfinite(value);
 }
 
-bool authenticateControlRequest() {
-  // Keep the same credentials, now protected in transit by TLS.
-  if (server.authenticate(CONTROL_USER, CONTROL_PASSWORD)) return true;
-  server.requestAuthentication();
+bool authenticateControlRequest(httpsserver::HTTPRequest *request,
+                                httpsserver::HTTPResponse *response) {
+  // Decode Basic Authentication and compare the configured credentials.
+  // HTTPS encrypts this header while it crosses the local network.
+  if (request->getBasicAuthUser() == CONTROL_USER &&
+      request->getBasicAuthPassword() == CONTROL_PASSWORD) return true;
+
+  response->setStatusCode(401);
+  response->setHeader("Content-Type", "text/plain");
+  response->setHeader("WWW-Authenticate", "Basic realm=\\"Space Pointer\\"");
+  response->print("Authentication required.");
   return false;
+}
+
+void sendHttpResponse(httpsserver::HTTPResponse *response, int status,
+                      const char *contentType, const String &body) {
+  response->setStatusCode(status);
+  response->setHeader("Content-Type", contentType);
+  response->print(body);
 }
 
 // Generate a self-signed certificate with a Subject Alternative Name (SAN).
@@ -886,10 +929,9 @@ bool configureHttpsCertificate() {
   }
 
   preferences.end();
-  server.setServerKeyAndCert(
-      localTlsCertificate.getPKData(), localTlsCertificate.getPKLength(),
-      localTlsCertificate.getCertData(), localTlsCertificate.getCertLength());
-  return localTlsCertificate.getPKLength() > 0 && localTlsCertificate.getCertLength() > 0;
+  // HTTPSServer reads the key and certificate from this object when start() is called.
+  return localTlsCertificate.getPKLength() > 0 &&
+         localTlsCertificate.getCertLength() > 0;
 }
 
 const char *planetName(int body) {
