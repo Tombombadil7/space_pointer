@@ -19,6 +19,7 @@
 #include <WiFi.h>
 #include <ESPmDNS.h>
 #include <Preferences.h>
+#include <new>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <AS5600.h> // I2C magnetic encoder for elevation feedback
