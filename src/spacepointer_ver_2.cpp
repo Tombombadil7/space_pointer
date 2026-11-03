@@ -166,7 +166,7 @@ bool parseDoubleArg(AsyncWebServerRequest *request, const char *name, double &va
 void disableMotors();
 const char *planetName(int body);
 void PhysicsTask(void * p);
-void updateNextPass(const TargetState &target, time_t now,
+void updateNextPass(const TargetState &target, uint32_t generation, time_t now,
                     double lat, double lon, double alt);
 void stepMotor(int stepPin, int dirPin, bool forward);
 int pidOutput(const PController &p, float error);
@@ -503,7 +503,7 @@ int pidOutput(const PController &p, float error) {
 
 // Calculate the next satellite pass or planetary rise/set independently of
 // any display. The web API reads the result from the shared telemetry state.
-void updateNextPass(const TargetState &target, time_t now,
+void updateNextPass(const TargetState &target, uint32_t generation, time_t now,
                     double lat, double lon, double alt) {
     bool passValid = false;
     time_t aosTime = 0;
@@ -544,12 +544,18 @@ void updateNextPass(const TargetState &target, time_t now,
         }
     }
 
-    if (xSemaphoreTake(sysMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-        sys.nextPassValid = passValid;
-        sys.nextPassAOS = aosTime;
-        sys.nextPassLOS = losTime;
-        sys.nextPassMaxEl = maxElevation;
-        xSemaphoreGive(sysMutex);
+    // A pass prediction can take noticeable time. Do not publish it if the
+    // user selected a different target while the search was running.
+    if (xSemaphoreTake(targetMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+        if (targetGeneration == generation &&
+            xSemaphoreTake(sysMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+            sys.nextPassValid = passValid;
+            sys.nextPassAOS = aosTime;
+            sys.nextPassLOS = losTime;
+            sys.nextPassMaxEl = maxElevation;
+            xSemaphoreGive(sysMutex);
+        }
+        xSemaphoreGive(targetMutex);
     }
 }
 
@@ -598,7 +604,7 @@ void PhysicsTask(void * p) {
       // rather than tying their calculation to a physical display task.
       static uint32_t lastPassCalc = 0;
       if (millis() - lastPassCalc > 30000) {
-          updateNextPass(target, now, lat, lon, alt);
+          updateNextPass(target, calculationGeneration, now, lat, lon, alt);
           lastPassCalc = millis();
       }
 
@@ -788,12 +794,6 @@ void MotorTask(void * p) {
 
       const float elNow = ENCODER_DIRECTION *
                           encoderDelta * (360.0f / 4096.0f);
-
-      if (!driversEnabled) {
-          digitalWrite(AZ_EN_PIN, LOW);
-          digitalWrite(EL_EN_PIN, LOW);
-          driversEnabled = true;
-      }
 
       // Convert the BNO055 magnetic heading to true north before comparing
       // it with Astronomy Engine's true-north target azimuth.
