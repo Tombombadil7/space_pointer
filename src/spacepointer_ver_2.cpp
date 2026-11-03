@@ -51,6 +51,17 @@
 // magnetic-north heading, while Astronomy Engine calculates true-north azimuth.
 // A zero value is only correct where magnetic and true north coincide.
 #define MAGNETIC_DECLINATION_DEG  0.0f
+
+// AS5600 elevation calibration.
+// Set ENCODER_ZERO_RAW to the raw sensor reading when the telescope tube is
+// physically level (0 degrees elevation). The default 2048 preserves the
+// previous assumption that the sensor's half-turn position is level.
+// Set ENCODER_DIRECTION to +1 or -1 after checking which way the raw reading
+// changes when the telescope is moved upward. Do not use AS5600.setDirection()
+// as well: direction is applied explicitly below.
+#define ENCODER_ZERO_RAW       2048
+#define ENCODER_DIRECTION      1
+
 // Two axes are stepped sequentially; 80 leaves time for task/sensor overhead.
 
 AsyncWebServer server(80);
@@ -391,8 +402,6 @@ void setup() {
   encoderReady = encoder.isConnected();
   if (!encoderReady) {
       Serial.println("WARNING: AS5600 not found — motor control will stay disabled");
-  } else {
-      encoder.setDirection(AS5600_CLOCK_WISE);
   }
 
   // ── BNO055 IMU ─────────────────────────────────────────────────────
@@ -903,8 +912,15 @@ void MotorTask(void * p) {
           resetPIDs();          vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(MOTOR_TASK_MS));
           continue;
       }
-      float elNow = encoderRaw * (360.0f / 4096.0f);
-      if (elNow > 180.0f) elNow -= 360.0f;
+      // Convert the 12-bit encoder reading into elevation relative to the
+      // calibrated level position. Wrap the difference so small movements
+      // across the sensor's 0/4095 boundary remain continuous.
+      int32_t encoderDelta = (int32_t)encoderRaw - ENCODER_ZERO_RAW;
+      if (encoderDelta > 2048) encoderDelta -= 4096;
+      if (encoderDelta < -2048) encoderDelta += 4096;
+
+      const float elNow = ENCODER_DIRECTION *
+                          encoderDelta * (360.0f / 4096.0f);
 
       digitalWrite(AZ_EN_PIN, LOW);
       digitalWrite(EL_EN_PIN, LOW);
