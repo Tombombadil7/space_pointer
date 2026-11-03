@@ -107,6 +107,10 @@ TargetState current = {TYPE_SATELLITE, {.noradID = 25544}, "ISS"};
 // Access is protected by targetMutex, just like current and motorTarget.
 uint32_t targetGeneration = 1;
 
+// Incremented whenever the observer's location changes. Protected by sysMutex,
+// alongside sys.lat/lon/alt, so a calculation can verify its location snapshot.
+uint32_t observerGeneration = 1;
+
 struct VersionedTargetSnapshot {
   TargetState target;
   uint32_t generation;
@@ -166,12 +170,14 @@ void TLEFetchTask(void * p);
 TargetState getTargetSnapshot();
 VersionedTargetSnapshot getVersionedTargetSnapshot();
 bool getTelemetrySnapshot(TelemetrySnapshot &snapshot);
-bool getObserverSnapshot(double &lat, double &lon, double &alt);
+bool getVersionedObserverSnapshot(double &lat, double &lon, double &alt,
+                                  uint32_t &generation);
 bool parseDoubleArg(AsyncWebServerRequest *request, const char *name, double &value);
 void disableMotors();
 const char *planetName(int body);
 void PhysicsTask(void * p);
-void updateNextPass(const TargetState &target, uint32_t generation, time_t now,
+void updateNextPass(const TargetState &target, uint32_t targetVersion,
+                    uint32_t observerVersion, time_t now,
                     double lat, double lon, double alt);
 void stepMotor(int stepPin, int dirPin, bool forward);
 int pidOutput(const PController &p, float error);
@@ -270,6 +276,8 @@ void setup() {
           return;
       }
       sys.lat = lat; sys.lon = lon; sys.alt = alt;
+      ++observerGeneration;
+      if (observerGeneration == 0) ++observerGeneration; // Reserve zero for an invalid snapshot.
       xSemaphoreGive(sysMutex);
       observerReady = true;
       targetCalculationReady = false;
@@ -477,11 +485,21 @@ bool getTelemetrySnapshot(TelemetrySnapshot &snapshot) {
   return true;
 }
 
-bool getObserverSnapshot(double &lat, double &lon, double &alt) {
-  if (sysMutex == NULL || xSemaphoreTake(sysMutex, pdMS_TO_TICKS(20)) != pdTRUE) return false;
-  lat = sys.lat; lon = sys.lon; alt = sys.alt;
+bool getVersionedObserverSnapshot(double &lat, double &lon, double &alt,
+                                  uint32_t &generation) {
+  // Read the coordinates and their version under the same lock. This ensures
+  // the version always describes the exact location copied into this snapshot.
+  if (sysMutex == NULL || xSemaphoreTake(sysMutex, pdMS_TO_TICKS(20)) != pdTRUE) {
+      return false;
+  }
+
+  lat = sys.lat;
+  lon = sys.lon;
+  alt = sys.alt;
+  generation = observerGeneration;
   xSemaphoreGive(sysMutex);
-  return TrackingMath::validObserver(lat, lon, alt);
+
+  return generation != 0 && TrackingMath::validObserver(lat, lon, alt);
 }
 
 bool parseDoubleArg(AsyncWebServerRequest *request, const char *name, double &value) {
@@ -538,7 +556,8 @@ int pidOutput(const PController &p, float error) {
 
 // Calculate the next satellite pass or planetary rise/set independently of
 // any display. The web API reads the result from the shared telemetry state.
-void updateNextPass(const TargetState &target, uint32_t generation, time_t now,
+void updateNextPass(const TargetState &target, uint32_t targetVersion,
+                    uint32_t observerVersion, time_t now,
                     double lat, double lon, double alt) {
     bool passValid = false;
     time_t aosTime = 0;
@@ -579,15 +598,18 @@ void updateNextPass(const TargetState &target, uint32_t generation, time_t now,
         }
     }
 
-    // A pass prediction can take noticeable time. Do not publish it if the
-    // user selected a different target while the search was running.
+    // A pass prediction can take noticeable time. Publish it only if neither
+    // the selected target nor the observer location changed during the search.
+    // Lock order stays targetMutex -> sysMutex, matching the physics commit path.
     if (xSemaphoreTake(targetMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-        if (targetGeneration == generation &&
+        if (targetGeneration == targetVersion &&
             xSemaphoreTake(sysMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-            sys.nextPassValid = passValid;
-            sys.nextPassAOS = aosTime;
-            sys.nextPassLOS = losTime;
-            sys.nextPassMaxEl = maxElevation;
+            if (observerGeneration == observerVersion) {
+                sys.nextPassValid = passValid;
+                sys.nextPassAOS = aosTime;
+                sys.nextPassLOS = losTime;
+                sys.nextPassMaxEl = maxElevation;
+            }
             xSemaphoreGive(sysMutex);
         }
         xSemaphoreGive(targetMutex);
@@ -621,7 +643,9 @@ void PhysicsTask(void * p) {
       const TargetState target = targetSnapshot.target;
       const uint32_t calculationGeneration = targetSnapshot.generation;
       double lat, lon, alt;
-      if (!getObserverSnapshot(lat, lon, alt)) {
+      uint32_t calculationObserverGeneration = 0;
+      if (!getVersionedObserverSnapshot(lat, lon, alt,
+                                        calculationObserverGeneration)) {
           targetCalculationReady = false;
           vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(500));
           continue;
@@ -639,7 +663,8 @@ void PhysicsTask(void * p) {
       // rather than tying their calculation to a physical display task.
       static uint32_t lastPassCalc = 0;
       if (millis() - lastPassCalc > 30000) {
-          updateNextPass(target, calculationGeneration, now, lat, lon, alt);
+          updateNextPass(target, calculationGeneration,
+                         calculationObserverGeneration, now, lat, lon, alt);
           lastPassCalc = millis();
       }
 
@@ -724,18 +749,27 @@ void PhysicsTask(void * p) {
           // A target change cannot slip between the generation check and write.
           if (targetGeneration == calculationGeneration) {
               if (xSemaphoreTake(sysMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-                  sys.targetAz = targetAz;
-                  sys.targetEl = targetEl;
-                  sys.satLat = satLat;
-                  sys.satLon = satLon;
-                  sys.satSpeed = satSpeed;
-                  sys.satAltKm = satAltKm;
-                  sys.satDist = satDist;
+                  // Location updates also take sysMutex, so this check and the
+                  // telemetry write are atomic with respect to /updateLoc and
+                  // the automatic IP-geolocation update.
+                  if (observerGeneration == calculationObserverGeneration) {
+                      sys.targetAz = targetAz;
+                      sys.targetEl = targetEl;
+                      sys.satLat = satLat;
+                      sys.satLon = satLon;
+                      sys.satSpeed = satSpeed;
+                      sys.satAltKm = satAltKm;
+                      sys.satDist = satDist;
+                      resultCommitted = true;
+                  }
                   xSemaphoreGive(sysMutex);
 
-                  motorTarget.az = (float)targetAz;
-                  motorTarget.el = (float)targetEl;
-                  resultCommitted = true;
+                  // Publish the motor target only after both versions have
+                  // been validated while their protecting locks are held.
+                  if (resultCommitted) {
+                      motorTarget.az = (float)targetAz;
+                      motorTarget.el = (float)targetEl;
+                  }
               }
           }
           xSemaphoreGive(targetMutex);
@@ -909,6 +943,8 @@ bool updateIPLocation() {
                     sys.lat = lat;
                     sys.lon = lon;
                     sys.alt = 50.0;
+                    ++observerGeneration;
+                    if (observerGeneration == 0) ++observerGeneration;
                     xSemaphoreGive(sysMutex);
                     valid = true;
                 }
@@ -932,10 +968,12 @@ void fetchTLE() {
     targetCalculationReady = false;
     const TargetState requested = getTargetSnapshot();
     double lat, lon, alt;
+    uint32_t observerVersion = 0;
     bool success = false;
 
     if (requested.type == TYPE_SATELLITE &&
-        getObserverSnapshot(lat, lon, alt) && requested.noradID > 0) {
+        getVersionedObserverSnapshot(lat, lon, alt, observerVersion) &&
+        requested.noradID > 0) {
         HTTPClient http;
         http.setTimeout(12000);
         const String url = "https://tle.ivanstanojevic.me/api/tle/" + String(requested.noradID);
