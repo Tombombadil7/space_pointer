@@ -165,7 +165,7 @@ bool startTLEFetchTask();
 void TLEFetchTask(void * p);
 TargetState getTargetSnapshot();
 VersionedTargetSnapshot getVersionedTargetSnapshot();
-TelemetrySnapshot getTelemetrySnapshot();
+bool getTelemetrySnapshot(TelemetrySnapshot &snapshot);
 bool getObserverSnapshot(double &lat, double &lon, double &alt);
 bool parseDoubleArg(AsyncWebServerRequest *request, const char *name, double &value);
 void disableMotors();
@@ -362,7 +362,14 @@ void setup() {
 
   server.on("/data", HTTP_GET, [](AsyncWebServerRequest *r){
       const TargetState target = getTargetSnapshot();
-      const TelemetrySnapshot data = getTelemetrySnapshot();
+      TelemetrySnapshot data = {};
+      // Never serialize a zero-filled snapshot when the telemetry lock is busy.
+      // The dashboard can then show a local telemetry error and keep the rest
+      // of the page (map and target controls) fully available.
+      if (!getTelemetrySnapshot(data)) {
+          r->send(503, "text/plain", "Telemetry temporarily unavailable; please retry.");
+          return;
+      }
       StaticJsonDocument<512> doc;
       doc["name"]  = target.name;
       doc["type"]  = target.type;
@@ -452,19 +459,22 @@ TargetState getTargetSnapshot() {
   return getVersionedTargetSnapshot().target;
 }
 
-TelemetrySnapshot getTelemetrySnapshot() {
-  TelemetrySnapshot result = {};
-  if (sysMutex != NULL && xSemaphoreTake(sysMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-      result.targetAz = sys.targetAz; result.targetEl = sys.targetEl;
-      result.satLat = sys.satLat; result.satLon = sys.satLon;
-      result.satSpeed = sys.satSpeed; result.satAltKm = sys.satAltKm;
-      result.satDist = sys.satDist;
-      result.nextPassValid = sys.nextPassValid;
-      result.nextPassAOS = sys.nextPassAOS; result.nextPassLOS = sys.nextPassLOS;
-      result.nextPassMaxEl = sys.nextPassMaxEl;
-      xSemaphoreGive(sysMutex);
+bool getTelemetrySnapshot(TelemetrySnapshot &snapshot) {
+  // A failed lock is not valid telemetry. Return false so the HTTP handler
+  // can report a temporary service error instead of publishing fake zeros.
+  if (sysMutex == NULL || xSemaphoreTake(sysMutex, pdMS_TO_TICKS(20)) != pdTRUE) {
+      return false;
   }
-  return result;
+
+  snapshot.targetAz = sys.targetAz; snapshot.targetEl = sys.targetEl;
+  snapshot.satLat = sys.satLat; snapshot.satLon = sys.satLon;
+  snapshot.satSpeed = sys.satSpeed; snapshot.satAltKm = sys.satAltKm;
+  snapshot.satDist = sys.satDist;
+  snapshot.nextPassValid = sys.nextPassValid;
+  snapshot.nextPassAOS = sys.nextPassAOS; snapshot.nextPassLOS = sys.nextPassLOS;
+  snapshot.nextPassMaxEl = sys.nextPassMaxEl;
+  xSemaphoreGive(sysMutex);
+  return true;
 }
 
 bool getObserverSnapshot(double &lat, double &lon, double &alt) {
