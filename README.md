@@ -93,7 +93,7 @@ Before operating the mount, review these values near the top of `src/spacepointe
 - Espressif32 platform with the Arduino framework
 - Libraries declared in `platformio.ini`:
   - WiFiManager
-  - ESPAsyncWebServer
+  - `esp32_idf5_https_server` (native ESP-IDF TLS server)
   - ArduinoJson
   - Adafruit BNO055, Adafruit Unified Sensor, and Adafruit BusIO
   - Sgp4
@@ -116,7 +116,7 @@ pio test -e native
 pio run -e esp32-s3-devkitc-1
 ```
 
-The GitHub Actions workflow runs both commands on pushes to the fix branch and on pull requests. The HTTPS dependency is `esp32_idf5_https_server_compat`, a TLS-capable alternative to `ESPAsyncWebServer`; request handling is synchronous, so `loop()` calls `server.handleClient()` frequently. A green CI result verifies compilation and the hardware-independent helper tests; it does not replace bench testing, sensor calibration, or safe motor commissioning.
+The GitHub Actions workflow runs both commands on pushes to the fix branch and on pull requests. The HTTPS dependency is `esp32_idf5_https_server`, which uses the native ESP-IDF TLS socket implementation and avoids the Arduino `WebServer` compatibility shim. Request processing is driven by `server.loop()` in the main Arduino loop; motor and physics calculations remain in their dedicated FreeRTOS tasks. A green CI result verifies compilation and the hardware-independent helper tests; it does not replace bench testing, sensor calibration, or safe motor commissioning.
 
 ## First boot and operation
 
