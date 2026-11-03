@@ -8,10 +8,10 @@ Run the tests from the repository root:
 pio test -e native
 ```
 
-The native suite checks:
-- Angular wrapping, including boundary and non-finite inputs.
-- Observer latitude, longitude, and altitude validation, including exact limits.
-- NORAD ID and supported planetary-body validation.
-- Proportional motor-step rounding, deadband behavior, correction limits, and non-finite errors.
+The native suite currently contains 19 test cases covering:
+- Angular wrapping, exact half-turn boundaries, multiple revolutions, and non-finite inputs.
+- Observer latitude, longitude, and altitude validation, including exact limits and out-of-range values.
+- NORAD ID boundaries and supported planetary-body IDs.
+- Proportional motor-step rounding, deadband behavior, correction limits, zero gain, and non-finite errors.
 
 The native tests do not exercise FreeRTOS scheduling, I2C peripherals, motor drivers, the Astronomy Engine integration, or live SGP4/TLE data. Those still require an ESP32 build and hardware/bench testing.
