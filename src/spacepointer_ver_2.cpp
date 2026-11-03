@@ -10,7 +10,6 @@
 
 #include <WiFiManager.h>
 #include <Wire.h>
-#include <LiquidCrystal_I2C.h>
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -80,7 +79,7 @@ struct {
   // satellite map position
   double satLat, satLon;
 
-  // display data
+  // telemetry data exposed through the web API
   double satSpeed;       // km/s
   double satAltKm;       // km above Earth surface (satellites) or from Earth center (planets)
   double satDist;        // km from observer
@@ -149,13 +148,6 @@ struct TelemetrySnapshot {
 };
 // ── AS5600 encoder ──────────────────────────────────────────────────────
 AS5600 encoder;   // default I2C address 0x36, shares bus with BNO055 (0x28)
-// LCD — try 0x27 first, some boards use 0x3F
-// Change to LiquidCrystal_I2C lcd(0x3F, 16, 2) if 0x27 doesn't work
-LiquidCrystal_I2C lcd(0x27, 16, 2);
-bool lcdFound = false;   // set in setup(), checked before creating DisplayTask
-
-
-void DisplayTask(void * p);
 bool updateIPLocation();
 void fetchTLE();
 bool startTLEFetchTask();
@@ -166,6 +158,8 @@ bool parseDoubleArg(AsyncWebServerRequest *request, const char *name, double &va
 void disableMotors();
 const char *planetName(int body);
 void PhysicsTask(void * p);
+void updateNextPass(const TargetState &target, time_t now,
+                    double lat, double lon, double alt);
 void stepMotor(int stepPin, int dirPin, bool forward);
 int pidOutput(const PController &p, float error);
 float wrapAngle(float e);
@@ -381,32 +375,6 @@ void setup() {
   Wire.begin(8, 9); // SDA=GPIO8, SCL=GPIO9
   Wire.setClock(400000);
 
-  // ── LCD detection ──────────────────────────────────────────────────
-  // Probe the I2C bus for the LCD address before init.
-  // Wire.endTransmission()==0 means a device ACK'd at that address.
-  Wire.beginTransmission(0x27);
-  if (Wire.endTransmission() == 0) {
-      lcdFound = true;
-  } else {
-      // Try the alternate common address
-      Wire.beginTransmission(0x3F);
-      if (Wire.endTransmission() == 0) {
-          lcdFound = true;
-          // Reinitialise the object at the correct address
-          lcd = LiquidCrystal_I2C(0x3F, 16, 2);
-      }
-  }
-
-  if (lcdFound) {
-      lcd.init();
-      lcd.backlight();
-      lcd.setCursor(0, 0); lcd.print("Space Pointer");
-      lcd.setCursor(0, 1); lcd.print("Booting...");
-      Serial.println("LCD found and initialised");
-  } else {
-      Serial.println("WARNING: LCD not found — DisplayTask will be skipped");
-  }
-
   // ── AS5600 encoder ─────────────────────────────────────────────────
   encoder.begin();
   encoderReady = encoder.isConnected();
@@ -602,13 +570,6 @@ void setup() {
       fetchTLE();
   }
 
-  if (lcdFound) {
-      lcd.clear();
-      lcd.setCursor(0, 0); lcd.print("WiFi OK");
-      lcd.setCursor(0, 1); lcd.print("Time synced!");
-      delay(1000);
-  }
-
   // ── 6. Task Creation ───────────────────────────────────────────────
   // WiFi stack runs on Core 0 — put Physics on Core 1 to avoid contention
   if (xTaskCreatePinnedToCore(PhysicsTask, "Physics", 15000, NULL, 2, NULL, 1) != pdPASS) {
@@ -620,9 +581,6 @@ void setup() {
       disableMotors();
   }
 
-  // DisplayTask also calculates next rise/set or satellite pass times.  // Keep it running even without an LCD; LCD writes are conditionally skipped.
-  if (xTaskCreatePinnedToCore(DisplayTask, "Display", 5000, NULL, 1, NULL, 0) != pdPASS) {      Serial.println("WARNING: Display/Pass task creation failed.");
-  }
 }
 
 void loop() {
@@ -717,6 +675,58 @@ int pidOutput(const PController &p, float error) {
                           (float)MAX_STEPS_PER_TICK);
 }
 
+// Calculate the next satellite pass or planetary rise/set independently of
+// any display. The web API reads the result from the shared telemetry state.
+void updateNextPass(const TargetState &target, time_t now,
+                    double lat, double lon, double alt) {
+    bool passValid = false;
+    time_t aosTime = 0;
+    time_t losTime = 0;
+    double maxElevation = 0.0;
+
+    if (target.type == TYPE_SATELLITE && tleReady &&
+        xSemaphoreTake(sgp4Mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        // Search for a pass that reaches at least 20 degrees above the horizon.
+        // The second argument is the search iteration limit, not the elevation.
+        const bool predictionReady =
+            satSgp4.initpredpoint((unsigned long)now, 0.0);
+        passinfo overpass = {};
+        passValid = predictionReady &&
+                    satSgp4.nextpass(&overpass, 20, false, 20.0);
+        if (passValid) {
+            aosTime = (time_t)((overpass.jdstart - 2440587.5) * 86400.0);
+            losTime = (time_t)((overpass.jdstop  - 2440587.5) * 86400.0);
+            maxElevation = overpass.maxelevation;
+        }
+        xSemaphoreGive(sgp4Mutex);
+    } else if (target.type == TYPE_PLANET) {
+        struct tm utc;
+        if (gmtime_r(&now, &utc) != nullptr) {
+            astro_time_t start = Astronomy_MakeTime(
+                utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday,
+                utc.tm_hour, utc.tm_min, (double)utc.tm_sec);
+            const astro_observer_t observer = {lat, lon, alt};
+            const astro_search_result_t rise = Astronomy_SearchRiseSet(
+                (astro_body_t)target.body, observer, DIRECTION_RISE, start, 1.0);
+            const astro_search_result_t set = Astronomy_SearchRiseSet(
+                (astro_body_t)target.body, observer, DIRECTION_SET, start, 1.0);
+            if (rise.status == ASTRO_SUCCESS && set.status == ASTRO_SUCCESS) {
+                aosTime = (time_t)(rise.time.ut * 86400.0 + 946728000.0);
+                losTime = (time_t)(set.time.ut * 86400.0 + 946728000.0);
+                passValid = true;
+            }
+        }
+    }
+
+    if (xSemaphoreTake(sysMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+        sys.nextPassValid = passValid;
+        sys.nextPassAOS = aosTime;
+        sys.nextPassLOS = losTime;
+        sys.nextPassMaxEl = maxElevation;
+        xSemaphoreGive(sysMutex);
+    }
+}
+
 void PhysicsTask(void * p) {
   TickType_t lastWake = xTaskGetTickCount();
 
@@ -749,6 +759,14 @@ void PhysicsTask(void * p) {
           targetCalculationReady = false;
           vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(500));
           continue;
+      }
+
+      // Pass/rise/set predictions are telemetry too, so update them here
+      // rather than tying their calculation to a physical display task.
+      static uint32_t lastPassCalc = 0;
+      if (millis() - lastPassCalc > 30000) {
+          updateNextPass(target, now, lat, lon, alt);
+          lastPassCalc = millis();
       }
 
       double targetAz = 0.0, targetEl = 0.0;
@@ -971,112 +989,6 @@ void MotorTask(void * p) {
   }
 }
 
-
-
-
-void DisplayTask(void * p) {
-  static uint32_t lastPassCalc = 0;
-  static uint8_t screen = 0;
-  char line0[17], line1[17];
-
-  for (;;) {
-      if (timeReady && millis() - lastPassCalc > 30000) {
-          time_t now;
-          time(&now);
-          const TargetState target = getTargetSnapshot();
-          bool passValid = false;
-          time_t aosTime = 0, losTime = 0;
-          double maxElevation = 0.0;
-
-          if (target.type == TYPE_SATELLITE && tleReady &&
-              xSemaphoreTake(sgp4Mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-              // Search for a pass that reaches at least 20 degrees above the horizon.
-              // The second argument is the search iteration limit, not the elevation.
-              const bool predictionReady =
-                  satSgp4.initpredpoint((unsigned long)now, 0.0);
-              passinfo overpass = {};
-              passValid = predictionReady &&
-                          satSgp4.nextpass(&overpass, 20, false, 20.0);
-              if (passValid) {
-                  aosTime = (time_t)((overpass.jdstart - 2440587.5) * 86400.0);
-                  losTime = (time_t)((overpass.jdstop  - 2440587.5) * 86400.0);
-                  maxElevation = overpass.maxelevation;
-              }
-              xSemaphoreGive(sgp4Mutex);
-          } else if (target.type == TYPE_PLANET) {
-              double lat, lon, alt;
-              struct tm utc;
-              if (getObserverSnapshot(lat, lon, alt) && gmtime_r(&now, &utc) != nullptr) {
-                  astro_time_t start = Astronomy_MakeTime(
-                      utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday,
-                      utc.tm_hour, utc.tm_min, (double)utc.tm_sec);
-                  const astro_observer_t obs = {lat, lon, alt};
-                  const astro_search_result_t rise = Astronomy_SearchRiseSet(
-                      (astro_body_t)target.body, obs, DIRECTION_RISE, start, 1.0);
-                  const astro_search_result_t set = Astronomy_SearchRiseSet(
-                      (astro_body_t)target.body, obs, DIRECTION_SET, start, 1.0);
-                  if (rise.status == ASTRO_SUCCESS && set.status == ASTRO_SUCCESS) {
-                      aosTime = (time_t)(rise.time.ut * 86400.0 + 946728000.0);
-                      losTime = (time_t)(set.time.ut * 86400.0 + 946728000.0);
-                      passValid = true;
-                  }
-              }
-          }
-
-          if (xSemaphoreTake(sysMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-              sys.nextPassValid = passValid;
-              sys.nextPassAOS = aosTime;
-              sys.nextPassLOS = losTime;
-              sys.nextPassMaxEl = maxElevation;
-              xSemaphoreGive(sysMutex);
-          }
-          lastPassCalc = millis();
-      }
-
-      const TargetState target = getTargetSnapshot();
-      const TelemetrySnapshot data = getTelemetrySnapshot();
-      if (screen == 0) {
-          snprintf(line0, sizeof(line0), "%-4.4s Az:%-6.1f",
-                   target.name, data.targetAz);
-          if (data.targetEl >= 0) {
-              snprintf(line1, sizeof(line1), "El:%-5.1f %5.0fkm",
-                       data.targetEl, data.satAltKm);
-          } else if (data.nextPassValid) {
-              struct tm aos;
-              if (gmtime_r(&data.nextPassAOS, &aos) != nullptr) {
-                  snprintf(line1, sizeof(line1), "El:%-4.1f >%02d:%02dUTC",
-                           data.targetEl, aos.tm_hour, aos.tm_min);
-              } else {
-                  snprintf(line1, sizeof(line1), "El:%-5.1f No pass", data.targetEl);
-              }
-          } else {
-              snprintf(line1, sizeof(line1), "El:%-5.1f No pass", data.targetEl);
-          }
-      } else {
-          snprintf(line0, sizeof(line0), "%-4.4s %6.2fkm/s",
-                   target.name, data.satSpeed);
-          if (target.type == TYPE_SATELLITE) {
-              snprintf(line1, sizeof(line1), "Dist:%9.0fkm", data.satDist);
-          } else {
-              const double distMkm = data.satDist / 1000.0;
-              if (distMkm < 10000.0) {
-                  snprintf(line1, sizeof(line1), "Dist:%7.0f Mkm", distMkm);
-              } else {
-                  snprintf(line1, sizeof(line1), "Dist:    %5.2f AU",
-                           data.satDist / 149597870.7);
-              }
-          }
-      }
-
-      if (lcdFound && xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-          lcd.setCursor(0, 0); lcd.print(line0);
-          lcd.setCursor(0, 1); lcd.print(line1);
-          xSemaphoreGive(i2cMutex);
-      }
-      screen = 1 - screen;
-      vTaskDelay(pdMS_TO_TICKS(2000));
-  }
-}
 
 
 

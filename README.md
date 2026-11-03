@@ -1,6 +1,6 @@
 # Universal Space Pointer
 
-An experimental ESP32-S3 project for pointing a two-axis motorized mount at selected satellites and solar-system objects. The firmware combines orbital/astronomical calculations with an IMU, a magnetic rotary encoder, stepper-motor drivers, an LCD, and a browser-based control panel.
+An experimental ESP32-S3 project for pointing a two-axis motorized mount at selected satellites and solar-system objects. The firmware combines orbital/astronomical calculations with an IMU, a magnetic rotary encoder, stepper-motor drivers, and a browser-based control panel.
 
 > **Project status:** prototype / work in progress. The `fix/satellite-nextpass-minimum-elevation` branch contains the current software remediation pass and automated build/test workflows. The firmware has not yet been verified on the physical mount. Do not connect motor power until the pin map, motor wiring, current limits, mechanics, and emergency-stop arrangement have been checked.
 
@@ -10,7 +10,7 @@ An experimental ESP32-S3 project for pointing a two-axis motorized mount at sele
 - Calculate pointing directions for the Moon, Mars, Jupiter, and Saturn using the bundled Astronomy Engine library.
 - Drive azimuth and elevation stepper motors with A4988 drivers.
 - Use a BNO055 IMU for heading feedback and an AS5600 magnetic encoder for elevation feedback.
-- Display pointing and telemetry information on a 16x2 I2C LCD.
+- Display pointing and telemetry information through the browser-based web interface.
 - Provide a local web interface with a satellite map, target selection, telemetry, and a phone-GPS location update.
 - Estimate the observer's initial location from IP geolocation.
 
@@ -25,7 +25,6 @@ The code indicates the following intended bill of materials:
 | 2 | **A4988 stepper-driver modules** | One driver per motor. The firmware sets STEP, DIR, and ENABLE signals. |
 | 1 | **BNO055 IMU module** | Heading/orientation feedback over I2C. |
 | 1 | **AS5600 magnetic encoder module** | Elevation-angle feedback over I2C. Requires a correctly mounted diametrically magnetized magnet. |
-| 1 | **16x2 character LCD with I2C backpack** | Local status display. Firmware probes address `0x27`, then `0x3F`. |
 | 1 | **Two-axis pan/tilt mount** | Mechanical azimuth/elevation structure, with suitable brackets, bearings, couplers, and gearing. |
 | 1 | **External motor power supply** | Must match the selected motors and driver configuration; size it for both motors. Do not power the motors from the ESP32 board. |
 | 1 | **USB data cable** | Firmware upload and serial monitoring. |
@@ -35,9 +34,9 @@ The code indicates the following intended bill of materials:
 
 1. **28BYJ-48 compatibility:** a common stock 28BYJ-48 is a five-wire unipolar motor. An A4988 is intended for a four-wire bipolar stepper. Use a genuine four-wire bipolar motor, or deliberately convert a compatible 28BYJ-48 to bipolar wiring before connecting it. Do not connect a stock five-wire motor to an A4988 as-is.
 2. **Motor power:** use a separate, correctly rated motor supply and connect its ground to ESP32 ground. Set each A4988 current limit for the actual motor. Fit the driver's recommended supply decoupling capacitor close to each driver and provide cooling as required.
-3. **Logic levels:** ESP32-S3 GPIOs are 3.3 V logic and are not 5 V tolerant. Check the LCD backpack's I2C pull-up voltage; use 3.3 V pull-ups or a suitable bidirectional I2C level shifter if the backpack pulls SDA/SCL up to 5 V.
+3. **Logic levels:** ESP32-S3 GPIOs are 3.3 V logic and are not 5 V tolerant. Ensure the BNO055 and AS5600 I2C pull-ups do not exceed 3.3 V; use suitable level shifting if required by the modules.
 4. **Current ENABLE assignments:** the firmware branch uses GPIO16 (azimuth ENABLE) and GPIO17 (elevation ENABLE), as approved for the ESP32-S3-DevKitC-1. Verify the exact module variant and board revision before wiring.
-5. **I2C pins:** the firmware explicitly initializes SDA=GPIO8 and SCL=GPIO9. Connect the BNO055, AS5600, and LCD to this shared bus. Check the LCD backpack pull-up voltage; ESP32-S3 pins are not 5 V tolerant.
+5. **I2C pins:** the firmware explicitly initializes SDA=GPIO8 and SCL=GPIO9. Connect only the BNO055 and AS5600 to this shared sensor bus. The LCD has been removed from the firmware and is not part of the required hardware.
 6. Add mechanical hard stops, a physical emergency stop, and preferably limit switches before allowing movement. Limit-switch and emergency-stop handling is not implemented in this firmware. **Important:** when a fault occurs or the target is below the horizon, the firmware disables the A4988 drivers. Disabling a driver removes motor holding torque; counterbalance the elevation axis or add a suitable brake so the telescope cannot fall.
 
 ## Current firmware pin definitions
@@ -64,7 +63,6 @@ Before operating the mount, review these values near the top of `src/spacepointe
 | `CONTROL_PASSWORD` | `spacepointer-change-me` | **Change this password** to a unique, strong password. Basic Authentication is sent over plain HTTP in this firmware, so it does not protect credentials from someone able to monitor the local network. |
 | `SETUP_AP_PASSWORD` | `SpacePointerSetup` | Change the WiFiManager setup access-point password. Use a password supported by the Wi-Fi stack (at least 8 characters). |
 | `current` initial target | ISS / NORAD `25544` | Optional: change the default satellite name and NORAD catalog ID if you want another initial target. |
-| LCD constructor | `0x27` | Usually leave as-is: setup probes `0x27` and then `0x3F` automatically. |
 | `MICROSTEPS_PER_REV` | `32768UL` | Check against the actual motor full-step angle, gearbox ratio, and A4988 microstep setting. **This constant is currently not used for angular positioning**, so changing it alone does not calibrate the mount. |
 | `STEP_PULSE_US` / `MOTOR_TASK_MS` / `MAX_STEPS_PER_TICK` | `50` µs / `25` ms / `8` steps | Pulse timing and a conservative per-tick correction cap. The cap limits large target changes; it is not an acceleration ramp. Change it only after unloaded bench testing. |
 | `pidAz.kp` | `2.5` | Proportional gain for the azimuth axis, in **steps per degree**. The controller multiplies the azimuth pointing error (degrees) by this value to calculate a requested number of motor steps. A larger value commands more steps for the same error; a smaller value makes corrections gentler. This is an experimental starting value, not a mechanically calibrated value. |
@@ -100,7 +98,6 @@ Before operating the mount, review these values near the top of `src/spacepointe
   - Adafruit BNO055, Adafruit Unified Sensor, and Adafruit BusIO
   - Sgp4
   - RobTillaart AS5600
-  - LiquidCrystal_I2C
 - Astronomy Engine is included locally under `lib/astronomy/`.
 
 ### Build and upload
@@ -136,7 +133,7 @@ The web server listens on port 80. The dashboard root (`/`), `/set`, and `/updat
 
 The `fix/satellite-nextpass-minimum-elevation` branch includes these software changes:
 
-- Corrected the AS5600 PlatformIO dependency and added the missing `Wire.h` and `LiquidCrystal_I2C.h` includes.
+- Corrected the AS5600 PlatformIO dependency and added the required I2C include.
 - Changed driver ENABLE pins to GPIO16 and GPIO17; explicitly selected I2C GPIO8/GPIO9.
 - Replaced the derivative/integral PID with a small proportional controller: this avoids derivative kick on target changes, keeps normal tracking corrections small, and caps unusually large corrections per control tick.
 - Corrected the Moon and Mars body IDs (Moon=10, Mars=3) and the one-second planetary look-ahead using `Astronomy_AddDays`.
@@ -148,7 +145,7 @@ The `fix/satellite-nextpass-minimum-elevation` branch includes these software ch
 - Added configurable AS5600 zero-angle and direction calibration, and converted encoder readings relative to the calibrated horizontal position.
 - Added magnetic-declination compensation to convert BNO055 magnetic heading to true-north heading (the default declination remains a placeholder that must be configured for the installation site).
 - Corrected satellite next-pass prediction to pass the 20-degree minimum elevation to the proper SGP4 argument and check prediction initialization.
-- Kept rise/set and satellite-pass calculations running even if the optional LCD is absent; only LCD writes are skipped.
+- Removed the physical LCD and its display task. Satellite-pass and planetary rise/set calculations now run in the physics task and remain available through the web telemetry API.
 - Fixed satellite and planetary telemetry population and added the missing planetary set-time field to `/data`.
 - Added HTTP Basic Authentication to the target/location control endpoints, password-protected WiFiManager setup AP, native helper tests, and GitHub Actions build/test jobs.
 
