@@ -297,8 +297,7 @@ const char index_html[] PROGMEM = R"rawliteral(
     
             // altitude label: "km altitude" for sats, "km from Earth" for planets
             document.querySelector('[data-lbl="alt"]').innerText  = isSat ? 'km altitude' : 'km from observer';
-            document.getElementById('alt').innerText = d.alt > 0 ? Math.round(d.alt) : '--';
-    
+            document.getElementById('alt').innerText = d.alt > 0 ? Math.round(d.alt) : '--';    
             // distance label: "km distance" for sats, same "km from Earth" for planets
             document.querySelector('[data-lbl="dist"]').innerText = isSat ? 'km distance'   : 'km from observer';
             document.getElementById('dist').innerText = d.dist > 0 ? Math.round(d.dist) : '--';
@@ -597,8 +596,7 @@ void setup() {
       disableMotors();
   }
 
-  // DisplayTask also calculates next rise/set or satellite pass times.
-  // Keep it running even without an LCD; LCD writes are conditionally skipped.
+  // DisplayTask also calculates next rise/set or satellite pass times.  // Keep it running even without an LCD; LCD writes are conditionally skipped.
   if (xTaskCreatePinnedToCore(DisplayTask, "Display", 5000, NULL, 1, NULL, 0) != pdPASS) {
       Serial.println("WARNING: Display/Pass task creation failed.");
   }
@@ -897,8 +895,7 @@ void MotorTask(void * p) {
       if (!sensorsRead || !isfinite(headingNow) || headingNow < 0.0f ||
           headingNow >= 360.0f || encoderRaw > 4095) {
           disableMotors();
-          resetPIDs();
-          vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(MOTOR_TASK_MS));
+          resetPIDs();          vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(MOTOR_TASK_MS));
           continue;
       }
 
@@ -943,9 +940,13 @@ void DisplayTask(void * p) {
 
           if (target.type == TYPE_SATELLITE && tleReady &&
               xSemaphoreTake(sgp4Mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-              satSgp4.initpredpoint((unsigned long)now, 0.0);
-              passinfo overpass;
-              passValid = satSgp4.nextpass(&overpass, 20);
+              // Search for a pass that reaches at least 20 degrees above the horizon.
+              // The second argument is the search iteration limit, not the elevation.
+              const bool predictionReady =
+                  satSgp4.initpredpoint((unsigned long)now, 0.0);
+              passinfo overpass = {};
+              passValid = predictionReady &&
+                          satSgp4.nextpass(&overpass, 20, false, 20.0);
               if (passValid) {
                   aosTime = (time_t)((overpass.jdstart - 2440587.5) * 86400.0);
                   losTime = (time_t)((overpass.jdstop  - 2440587.5) * 86400.0);
