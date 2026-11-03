@@ -139,6 +139,7 @@ The `fix/satellite-nextpass-minimum-elevation` branch includes these software ch
 - Corrected the Moon and Mars body IDs (Moon=10, Mars=3) and the one-second planetary look-ahead using `Astronomy_AddDays`.
 - Added a TLE fetch/validation step before satellite calculations, serialized access to SGP4, and restored SGP4 to the current epoch after the velocity look-ahead.
 - Protected target, observer/telemetry, I2C, and SGP4 shared state with mutexes and used snapshots between tasks.
+- Replaced the shared calculation-ready boolean with a target/observer generation pair. PhysicsTask publishes readiness atomically with the matching telemetry and motor target; MotorTask verifies both live generations before every bounded motor-step batch.
 - Added bounds checks for observer coordinates, NORAD IDs, and supported planetary bodies; added HTTP response/JSON/TLE validation.
 - Kept motor drivers disabled until time, location, orbital solution (for satellites), and both feedback sensors are ready; runtime motor GPIO writes are now owned exclusively by MotorTask, while other tasks can only request a stop. Sensor/mutex failures and below-horizon targets stop step pulses and disable the drivers. If NTP synchronizes after the startup timeout, the physics task can now resume automatically.
 - Updated the AS5600 read call to the library's actual `rawAngle()` API and use `lastError()` to reject a failed I2C read.
