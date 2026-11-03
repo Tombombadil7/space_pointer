@@ -78,6 +78,38 @@ void test_observer_validation_rejects_non_finite_values() {
     TEST_ASSERT_FALSE(TrackingMath::validObserver(32.0, 34.8, NAN));
 }
 
+
+void test_wrap_angle_keeps_exact_half_turn_boundaries() {
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, 180.0f, TrackingMath::wrapAngle(180.0f));
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, -180.0f, TrackingMath::wrapAngle(-180.0f));
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, 180.0f, TrackingMath::wrapAngle(900.0f));
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, -180.0f, TrackingMath::wrapAngle(-900.0f));
+}
+
+void test_wrap_angle_handles_infinity() {
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, 0.0f, TrackingMath::wrapAngle(INFINITY));
+}
+
+void test_observer_validation_rejects_all_out_of_range_edges() {
+    TEST_ASSERT_FALSE(TrackingMath::validObserver(-90.01, 0.0, 0.0));
+    TEST_ASSERT_FALSE(TrackingMath::validObserver(90.01, 0.0, 0.0));
+    TEST_ASSERT_FALSE(TrackingMath::validObserver(0.0, -180.01, 0.0));
+    TEST_ASSERT_FALSE(TrackingMath::validObserver(0.0, 180.01, 0.0));
+    TEST_ASSERT_FALSE(TrackingMath::validObserver(0.0, 0.0, -500.01));
+    TEST_ASSERT_FALSE(TrackingMath::validObserver(0.0, 0.0, 10000.01));
+}
+
+void test_norad_validation_accepts_exact_range_edges() {
+    TEST_ASSERT_TRUE(TrackingMath::validNoradId(1));
+    TEST_ASSERT_TRUE(TrackingMath::validNoradId(999999));
+    TEST_ASSERT_FALSE(TrackingMath::validNoradId(-1));
+}
+
+void test_proportional_controller_handles_zero_gain_and_zero_step_limit() {
+    TEST_ASSERT_EQUAL_INT(0, TrackingMath::proportionalSteps(0.0f, 0.0f, 5.0f, 8));
+    TEST_ASSERT_EQUAL_INT(0, TrackingMath::proportionalSteps(3.0f, 0.05f, 5.0f, 0));
+}
+
 int main(int argc, char **argv) {
     UNITY_BEGIN();
     RUN_TEST(test_wraps_across_positive_boundary);
@@ -94,5 +126,10 @@ int main(int argc, char **argv) {
     RUN_TEST(test_proportional_controller_ignores_non_finite_error);
     RUN_TEST(test_observer_validation_accepts_documented_boundaries);
     RUN_TEST(test_observer_validation_rejects_non_finite_values);
+    RUN_TEST(test_wrap_angle_keeps_exact_half_turn_boundaries);
+    RUN_TEST(test_wrap_angle_handles_infinity);
+    RUN_TEST(test_observer_validation_rejects_all_out_of_range_edges);
+    RUN_TEST(test_norad_validation_accepts_exact_range_edges);
+    RUN_TEST(test_proportional_controller_handles_zero_gain_and_zero_step_limit);
     return UNITY_END();
 }
