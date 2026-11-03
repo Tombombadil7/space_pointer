@@ -127,7 +127,7 @@ struct MotorTarget { float az = 0; float el = 0; } motorTarget;
 // A narrow deadband filters sensor noise without allowing a large pointing error.
 PController pAz = {2.5f, 0.05f};
 PController pEl = {3.0f, 0.05f};
-SemaphoreHandle_t targetMutex;   // protects current and motorTarget
+SemaphoreHandle_t targetMutex;   // protects current, motorTarget, and calculationReadiness
 SemaphoreHandle_t i2cMutex;      // protects the shared I2C bus
 SemaphoreHandle_t sysMutex;      // protects observer and telemetry state
 SemaphoreHandle_t sgp4Mutex;     // protects the shared SGP4 instance
@@ -288,7 +288,6 @@ void setup() {
       TargetState target = getTargetSnapshot();
       if (target.type == TYPE_SATELLITE) {
           tleReady = false;   // invalidate the old observer's SGP4 state immediately
-          invalidateCalculationReadiness();
           if (!startTLEFetchTask()) {
               r->send(503, "text/plain", "Could not start TLE refresh; motors remain disabled.");
               return;
@@ -985,6 +984,9 @@ bool updateIPLocation() {
         }
     }
     http.end();
+    // Keep this path safe if IP geolocation is ever requested after startup.
+    // The observer generation already rejects stale tokens; clearing is explicit.
+    if (valid) invalidateCalculationReadiness();
     return valid;
 }
 
