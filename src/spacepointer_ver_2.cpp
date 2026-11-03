@@ -44,6 +44,13 @@
 #define STEP_PULSE_US     50      // µs per pulse
 #define MOTOR_TASK_MS     25      // MotorTask period in ms
 #define MAX_STEPS_PER_TICK  80
+
+// Magnetic declination at the physical installation site, in degrees.
+// East is positive; west is negative. Set this using a current magnetic
+// declination model for the telescope's location. The BNO055 reports
+// magnetic-north heading, while Astronomy Engine calculates true-north azimuth.
+// A zero value is only correct where magnetic and true north coincide.
+#define MAGNETIC_DECLINATION_DEG  0.0f
 // Two axes are stepped sequentially; 80 leaves time for task/sensor overhead.
 
 AsyncWebServer server(80);
@@ -297,8 +304,7 @@ const char index_html[] PROGMEM = R"rawliteral(
     
             // altitude label: "km altitude" for sats, "km from Earth" for planets
             document.querySelector('[data-lbl="alt"]').innerText  = isSat ? 'km altitude' : 'km from observer';
-            document.getElementById('alt').innerText = d.alt > 0 ? Math.round(d.alt) : '--';    
-            // distance label: "km distance" for sats, same "km from Earth" for planets
+            document.getElementById('alt').innerText = d.alt > 0 ? Math.round(d.alt) : '--';                // distance label: "km distance" for sats, same "km from Earth" for planets
             document.querySelector('[data-lbl="dist"]').innerText = isSat ? 'km distance'   : 'km from observer';
             document.getElementById('dist').innerText = d.dist > 0 ? Math.round(d.dist) : '--';
     
@@ -597,8 +603,7 @@ void setup() {
   }
 
   // DisplayTask also calculates next rise/set or satellite pass times.  // Keep it running even without an LCD; LCD writes are conditionally skipped.
-  if (xTaskCreatePinnedToCore(DisplayTask, "Display", 5000, NULL, 1, NULL, 0) != pdPASS) {
-      Serial.println("WARNING: Display/Pass task creation failed.");
+  if (xTaskCreatePinnedToCore(DisplayTask, "Display", 5000, NULL, 1, NULL, 0) != pdPASS) {      Serial.println("WARNING: Display/Pass task creation failed.");
   }
 }
 
@@ -898,14 +903,18 @@ void MotorTask(void * p) {
           resetPIDs();          vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(MOTOR_TASK_MS));
           continue;
       }
-
       float elNow = encoderRaw * (360.0f / 4096.0f);
       if (elNow > 180.0f) elNow -= 360.0f;
 
       digitalWrite(AZ_EN_PIN, LOW);
       digitalWrite(EL_EN_PIN, LOW);
 
-      const int azSteps = pidOutput(pidAz, wrapAngle(targetAz - headingNow), DT);
+      // Convert the BNO055 magnetic heading to true north before comparing
+      // it with Astronomy Engine's true-north target azimuth.
+      float headingTrue = fmodf(headingNow + MAGNETIC_DECLINATION_DEG, 360.0f);
+      if (headingTrue < 0.0f) headingTrue += 360.0f;
+
+      const int azSteps = pidOutput(pidAz, wrapAngle(targetAz - headingTrue), DT);
       const int elSteps = pidOutput(pidEl, wrapAngle(targetEl - elNow), DT);
       const bool azFwd = azSteps > 0;
       const bool elFwd = elSteps > 0;
