@@ -435,13 +435,13 @@ void handleSetTarget(httpsserver::HTTPRequest *request,
 
   char *end = nullptr;
   const long type = strtol(typeArgument.c_str(), &end, 10);
-  if (end == typeArgument.c_str() || *end != '\\0' || (type != 0 && type != 1)) {
+  if (end == typeArgument.c_str() || *end != '\0' || (type != 0 && type != 1)) {
     sendHttpResponse(response, 400, "text/plain", "Invalid target type.");
     return;
   }
   end = nullptr;
   const long value = strtol(valueArgument.c_str(), &end, 10);
-  if (end == valueArgument.c_str() || *end != '\\0') {
+  if (end == valueArgument.c_str() || *end != '\0') {
     sendHttpResponse(response, 400, "text/plain", "Invalid target ID.");
     return;
   }
