@@ -102,6 +102,15 @@ struct TargetState {
   char name[25];
 };
 TargetState current = {TYPE_SATELLITE, {.noradID = 25544}, "ISS"};
+// Incremented whenever the selected target changes. PhysicsTask and MotorTask
+// use this version to reject calculations/commands produced for an older target.
+// Access is protected by targetMutex, just like current and motorTarget.
+uint32_t targetGeneration = 1;
+
+struct VersionedTargetSnapshot {
+  TargetState target;
+  uint32_t generation;
+};
 // A deliberately simple proportional controller is enough for slow telescope tracking.
 // It avoids derivative kick and integral wind-up when a new target is selected.
 struct PController {
@@ -150,6 +159,7 @@ bool updateIPLocation();
 void fetchTLE();
 bool startTLEFetchTask();
 TargetState getTargetSnapshot();
+VersionedTargetSnapshot getVersionedTargetSnapshot();
 TelemetrySnapshot getTelemetrySnapshot();
 bool getObserverSnapshot(double &lat, double &lon, double &alt);
 bool parseDoubleArg(AsyncWebServerRequest *request, const char *name, double &value);
@@ -322,6 +332,8 @@ void setup() {
       }
       targetCalculationReady = false;
       current = next;
+      ++targetGeneration;
+      if (targetGeneration == 0) ++targetGeneration; // Reserve zero for an invalid snapshot.
       motorTarget.az = 0;
       motorTarget.el = 0;
       xSemaphoreGive(targetMutex);
@@ -411,13 +423,20 @@ void loop() {
 
 
 
-TargetState getTargetSnapshot() {
-  TargetState result = {};
+VersionedTargetSnapshot getVersionedTargetSnapshot() {
+  VersionedTargetSnapshot result = {};
   if (targetMutex != NULL && xSemaphoreTake(targetMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-      result = current;
+      result.target = current;
+      result.generation = targetGeneration;
       xSemaphoreGive(targetMutex);
   }
+  // A zero generation means the mutex could not be acquired; callers must
+  // treat that snapshot as unavailable instead of calculating with defaults.
   return result;
+}
+
+TargetState getTargetSnapshot() {
+  return getVersionedTargetSnapshot().target;
 }
 
 TelemetrySnapshot getTelemetrySnapshot() {
@@ -552,7 +571,14 @@ void PhysicsTask(void * p) {
           continue;
       }
 
-      const TargetState target = getTargetSnapshot();
+      const VersionedTargetSnapshot targetSnapshot = getVersionedTargetSnapshot();
+      if (targetSnapshot.generation == 0) {
+          targetCalculationReady = false;
+          vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(500));
+          continue;
+      }
+      const TargetState target = targetSnapshot.target;
+      const uint32_t calculationGeneration = targetSnapshot.generation;
       double lat, lon, alt;
       if (!getObserverSnapshot(lat, lon, alt)) {
           targetCalculationReady = false;
@@ -650,39 +676,31 @@ void PhysicsTask(void * p) {
           }
       }
 
-      const TargetState latestTarget = getTargetSnapshot();
-      const bool sameTarget = latestTarget.type == target.type &&
-          ((target.type == TYPE_SATELLITE && latestTarget.noradID == target.noradID) ||
-           (target.type == TYPE_PLANET && latestTarget.body == target.body));
+      bool resultCommitted = false;
+      if (calculationOK &&
+          xSemaphoreTake(targetMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+          // Keep targetMutex while committing both telemetry and motor target.
+          // A target change cannot slip between the generation check and write.
+          if (targetGeneration == calculationGeneration) {
+              if (xSemaphoreTake(sysMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+                  sys.targetAz = targetAz;
+                  sys.targetEl = targetEl;
+                  sys.satLat = satLat;
+                  sys.satLon = satLon;
+                  sys.satSpeed = satSpeed;
+                  sys.satAltKm = satAltKm;
+                  sys.satDist = satDist;
+                  xSemaphoreGive(sysMutex);
 
-      if (calculationOK && sameTarget &&
-          xSemaphoreTake(sysMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-          sys.targetAz = targetAz;
-          sys.targetEl = targetEl;
-          sys.satLat = satLat;
-          sys.satLon = satLon;
-          sys.satSpeed = satSpeed;
-          sys.satAltKm = satAltKm;
-          sys.satDist = satDist;
-          xSemaphoreGive(sysMutex);
-
-          bool motorTargetWritten = false;
-          if (xSemaphoreTake(targetMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-              const bool stillSelected =
-                  current.type == target.type &&
-                  ((target.type == TYPE_SATELLITE && current.noradID == target.noradID) ||
-                   (target.type == TYPE_PLANET && current.body == target.body));
-              if (stillSelected) {
                   motorTarget.az = (float)targetAz;
                   motorTarget.el = (float)targetEl;
-                  motorTargetWritten = true;
+                  resultCommitted = true;
               }
-              xSemaphoreGive(targetMutex);
           }
-          targetCalculationReady = motorTargetWritten;
-      } else {
-          targetCalculationReady = false;
+          xSemaphoreGive(targetMutex);
       }
+      // Never mark a result ready unless it was committed for the current target.
+      targetCalculationReady = resultCommitted;
 
       vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(500));
   }
@@ -699,8 +717,10 @@ void MotorTask(void * p) {
       float targetAz = 0.0f, targetEl = 0.0f;
       TargetState activeTarget = {};
       bool targetRead = false;
+      uint32_t activeGeneration = 0;
       if (xSemaphoreTake(targetMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
           activeTarget = current;
+          activeGeneration = targetGeneration;
           targetAz = motorTarget.az;
           targetEl = motorTarget.el;
           targetRead = true;
@@ -788,9 +808,34 @@ void MotorTask(void * p) {
       const int elN = abs(elSteps);
       const int maxN = max(azN, elN);
 
-      for (int i = 0; i < maxN; i++) {
-          if (i < azN) stepMotor(AZ_STEP_PIN, AZ_DIR_PIN, azFwd);
-          if (i < elN) stepMotor(EL_STEP_PIN, EL_DIR_PIN, elFwd);
+      // Revalidate immediately before touching the motors. Keep targetMutex
+      // for this short, bounded step batch so a new target cannot be selected
+      // halfway through executing a command from the previous target.
+      if (xSemaphoreTake(targetMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+          const bool commandStillCurrent =
+              targetGeneration == activeGeneration && targetCalculationReady &&
+              !motorStopRequested;
+          if (commandStillCurrent) {
+              if (!driversEnabled) {
+                  digitalWrite(AZ_EN_PIN, LOW);
+                  digitalWrite(EL_EN_PIN, LOW);
+                  driversEnabled = true;
+              }
+              for (int i = 0; i < maxN; i++) {
+                  if (i < azN) stepMotor(AZ_STEP_PIN, AZ_DIR_PIN, azFwd);
+                  if (i < elN) stepMotor(EL_STEP_PIN, EL_DIR_PIN, elFwd);
+              }
+          } else if (driversEnabled) {
+              digitalWrite(AZ_EN_PIN, HIGH);
+              digitalWrite(EL_EN_PIN, HIGH);
+              driversEnabled = false;
+          }
+          xSemaphoreGive(targetMutex);
+      } else if (driversEnabled) {
+          // If we cannot verify the command's generation, fail safe and stop.
+          digitalWrite(AZ_EN_PIN, HIGH);
+          digitalWrite(EL_EN_PIN, HIGH);
+          driversEnabled = false;
       }
       vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(MOTOR_TASK_MS));
   }
