@@ -45,7 +45,7 @@
 #define MOTOR_TASK_MS     25      // MotorTask period in ms
 // Absolute per-tick limit for an unexpected large correction.
 // Normal tracking corrections should be much smaller; this is not an acceleration ramp.
-#define MAX_STEPS_PER_TICK  80
+#define MAX_STEPS_PER_TICK  8
 
 // Magnetic declination at the physical installation site, in degrees.
 // East is positive; west is negative. Set this using a current magnetic
