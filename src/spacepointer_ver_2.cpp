@@ -8,6 +8,14 @@
  * - IMU BNO055 Compensation (Yaw & Pitch) 
  */
 
+// The TLS compatibility server includes its own WebServer-compatible API.
+// WiFiManager normally includes Arduino's WebServer.h, whose HTTPUploadStatus,
+// HTTPClientStatus and HTTPAuthMethod enums collide with the compatibility
+// server's declarations. Reuse the compatible ESPWebServer class for the
+// temporary Wi-Fi captive portal too, avoiding two conflicting definitions.
+#include <ESPWebServer.hpp>
+using WebServer = ESPWebServer;
+#define WEBSERVER_H
 #include <WiFiManager.h>
 #include <Wire.h>
 #include <math.h>
@@ -767,13 +775,13 @@ int createSpacePointerCertificate(httpsserver::SSLCert &certContext) {
     result = mbedtls_x509write_crt_set_extension(
         &certificateWriter, MBEDTLS_OID_SUBJECT_ALT_NAME,
         MBEDTLS_OID_SIZE(MBEDTLS_OID_SUBJECT_ALT_NAME),
-        subjectAltName, sizeof(subjectAltName), 0);
+        0, subjectAltName, sizeof(subjectAltName));
   }
 
 #if MBEDTLS_VERSION_NUMBER >= 0x03000000
   if (result == 0) {
     // The RSA key is unique per device; this serial identifies the local certificate.
-    const unsigned char serial[] = {0x53, 0x50, 0x32, 0x30, 0x32, 0x36};
+    unsigned char serial[] = {0x53, 0x50, 0x32, 0x30, 0x32, 0x36};
     result = mbedtls_x509write_crt_set_serial_raw(&certificateWriter, serial, sizeof(serial));
   }
 #else
