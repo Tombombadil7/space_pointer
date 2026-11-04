@@ -4,7 +4,6 @@
 #include <stdint.h>
 #include <errno.h>
 #include <stdlib.h>
-#include <string.h>
 
 namespace TrackingMath {
 
@@ -166,40 +165,6 @@ inline bool validObserver(double latitude, double longitude, double altitudeMete
 
 inline bool validNoradId(long noradId) {
     return noradId >= 1 && noradId <= 999999;
-}
-
-/* Validate the two fixed-width TLE lines against their embedded checksums
- * and the requested five-digit NORAD catalog number.
- */
-inline bool validTleChecksum(const char *line) {
-    if (line == NULL || strlen(line) < 69 ||
-        line[68] < '0' || line[68] > '9') return false;
-
-    int sum = 0;
-    for (int i = 0; i < 68; ++i) {
-        if (line[i] >= '0' && line[i] <= '9') sum += line[i] - '0';
-        else if (line[i] == '-') ++sum;
-    }
-    return sum % 10 == line[68] - '0';
-}
-
-inline bool validTlePair(const char *line1, const char *line2,
-                         long expectedNoradId) {
-    if (!validNoradId(expectedNoradId) || line1 == NULL || line2 == NULL ||
-        line1[0] != '1' || line2[0] != '2' ||
-        !validTleChecksum(line1) || !validTleChecksum(line2)) {
-        return false;
-    }
-
-    long line1Id = 0;
-    long line2Id = 0;
-    for (int i = 2; i <= 6; ++i) {
-        if (line1[i] < '0' || line1[i] > '9' ||
-            line2[i] < '0' || line2[i] > '9') return false;
-        line1Id = line1Id * 10 + line1[i] - '0';
-        line2Id = line2Id * 10 + line2[i] - '0';
-    }
-    return line1Id == line2Id && line1Id == expectedNoradId;
 }
 
 inline bool supportedPlanetBody(int body) {
