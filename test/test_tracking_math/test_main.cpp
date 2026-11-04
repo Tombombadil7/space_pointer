@@ -150,6 +150,25 @@ void test_generation_readiness_republish_replaces_both_generations() {
     TEST_ASSERT_TRUE(readiness.matches(3, 4));
 }
 
+
+/*
+ * TLE data is tied to both the selected satellite and the observer location.
+ * These tests model the checks used before SGP4 calculations are allowed.
+ */
+void test_tle_source_token_rejects_a_new_target_generation() {
+    TrackingMath::GenerationReadiness tleSource;
+    tleSource.publish(12, 4);
+    TEST_ASSERT_TRUE(tleSource.matches(12, 4));
+    TEST_ASSERT_FALSE(tleSource.matches(13, 4));
+}
+
+void test_tle_source_token_rejects_a_new_observer_generation() {
+    TrackingMath::GenerationReadiness tleSource;
+    tleSource.publish(12, 4);
+    TEST_ASSERT_TRUE(tleSource.matches(12, 4));
+    TEST_ASSERT_FALSE(tleSource.matches(12, 5));
+}
+
 int main(int argc, char **argv) {
     UNITY_BEGIN();
     RUN_TEST(test_wraps_across_positive_boundary);
@@ -176,5 +195,7 @@ int main(int argc, char **argv) {
     RUN_TEST(test_generation_readiness_clear_invalidates_previous_pair);
     RUN_TEST(test_generation_readiness_rejects_zero_generations);
     RUN_TEST(test_generation_readiness_republish_replaces_both_generations);
+    RUN_TEST(test_tle_source_token_rejects_a_new_target_generation);
+    RUN_TEST(test_tle_source_token_rejects_a_new_observer_generation);
     return UNITY_END();
 }
