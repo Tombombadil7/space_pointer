@@ -76,7 +76,7 @@ const char index_html[] PROGMEM = R"rawliteral(
              The map and all target/location controls remain visible and usable. -->
         <div id="telemetry-error" role="status" aria-live="polite"
              style="display:none; color:#ff7675; padding:18px 8px;">
-          Telemetry temporarily unavailable. Please retry.
+          Telemetry is updating for the selected target or location, or is temporarily unavailable. Please wait.
         </div>
         <div id="telemetry-content">
           <p id="target-name">---</p>
