@@ -796,29 +796,16 @@ void PhysicsTask(void * p) {
                   astro_horizon_t hor1 = Astronomy_Horizon(
                       &aTime, obs, equ1.ra, equ1.dec, REFRACTION_NORMAL);
 
-                  astro_time_t aTime2 = Astronomy_AddDays(aTime, 1.0 / 86400.0);
-                  astro_equatorial_t equ2 = Astronomy_Equator(
-                      (astro_body_t)target.body, &aTime2, obs,
-                      EQUATOR_OF_DATE, ABERRATION);
-                  if (equ2.status == ASTRO_SUCCESS) {
-                      astro_horizon_t hor2 = Astronomy_Horizon(
-                          &aTime2, obs, equ2.ra, equ2.dec, REFRACTION_NORMAL);
+                  const double distanceKm = equ1.dist * 149597870.7;
 
-                      const double distanceKm = equ1.dist * 149597870.7;
-                      const double dDistance = (equ2.dist - equ1.dist) * 149597870.7;
-                      const double dAz = TrackingMath::wrapAngle((float)(hor2.azimuth - hor1.azimuth)) *
-                                         DEG_TO_RAD * distanceKm;
-                      const double dEl = (hor2.altitude - hor1.altitude) *
-                                         DEG_TO_RAD * distanceKm;
-
-                      targetAz = hor1.azimuth;
-                      targetEl = hor1.altitude;
-                      satSpeed = sqrt(dAz*dAz + dEl*dEl + dDistance*dDistance);
-                      satAltKm = distanceKm;
-                      satDist = distanceKm;
-                      calculationOK = isfinite(targetAz) && isfinite(targetEl) &&
-                                      isfinite(satSpeed) && isfinite(distanceKm);
-                  }
+                  targetAz = hor1.azimuth;
+                  targetEl = hor1.altitude;
+                  // Planetary speed is intentionally not calculated; the UI
+                  // marks this field as unavailable for non-satellite targets.
+                  satAltKm = distanceKm;
+                  satDist = distanceKm;
+                  calculationOK = isfinite(targetAz) && isfinite(targetEl) &&
+                                  isfinite(distanceKm);
               }
 
           }
