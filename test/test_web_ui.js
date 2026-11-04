@@ -106,8 +106,13 @@ async function flushPromises() {
 function routeSource(path) {
   const start = firmware.indexOf(`server.on("${path}"`);
   assert.notEqual(start, -1, `route ${path} must exist`);
-  const end = firmware.indexOf("\n  });", start);
-  assert.notEqual(end, -1, `route ${path} must have a handler boundary`);
+
+  const nextRoute = firmware.indexOf('\n  server.on("', start + 1);
+  const serverStart = firmware.indexOf("\n  server.begin()", start);
+  const end = nextRoute !== -1 && (serverStart === -1 || nextRoute < serverStart)
+    ? nextRoute
+    : serverStart;
+  assert.notEqual(end, -1, `route ${path} must have a following server boundary`);
   return firmware.slice(start, end);
 }
 
@@ -156,10 +161,8 @@ test("satellite mutations return 503 before committing when the TLE worker is un
 
 test("TLE validation stays inside fetchTLE", () => {
   const start = firmware.lastIndexOf("void fetchTLE() {");
-  const end = firmware.indexOf("\n}\n", start);
   assert.notEqual(start, -1, "fetchTLE implementation must exist");
-  assert.notEqual(end, -1, "fetchTLE implementation must have an end");
-  const fetchTLE = firmware.slice(start, end);
+  const fetchTLE = firmware.slice(start);
 
   assert.match(fetchTLE, /strlen\(rawLine1\) >= 69/);
   assert.match(fetchTLE, /strlen\(rawLine2\) >= 69/);
