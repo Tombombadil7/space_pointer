@@ -1,6 +1,7 @@
 #include <unity.h>
 #include <math.h>
 #include "tracking_math.h"
+#include <astronomy.h>
 
 void test_wraps_across_positive_boundary() {
     TEST_ASSERT_FLOAT_WITHIN(0.001f, -179.0f, TrackingMath::wrapAngle(181.0f));
@@ -233,8 +234,80 @@ void test_pass_prediction_source_pair_is_independent() {
     TEST_ASSERT_TRUE(passSource.matches(8, 10));
 }
 
+
+/*
+ * Exercise the actual Astronomy Engine library used by the firmware, not a
+ * reimplementation of its equations. Equatorial-to-horizon results must stay
+ * finite and within their documented angular ranges for every supported body.
+ */
+void assert_valid_planet_horizon(astro_body_t body) {
+    astro_time_t time = Astronomy_MakeTime(2024, 4, 8, 18, 0, 0.0);
+    const astro_observer_t observer = {0.0, 0.0, 0.0};
+    const astro_equatorial_t equ = Astronomy_Equator(
+        body, &time, observer, EQUATOR_OF_DATE, ABERRATION);
+    TEST_ASSERT_EQUAL_INT(ASTRO_SUCCESS, equ.status);
+    TEST_ASSERT_TRUE(isfinite(equ.ra));
+    TEST_ASSERT_TRUE(isfinite(equ.dec));
+    TEST_ASSERT_TRUE(isfinite(equ.dist));
+    TEST_ASSERT_TRUE(equ.ra >= 0.0 && equ.ra < 24.0);
+    TEST_ASSERT_TRUE(equ.dec >= -90.0 && equ.dec <= 90.0);
+    TEST_ASSERT_TRUE(equ.dist > 0.0);
+
+    const astro_horizon_t horizon = Astronomy_Horizon(
+        &time, observer, equ.ra, equ.dec, REFRACTION_NORMAL);
+    TEST_ASSERT_TRUE(isfinite(horizon.azimuth));
+    TEST_ASSERT_TRUE(isfinite(horizon.altitude));
+    TEST_ASSERT_TRUE(horizon.azimuth >= 0.0 && horizon.azimuth < 360.0);
+    TEST_ASSERT_TRUE(horizon.altitude >= -90.0 && horizon.altitude <= 90.0);
+}
+
+void test_astronomy_engine_supported_bodies_produce_valid_horizon_coordinates() {
+    assert_valid_planet_horizon(BODY_MOON);
+    assert_valid_planet_horizon(BODY_MARS);
+    assert_valid_planet_horizon(BODY_JUPITER);
+    assert_valid_planet_horizon(BODY_SATURN);
+}
+
+/*
+ * Reproduce the firmware's sequential rise-then-set search at the equator.
+ * This catches invalid event status and reversed/equal event timestamps using
+ * the real ephemeris and rise/set search implementation.
+ */
+void assert_chronological_planet_rise_set(astro_body_t body) {
+    const astro_time_t start = Astronomy_MakeTime(2024, 4, 8, 0, 0, 0.0);
+    const astro_observer_t observer = {0.0, 0.0, 0.0};
+    const astro_search_result_t rise = Astronomy_SearchRiseSet(
+        body, observer, DIRECTION_RISE, start, 1.0);
+    TEST_ASSERT_EQUAL_INT(ASTRO_SUCCESS, rise.status);
+
+    const astro_time_t afterRise = Astronomy_AddDays(rise.time, 1.0 / 86400.0);
+    const astro_search_result_t set = Astronomy_SearchRiseSet(
+        body, observer, DIRECTION_SET, afterRise, 1.0);
+    TEST_ASSERT_EQUAL_INT(ASTRO_SUCCESS, set.status);
+    TEST_ASSERT_TRUE(TrackingMath::chronologicalEventPair(
+        rise.time.ut, set.time.ut));
+}
+
+void test_astronomy_engine_rise_set_search_is_chronological_for_supported_bodies() {
+    assert_chronological_planet_rise_set(BODY_MOON);
+    assert_chronological_planet_rise_set(BODY_MARS);
+    assert_chronological_planet_rise_set(BODY_JUPITER);
+    assert_chronological_planet_rise_set(BODY_SATURN);
+}
+
+/* Verify the J2000-to-Unix conversion constant used by firmware pass times. */
+void test_astronomy_unix_epoch_conversion_matches_utc_epoch() {
+    const astro_time_t unixEpoch = Astronomy_MakeTime(1970, 1, 1, 0, 0, 0.0);
+    const double unixSeconds = unixEpoch.ut * 86400.0 + 946728000.0;
+    TEST_ASSERT_TRUE(fabs(unixSeconds) <= 1.0);
+}
+
+
 int main(int argc, char **argv) {
     UNITY_BEGIN();
+    RUN_TEST(test_astronomy_engine_supported_bodies_produce_valid_horizon_coordinates);
+    RUN_TEST(test_astronomy_engine_rise_set_search_is_chronological_for_supported_bodies);
+    RUN_TEST(test_astronomy_unix_epoch_conversion_matches_utc_epoch);
     RUN_TEST(test_wraps_across_positive_boundary);
     RUN_TEST(test_wraps_across_negative_boundary);
     RUN_TEST(test_full_revolution_is_zero);
