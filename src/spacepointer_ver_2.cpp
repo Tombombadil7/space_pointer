@@ -183,6 +183,8 @@ bool getVersionedTelemetrySnapshot(TargetState &target, TelemetrySnapshot &snaps
 bool getVersionedObserverSnapshot(double &lat, double &lon, double &alt,
                                   uint32_t &generation);
 bool parseDoubleArg(AsyncWebServerRequest *request, const char *name, double &value);
+// Require a non-simple custom header on state-changing requests to block browser CSRF.
+bool hasValidMutationRequest(AsyncWebServerRequest *request);
 void disableMotors();
 // Clear readiness after releasing sysMutex; never acquire targetMutex from sysMutex.
 void invalidateCalculationReadiness();
@@ -271,9 +273,13 @@ void setup() {
       r->send(200, "text/html", index_html);
   });
 
-  server.on("/updateLoc", HTTP_GET, [](AsyncWebServerRequest *r){
+  server.on("/updateLoc", HTTP_POST, [](AsyncWebServerRequest *r){
       if (!r->authenticate(CONTROL_USER, CONTROL_PASSWORD)) {
           r->requestAuthentication();
+          return;
+      }
+      if (!hasValidMutationRequest(r)) {
+          r->send(403, "text/plain", "Forbidden: missing same-origin request header.");
           return;
       }
       double lat, lon, alt;
@@ -305,9 +311,13 @@ void setup() {
       r->send(202, "text/plain", "Location accepted.");
   });
 
-  server.on("/set", HTTP_GET, [](AsyncWebServerRequest *r){
+  server.on("/set", HTTP_POST, [](AsyncWebServerRequest *r){
       if (!r->authenticate(CONTROL_USER, CONTROL_PASSWORD)) {
           r->requestAuthentication();
+          return;
+      }
+      if (!hasValidMutationRequest(r)) {
+          r->send(403, "text/plain", "Forbidden: missing same-origin request header.");
           return;
       }
       if (!r->hasArg("type") || !r->hasArg("val")) {
@@ -543,6 +553,13 @@ bool getVersionedObserverSnapshot(double &lat, double &lon, double &alt,
   xSemaphoreGive(sysMutex);
 
   return generation != 0 && TrackingMath::validObserver(lat, lon, alt);
+}
+
+bool hasValidMutationRequest(AsyncWebServerRequest *request) {
+  // Cross-origin HTML forms cannot set this custom header. Cross-origin fetch
+  // requests must pass a CORS preflight, which this device does not enable.
+  return request->hasHeader("X-SpacePointer-Request") &&
+         request->getHeader("X-SpacePointer-Request")->value() == "1";
 }
 
 bool parseDoubleArg(AsyncWebServerRequest *request, const char *name, double &value) {
