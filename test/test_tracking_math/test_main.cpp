@@ -472,8 +472,17 @@ void test_motor_sensor_sample_rejects_missing_or_invalid_sensor_data() {
 }
 
 
+
+void test_proportional_controller_preserves_float_rounding_for_normal_inputs() {
+    const float floatProduct = 2.5f * 0.2f;
+    TEST_ASSERT_EQUAL_INT((int)lroundf(floatProduct),
+                          TrackingMath::proportionalSteps(2.5f, 0.0f, 0.2f, 8));
+}
+
+
 int main(int argc, char **argv) {
     UNITY_BEGIN();
+    RUN_TEST(test_proportional_controller_preserves_float_rounding_for_normal_inputs);
     RUN_TEST(test_motor_readiness_requires_all_prerequisites_and_satellite_tle);
     RUN_TEST(test_motor_sensor_sample_accepts_calibrated_valid_boundaries);
     RUN_TEST(test_motor_sensor_sample_rejects_missing_or_invalid_sensor_data);
