@@ -13,11 +13,11 @@ namespace TrackingMath {
  * Reject partial strings, range errors, and non-finite floating-point values.
  */
 inline bool parseFiniteDouble(const char *text, double &value) {
-    if (text == NULL || *text == '\\0') return false;
+    if (text == NULL || *text == '\0') return false;
     errno = 0;
     char *end = NULL;
     const double parsed = strtod(text, &end);
-    if (end == text || *end != '\\0' || errno == ERANGE || !isfinite(parsed)) {
+    if (end == text || *end != '\0' || errno == ERANGE || !isfinite(parsed)) {
         return false;
     }
     value = parsed;
@@ -25,11 +25,11 @@ inline bool parseFiniteDouble(const char *text, double &value) {
 }
 
 inline bool parseLongInteger(const char *text, long &value) {
-    if (text == NULL || *text == '\\0') return false;
+    if (text == NULL || *text == '\0') return false;
     errno = 0;
     char *end = NULL;
     const long parsed = strtol(text, &end, 10);
-    if (end == text || *end != '\\0' || errno == ERANGE) return false;
+    if (end == text || *end != '\0' || errno == ERANGE) return false;
     value = parsed;
     return true;
 }
