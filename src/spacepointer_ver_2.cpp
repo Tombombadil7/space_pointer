@@ -947,8 +947,46 @@ void fetchTLE() {
                 const char *rawLine1 = doc["line1"].as<const char *>();
                 const char *rawLine2 = doc["line2"].as<const char *>();
 
-                if (!error && TrackingMath::validTlePair(
-                        rawLine1, rawLine2, requested.target.noradID)) {
+                bool validTle = !error && rawLine1 != nullptr &&
+                                rawLine2 != nullptr && strlen(rawLine1) >= 69 &&
+                                strlen(rawLine2) >= 69 &&
+                                rawLine1[0] == '1' && rawLine2[0] == '2';
+
+                if (validTle) {
+                    int checksum1 = 0;
+                    int checksum2 = 0;
+                    for (int i = 0; i < 68; ++i) {
+                        if (rawLine1[i] >= '0' && rawLine1[i] <= '9')
+                            checksum1 += rawLine1[i] - '0';
+                        else if (rawLine1[i] == '-') ++checksum1;
+
+                        if (rawLine2[i] >= '0' && rawLine2[i] <= '9')
+                            checksum2 += rawLine2[i] - '0';
+                        else if (rawLine2[i] == '-') ++checksum2;
+                    }
+                    validTle = rawLine1[68] >= '0' && rawLine1[68] <= '9' &&
+                               rawLine2[68] >= '0' && rawLine2[68] <= '9' &&
+                               checksum1 % 10 == rawLine1[68] - '0' &&
+                               checksum2 % 10 == rawLine2[68] - '0';
+                }
+
+                long line1Norad = 0;
+                long line2Norad = 0;
+                if (validTle) {
+                    for (int i = 2; i <= 6; ++i) {
+                        if (rawLine1[i] < '0' || rawLine1[i] > '9' ||
+                            rawLine2[i] < '0' || rawLine2[i] > '9') {
+                            validTle = false;
+                            break;
+                        }
+                        line1Norad = line1Norad * 10 + rawLine1[i] - '0';
+                        line2Norad = line2Norad * 10 + rawLine2[i] - '0';
+                    }
+                    validTle = validTle && line1Norad == line2Norad &&
+                               line1Norad == requested.target.noradID;
+                }
+
+                if (validTle) {
                     char line1[71] = {};
                     char line2[71] = {};
                     strlcpy(line1, rawLine1, sizeof(line1));
