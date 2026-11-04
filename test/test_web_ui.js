@@ -126,7 +126,7 @@ test("firmware mutation endpoints require POST, authentication, and CSRF header"
 test("firmware telemetry endpoint remains read-only GET", () => {
   const route = routeSource("/data");
   assert.match(route, /HTTP_GET/);
-  assert.match(route, /getVersionedTelemetrySnapshot\(target, data\)/);
+  assert.match(route, /getTelemetrySnapshot\(target, data\)/);
   assert.match(route, /r->send\(503/);
   assert.match(route, /application\/json/);
 });
@@ -241,4 +241,32 @@ test("planet telemetry displays speed as unavailable, not zero", async () => {
   assert.equal(h.label('[data-lbl="speed"]').innerText, "not calculated");
   assert.equal(h.label('[data-lbl="pass"]').innerText, "Rises at");
   assert.equal(h.label('[data-lbl="lose"]').innerText, "Sets at");
+});
+
+test("firmware system state uses one mutex and one configuration generation", () => {
+  assert.match(firmware, /SemaphoreHandle_t stateMutex/);
+  assert.doesNotMatch(
+    firmware,
+    /\\b(?:targetMutex|sysMutex|targetGeneration|observerGeneration|GenerationReadiness|telemetrySourceVersions|passSourceVersions|calculationReadiness|tleSourceVersions)\\b/
+  );
+  assert.match(firmware, /systemReadiness\\.invalidate\\(\\)/);
+  assert.match(routeSource("/set"), /advanceConfigurationLocked\\(\\)/);
+  assert.match(routeSource("/updateLoc"), /advanceConfigurationLocked\\(\\)/);
+});
+
+test("motor stop requests use a latched task notification, not a shared bool", () => {
+  const stopStart = firmware.indexOf("void disableMotors() {");
+  const stopEnd = firmware.indexOf("\\n}", stopStart);
+  assert.notEqual(stopStart, -1);
+  assert.notEqual(stopEnd, -1);
+  const disableFunction = firmware.slice(stopStart, stopEnd + 2);
+  assert.match(disableFunction, /xTaskNotify\\(motorTaskHandle, MOTOR_STOP_NOTIFICATION, eSetBits\\)/);
+
+  const motorStart = firmware.indexOf("void MotorTask(void * p) {");
+  const motorEnd = firmware.indexOf("void stepMotor(", motorStart);
+  assert.notEqual(motorStart, -1);
+  assert.notEqual(motorEnd, -1);
+  const motorTask = firmware.slice(motorStart, motorEnd);
+  assert.match(motorTask, /xTaskNotifyWait\\(0, MOTOR_STOP_NOTIFICATION/);
+  assert.doesNotMatch(firmware, /volatile bool motorStopRequested/);
 });
