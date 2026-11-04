@@ -149,6 +149,7 @@ void test_proportional_controller_handles_zero_gain_and_zero_step_limit() {
 void test_configuration_readiness_starts_invalid() {
     TrackingMath::ConfigurationReadiness state;
     TEST_ASSERT_EQUAL_UINT32(1, state.generation);
+    TEST_ASSERT_FALSE(state.locationReady);
     TEST_ASSERT_FALSE(state.tleReady);
     TEST_ASSERT_FALSE(state.calculationReady);
     TEST_ASSERT_FALSE(state.passReady);
@@ -160,9 +161,11 @@ void test_configuration_change_increments_one_generation_and_clears_results() {
     TEST_ASSERT_TRUE(state.publishTle(previous));
     TEST_ASSERT_TRUE(state.publishCalculation(previous));
     TEST_ASSERT_TRUE(state.publishPass(previous));
+    state.locationReady = true;
 
     state.invalidate();
     TEST_ASSERT_EQUAL_UINT32(previous + 1, state.generation);
+    TEST_ASSERT_TRUE(state.locationReady);
     TEST_ASSERT_FALSE(state.isCurrent(previous));
     TEST_ASSERT_FALSE(state.tleReady);
     TEST_ASSERT_FALSE(state.calculationReady);
