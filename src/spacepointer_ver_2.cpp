@@ -274,7 +274,6 @@ void setup() {
       const TargetState target = current;
       xSemaphoreGive(stateMutex);
       if (target.type == TYPE_SATELLITE) {
-          tleReady = false;   // invalidate the old observer's SGP4 state immediately
           if (!startTLEFetchTask()) {
               r->send(503, "text/plain", "Could not start TLE refresh; motors remain disabled.");
               return;
