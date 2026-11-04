@@ -633,21 +633,17 @@ void PhysicsTask(void * p) {
 
   for (;;) {
       const ConfigurationSnapshot snapshot = getConfigurationSnapshot();
+      time_t now = 0;
+      time(&now);
       if (snapshot.generation == 0 || !snapshot.locationReady ||
           !TrackingMath::validObserver(snapshot.lat, snapshot.lon, snapshot.alt) ||
-          !isTimeReady()) {
+          now < 1000000000) {
           vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(500));
           continue;
       }
 
       const TargetState &target = snapshot.target;
       const uint32_t generation = snapshot.generation;
-      time_t now = 0;
-      time(&now);
-      if (now < 1000000000) {
-          vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(500));
-          continue;
-      }
 
       static uint32_t lastPassCalc = 0;
       if (millis() - lastPassCalc > 30000) {
@@ -894,8 +890,7 @@ bool updateIPLocation() {
         if (!error && doc["status"] == "success") {
             const double lat = doc["lat"] | NAN;
             const double lon = doc["lon"] | NAN;
-            if (isfinite(lat) && isfinite(lon) && lat >= -90.0 &&
-                lat <= 90.0 && lon >= -180.0 && lon <= 180.0) {
+            if (TrackingMath::validObserver(lat, lon, 50.0)) {
                 if (stateMutex != NULL &&
                     xSemaphoreTake(stateMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
                     sys.lat = lat;
@@ -922,7 +917,7 @@ void fetchTLE() {
     if (requested.generation != 0 &&
         requested.target.type == TYPE_SATELLITE &&
         TrackingMath::validObserver(requested.lat, requested.lon, requested.alt) &&
-        requested.target.noradID > 0) {
+        TrackingMath::validNoradId(requested.target.noradID)) {
         HTTPClient http;
         http.setTimeout(12000);
         const String url = "https://tle.ivanstanojevic.me/api/tle/" +
