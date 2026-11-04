@@ -169,6 +169,36 @@ void test_tle_source_token_rejects_a_new_observer_generation() {
     TEST_ASSERT_FALSE(tleSource.matches(12, 5));
 }
 
+
+/*
+ * The web API keeps pointing/position telemetry and pass predictions on
+ * separate generation pairs because pass calculations run less frequently.
+ */
+void test_telemetry_source_pair_rejects_old_target_or_observer() {
+    TrackingMath::GenerationReadiness telemetrySource;
+    telemetrySource.publish(20, 30);
+    TEST_ASSERT_TRUE(telemetrySource.matches(20, 30));
+    TEST_ASSERT_FALSE(telemetrySource.matches(21, 30));
+    TEST_ASSERT_FALSE(telemetrySource.matches(20, 31));
+}
+
+void test_pass_prediction_source_pair_is_independent() {
+    TrackingMath::GenerationReadiness telemetrySource;
+    TrackingMath::GenerationReadiness passSource;
+    telemetrySource.publish(8, 9);
+    passSource.publish(8, 9);
+
+    // A fresh pointing update does not make an old pass prediction current.
+    telemetrySource.publish(8, 10);
+    TEST_ASSERT_TRUE(telemetrySource.matches(8, 10));
+    TEST_ASSERT_FALSE(passSource.matches(8, 10));
+
+    // Once the pass calculation catches up, both groups describe the same
+    // selected target and observer location.
+    passSource.publish(8, 10);
+    TEST_ASSERT_TRUE(passSource.matches(8, 10));
+}
+
 int main(int argc, char **argv) {
     UNITY_BEGIN();
     RUN_TEST(test_wraps_across_positive_boundary);
@@ -197,5 +227,7 @@ int main(int argc, char **argv) {
     RUN_TEST(test_generation_readiness_republish_replaces_both_generations);
     RUN_TEST(test_tle_source_token_rejects_a_new_target_generation);
     RUN_TEST(test_tle_source_token_rejects_a_new_observer_generation);
+    RUN_TEST(test_telemetry_source_pair_rejects_old_target_or_observer);
+    RUN_TEST(test_pass_prediction_source_pair_is_independent);
     return UNITY_END();
 }
