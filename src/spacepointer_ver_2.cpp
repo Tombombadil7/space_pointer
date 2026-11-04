@@ -633,14 +633,25 @@ void updateNextPass(const TargetState &target, uint32_t targetVersion,
                 utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday,
                 utc.tm_hour, utc.tm_min, (double)utc.tm_sec);
             const astro_observer_t observer = {lat, lon, alt};
+            // Find the next rise first, then search for the set after that rise.
+            // Independent searches can pair tomorrow's rise with today's set
+            // when the object is already above the horizon. Sequential searches
+            // keep the displayed pair chronological without calculating the
+            // object's current altitude or sky position separately.
             const astro_search_result_t rise = Astronomy_SearchRiseSet(
                 (astro_body_t)target.body, observer, DIRECTION_RISE, start, 1.0);
-            const astro_search_result_t set = Astronomy_SearchRiseSet(
-                (astro_body_t)target.body, observer, DIRECTION_SET, start, 1.0);
-            if (rise.status == ASTRO_SUCCESS && set.status == ASTRO_SUCCESS) {
-                aosTime = (time_t)(rise.time.ut * 86400.0 + 946728000.0);
-                losTime = (time_t)(set.time.ut * 86400.0 + 946728000.0);
-                passValid = true;
+            if (rise.status == ASTRO_SUCCESS) {
+                // Start one second after the rise so the set search cannot return
+                // an event at the same instant due to boundary/rounding behavior.
+                const astro_time_t afterRise = Astronomy_AddDays(rise.time, 1.0 / 86400.0);
+                const astro_search_result_t set = Astronomy_SearchRiseSet(
+                    (astro_body_t)target.body, observer, DIRECTION_SET, afterRise, 1.0);
+                if (set.status == ASTRO_SUCCESS &&
+                    TrackingMath::chronologicalEventPair(rise.time.ut, set.time.ut)) {
+                    aosTime = (time_t)(rise.time.ut * 86400.0 + 946728000.0);
+                    losTime = (time_t)(set.time.ut * 86400.0 + 946728000.0);
+                    passValid = losTime > aosTime;
+                }
             }
         }
     }
