@@ -130,7 +130,9 @@ PController pEl = {3.0f, 0.05f};
 SemaphoreHandle_t targetMutex;   // protects current, motorTarget, and calculationReadiness
 SemaphoreHandle_t i2cMutex;      // protects the shared I2C bus
 SemaphoreHandle_t sysMutex;      // protects observer and telemetry state
-SemaphoreHandle_t sgp4Mutex;     // protects the shared SGP4 instance
+SemaphoreHandle_t sgp4Mutex;
+// The observer/target pair used to initialize satSgp4; protected by sgp4Mutex.
+TrackingMath::GenerationReadiness tleSourceVersions;     // protects the shared SGP4 instance
 SemaphoreHandle_t tleFetchMutex;
 // One long-lived worker handles all TLE refresh requests. Notifications are
 // coalesced while a download is running, so rapid target changes cannot create
@@ -578,17 +580,21 @@ void updateNextPass(const TargetState &target, uint32_t targetVersion,
 
     if (target.type == TYPE_SATELLITE && tleReady &&
         xSemaphoreTake(sgp4Mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        // Search for a pass that reaches at least 20 degrees above the horizon.
-        // The second argument is the search iteration limit, not the elevation.
-        const bool predictionReady =
-            satSgp4.initpredpoint((unsigned long)now, 0.0);
-        passinfo overpass = {};
-        passValid = predictionReady &&
-                    satSgp4.nextpass(&overpass, 20, false, 20.0);
-        if (passValid) {
-            aosTime = (time_t)((overpass.jdstart - 2440587.5) * 86400.0);
-            losTime = (time_t)((overpass.jdstop  - 2440587.5) * 86400.0);
-            maxElevation = overpass.maxelevation;
+        // Never calculate a pass with SGP4 data belonging to an older target
+        // or observer location. The source token is protected by this mutex.
+        if (tleSourceVersions.matches(targetVersion, observerVersion)) {
+            // Search for a pass that reaches at least 20 degrees above the horizon.
+            // The second argument is the search iteration limit, not the elevation.
+            const bool predictionReady =
+                satSgp4.initpredpoint((unsigned long)now, 0.0);
+            passinfo overpass = {};
+            passValid = predictionReady &&
+                        satSgp4.nextpass(&overpass, 20, false, 20.0);
+            if (passValid) {
+                aosTime = (time_t)((overpass.jdstart - 2440587.5) * 86400.0);
+                losTime = (time_t)((overpass.jdstop  - 2440587.5) * 86400.0);
+                maxElevation = overpass.maxelevation;
+            }
         }
         xSemaphoreGive(sgp4Mutex);
     } else if (target.type == TYPE_PLANET) {
@@ -688,6 +694,8 @@ void PhysicsTask(void * p) {
 
       if (target.type == TYPE_SATELLITE) {
           if (tleReady && xSemaphoreTake(sgp4Mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+              if (tleSourceVersions.matches(calculationGeneration,
+                                            calculationObserverGeneration)) {
               satSgp4.findsat((unsigned long)now);
               const double lat1 = satSgp4.satLat;
               const double lon1 = satSgp4.satLon;
@@ -708,10 +716,11 @@ void PhysicsTask(void * p) {
               satLon = lon1;
               satAltKm = alt1;
               satDist = dist1;
-              xSemaphoreGive(sgp4Mutex);
               calculationOK = isfinite(targetAz) && isfinite(targetEl) &&
                               isfinite(satSpeed) && isfinite(satAltKm) &&
                               isfinite(satDist);
+              } // End exact TLE source-generation match.
+              xSemaphoreGive(sgp4Mutex);
           }
       } else {
           struct tm utc;
@@ -1001,12 +1010,14 @@ void fetchTLE() {
 
     tleReady = false;
     invalidateCalculationReadiness();
-    const TargetState requested = getTargetSnapshot();
+    const VersionedTargetSnapshot requestedSnapshot = getVersionedTargetSnapshot();
+    const TargetState requested = requestedSnapshot.target;
     double lat, lon, alt;
     uint32_t observerVersion = 0;
     bool success = false;
 
-    if (requested.type == TYPE_SATELLITE &&
+    if (requestedSnapshot.generation != 0 &&
+        requested.type == TYPE_SATELLITE &&
         getVersionedObserverSnapshot(lat, lon, alt, observerVersion) &&
         requested.noradID > 0) {
         HTTPClient http;
@@ -1028,17 +1039,43 @@ void fetchTLE() {
                     strlcpy(line1, rawLine1, sizeof(line1));
                     strlcpy(line2, rawLine2, sizeof(line2));
 
-                    const TargetState latest = getTargetSnapshot();
-                    const bool stillCurrent = latest.type == TYPE_SATELLITE &&
-                                              latest.noradID == requested.noradID;
-                    if (stillCurrent &&
-                        xSemaphoreTake(sgp4Mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+                    // Installation is the critical point: while holding the
+                    // target and observer locks, prove that neither input
+                    // changed during the network request. This follows the
+                    // global lock order targetMutex -> sysMutex -> sgp4Mutex.
+                    bool targetLocked =
+                        xSemaphoreTake(targetMutex, pdMS_TO_TICKS(100)) == pdTRUE;
+                    bool observerLocked = false;
+                    bool sgp4Locked = false;
+                    if (targetLocked) {
+                        observerLocked =
+                            xSemaphoreTake(sysMutex, pdMS_TO_TICKS(100)) == pdTRUE;
+                    }
+                    const bool sameTarget = targetLocked &&
+                        targetGeneration == requestedSnapshot.generation &&
+                        current.type == TYPE_SATELLITE &&
+                        current.noradID == requested.noradID;
+                    const bool sameObserver = observerLocked &&
+                        observerGeneration == observerVersion;
+                    if (sameTarget && sameObserver) {
+                        sgp4Locked =
+                            xSemaphoreTake(sgp4Mutex, pdMS_TO_TICKS(500)) == pdTRUE;
+                    }
+
+                    if (sameTarget && sameObserver && sgp4Locked) {
                         satSgp4.site(lat, lon, alt);
                         satSgp4.init(requested.name, line1, line2);
-                        xSemaphoreGive(sgp4Mutex);
+                        // Record which exact inputs produced this SGP4 model.
+                        // PhysicsTask and updateNextPass reject any other pair.
+                        tleSourceVersions.publish(requestedSnapshot.generation,
+                                                  observerVersion);
                         tleReady = true;
                         success = true;
                     }
+
+                    if (sgp4Locked) xSemaphoreGive(sgp4Mutex);
+                    if (observerLocked) xSemaphoreGive(sysMutex);
+                    if (targetLocked) xSemaphoreGive(targetMutex);
                 } else {
                     Serial.println("ERROR: TLE response was invalid or incomplete.");
                 }
