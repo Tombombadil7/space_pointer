@@ -2,8 +2,37 @@
 
 #include <math.h>
 #include <stdint.h>
+#include <errno.h>
+#include <stdlib.h>
 
 namespace TrackingMath {
+
+
+/*
+ * Strict numeric parsers shared by the HTTP handlers and native tests.
+ * Reject partial strings, range errors, and non-finite floating-point values.
+ */
+inline bool parseFiniteDouble(const char *text, double &value) {
+    if (text == NULL || *text == '\\0') return false;
+    errno = 0;
+    char *end = NULL;
+    const double parsed = strtod(text, &end);
+    if (end == text || *end != '\\0' || errno == ERANGE || !isfinite(parsed)) {
+        return false;
+    }
+    value = parsed;
+    return true;
+}
+
+inline bool parseLongInteger(const char *text, long &value) {
+    if (text == NULL || *text == '\\0') return false;
+    errno = 0;
+    char *end = NULL;
+    const long parsed = strtol(text, &end, 10);
+    if (end == text || *end != '\\0' || errno == ERANGE) return false;
+    value = parsed;
+    return true;
+}
 
 inline float wrapAngle(float degrees) {
     if (!isfinite(degrees)) return 0.0f;
