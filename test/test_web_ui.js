@@ -253,6 +253,9 @@ test("firmware system state uses one mutex and one configuration generation", ()
     assert.equal(firmware.includes(oldName), false, oldName + " should be removed");
   }
   assert.ok(firmware.includes("systemReadiness.invalidate();"));
+  assert.ok(firmware.includes("bool locationReady;"));
+  assert.ok(firmware.includes("systemReadiness.locationReady = true;"));
+
   assert.ok(routeSource("/set").includes("advanceConfigurationLocked();"));
   assert.ok(routeSource("/updateLoc").includes("advanceConfigurationLocked();"));
 });
