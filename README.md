@@ -139,6 +139,10 @@ The `fix/satellite-nextpass-minimum-elevation` branch includes these software ch
 - Corrected the Moon and Mars body IDs (Moon=10, Mars=3) and the one-second planetary look-ahead using `Astronomy_AddDays`.
 - Added a TLE fetch/validation step before satellite calculations, serialized access to SGP4, and restored SGP4 to the current epoch after the velocity look-ahead.
 - Protected target, observer/telemetry, I2C, and SGP4 shared state with mutexes and used snapshots between tasks.
+- Replaced the shared calculation-ready boolean with a target/observer generation pair. PhysicsTask publishes readiness atomically with the matching telemetry and motor target; MotorTask verifies both live generations before every bounded motor-step batch.
+- TLE downloads now capture target and observer generations and revalidate both under the ordered target/observer/SGP4 locks before installing the model. Each installed SGP4 model records its source generations; physics and next-pass calculations reject it if either source has since changed.
+- The `/data` endpoint now reads the selected target and telemetry as one versioned snapshot. It withholds pointing/position data until both target and observer generations match, and independently hides stale next-pass predictions until their slower refresh catches up.
+- Planetary rise/set predictions search for the next set after the next rise, keeping the displayed pair chronological without separately calculating the body's current altitude.
 - Added bounds checks for observer coordinates, NORAD IDs, and supported planetary bodies; added HTTP response/JSON/TLE validation.
 - Kept motor drivers disabled until time, location, orbital solution (for satellites), and both feedback sensors are ready; runtime motor GPIO writes are now owned exclusively by MotorTask, while other tasks can only request a stop. Sensor/mutex failures and below-horizon targets stop step pulses and disable the drivers. If NTP synchronizes after the startup timeout, the physics task can now resume automatically.
 - Updated the AS5600 read call to the library's actual `rawAngle()` API and use `lastError()` to reject a failed I2C read.
@@ -178,6 +182,8 @@ A successful CI build and native test run should be checked on the pull request 
 │       └── astronomy.h
 ├── include/
 └── test/
+    └── test_tracking_math/
+        └── test_main.cpp
 ```
 
 ## References

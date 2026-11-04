@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "tracking_math.h"
+#include "web_ui.h" // Browser dashboard markup, styles, and JavaScript
 #include <ESPAsyncWebServer.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
@@ -63,8 +64,6 @@
 #define ENCODER_ZERO_RAW       2048
 #define ENCODER_DIRECTION      1
 
-// Two axes are stepped sequentially; 80 leaves time for task/sensor overhead.
-
 AsyncWebServer server(80);
 Adafruit_BNO055 bno = Adafruit_BNO055(55);
 Sgp4 satSgp4;
@@ -90,6 +89,11 @@ struct {
   time_t nextPassLOS    = 0;   // unix timestamp — set time or satellite LOS
   double nextPassMaxEl  = 0;   // degrees — satellite only, 0 for planets
 
+  // Each telemetry group records the exact target/location generations that
+  // produced it. Protected by sysMutex and checked before the web API reads it.
+  TrackingMath::GenerationReadiness telemetrySourceVersions;
+  TrackingMath::GenerationReadiness passSourceVersions;
+
 } sys;
 
 enum TargetType {
@@ -103,6 +107,19 @@ struct TargetState {
   char name[25];
 };
 TargetState current = {TYPE_SATELLITE, {.noradID = 25544}, "ISS"};
+// Incremented whenever the selected target changes. PhysicsTask and MotorTask
+// use this version to reject calculations/commands produced for an older target.
+// Access is protected by targetMutex, just like current and motorTarget.
+uint32_t targetGeneration = 1;
+
+// Incremented whenever the observer's location changes. Protected by sysMutex,
+// alongside sys.lat/lon/alt, so a calculation can verify its location snapshot.
+uint32_t observerGeneration = 1;
+
+struct VersionedTargetSnapshot {
+  TargetState target;
+  uint32_t generation;
+};
 // A deliberately simple proportional controller is enough for slow telescope tracking.
 // It avoids derivative kick and integral wind-up when a new target is selected.
 struct PController {
@@ -113,20 +130,27 @@ struct MotorTarget { float az = 0; float el = 0; } motorTarget;
 
 // Modest gains suit the small, repeated corrections used during normal tracking.
 // A narrow deadband filters sensor noise without allowing a large pointing error.
-PController pidAz = {2.5f, 0.05f};
-PController pidEl = {3.0f, 0.05f};
-SemaphoreHandle_t targetMutex;   // protects current and motorTarget
+PController pAz = {2.5f, 0.05f};
+PController pEl = {3.0f, 0.05f};
+SemaphoreHandle_t targetMutex;   // protects current, motorTarget, and calculationReadiness
 SemaphoreHandle_t i2cMutex;      // protects the shared I2C bus
 SemaphoreHandle_t sysMutex;      // protects observer and telemetry state
-SemaphoreHandle_t sgp4Mutex;     // protects the shared SGP4 instance
+SemaphoreHandle_t sgp4Mutex;
+// The observer/target pair used to initialize satSgp4; protected by sgp4Mutex.
+TrackingMath::GenerationReadiness tleSourceVersions;     // protects the shared SGP4 instance
 SemaphoreHandle_t tleFetchMutex;
+// One long-lived worker handles all TLE refresh requests. Notifications are
+// coalesced while a download is running, so rapid target changes cannot create
+// an unbounded number of short-lived FreeRTOS tasks.
+TaskHandle_t tleFetchTaskHandle = NULL;
 
 volatile bool bnoReady = false;
 volatile bool encoderReady = false;
 volatile bool observerReady = false;
 volatile bool timeReady = false;
 volatile bool tleReady = false;
-volatile bool targetCalculationReady = false;
+// Protected by targetMutex. Readiness is valid only for this exact target/location pair.
+TrackingMath::GenerationReadiness calculationReadiness;
 
 // Other tasks may request a safe stop, but only MotorTask writes motor GPIOs.
 // MotorTask consumes this flag and performs the actual ENABLE-pin changes.
@@ -138,7 +162,6 @@ static const char *CONTROL_PASSWORD = "spacepointer-change-me";
 static const char *SETUP_AP_PASSWORD = "SpacePointerSetup";
 
 struct TelemetrySnapshot {
-  double lat, lon, alt;
   double targetAz, targetEl;
   double satLat, satLon;
   double satSpeed, satAltKm, satDist;
@@ -151,197 +174,31 @@ AS5600 encoder;   // default I2C address 0x36, shares bus with BNO055 (0x28)
 bool updateIPLocation();
 void fetchTLE();
 bool startTLEFetchTask();
+void TLEFetchTask(void * p);
 TargetState getTargetSnapshot();
-TelemetrySnapshot getTelemetrySnapshot();
-bool getObserverSnapshot(double &lat, double &lon, double &alt);
+VersionedTargetSnapshot getVersionedTargetSnapshot();
+// Returns telemetry only when it belongs to the target and observer snapshots
+// copied atomically under targetMutex -> sysMutex.
+bool getVersionedTelemetrySnapshot(TargetState &target, TelemetrySnapshot &snapshot);
+bool getVersionedObserverSnapshot(double &lat, double &lon, double &alt,
+                                  uint32_t &generation);
 bool parseDoubleArg(AsyncWebServerRequest *request, const char *name, double &value);
+// Require a non-simple custom header on state-changing requests to block browser CSRF.
+bool hasValidMutationRequest(AsyncWebServerRequest *request);
 void disableMotors();
+// Clear readiness after releasing sysMutex; never acquire targetMutex from sysMutex.
+void invalidateCalculationReadiness();
 const char *planetName(int body);
 void PhysicsTask(void * p);
-void updateNextPass(const TargetState &target, time_t now,
+void updateNextPass(const TargetState &target, uint32_t targetVersion,
+                    uint32_t observerVersion, time_t now,
                     double lat, double lon, double alt);
 void stepMotor(int stepPin, int dirPin, bool forward);
 int pidOutput(const PController &p, float error);
-float wrapAngle(float e);
 void MotorTask(void * p);
 
 
-const char index_html[] PROGMEM = R"rawliteral(
-  <!DOCTYPE HTML>
-  <html>
-    <head>
-      <title>Universal Space Pointer</title>
-      <meta name="viewport" content="width=device-width, initial-scale=1">
-      <link rel="stylesheet" href="https://unpkg.com/leaflet@1.7.1/dist/leaflet.css" />
-      <script src="https://unpkg.com/leaflet@1.7.1/dist/leaflet.js"></script>
-      <style>
-        /* Ensure padding and borders don't increase element widths */
-        * { box-sizing: border-box; }
-        
-        body { font-family: 'Segoe UI', Arial; text-align: center; background: #121212; color: white; margin: 0; padding: 15px; }
-        
-        /* Map uses 100% width of its parent card to avoid overflow */
-        #map { height: 320px; width: 100%; margin: 15px 0; border-radius: 12px; border: 2px solid #444; }
-        
-        /* Width 100% ensures it scales down on mobile, while max-width keeps it neat on PC */
-        .card { background: #1e1e1e; padding: 20px; border-radius: 15px; box-shadow: 0 4px 10px rgba(0,0,0,0.5); width: 100%; max-width: 500px; margin: auto; }
-        
-        .btn { padding: 10px 15px; margin: 5px; cursor: pointer; border-radius: 6px; border: none; background: #3498db; color: white; transition: 0.2s; }
-        .btn:hover { background: #2980b9; }
-        .input-group { margin: 20px 0; display: flex; justify-content: center; gap: 10px; flex-wrap: wrap; }
-        
-        /* Max-width prevents long selections from breaking mobile views */
-        select, input { padding: 8px; border-radius: 5px; border: none; background: #333; color: white; max-width: 100%; }
-        
-        .data { color: #00ffcc; font-weight: bold; }
-        .label { color: #888; font-size: 0.85em; }
-    
-        /* ── tracking name banner ── */
-        #target-name {
-          font-size: 1.6em; font-weight: bold; letter-spacing: 2px;
-          color: #00ffcc; margin: 0 0 12px; text-transform: uppercase;
-          word-wrap: break-word; /* Prevents long names from breaking layout */
-        }
-    
-        /* ── stats grid ── */
-        .stats-grid {
-          display: grid; grid-template-columns: repeat(3, 1fr);
-          gap: 10px; margin: 12px 0;
-        }
-        .stat-box {
-          background: #2a2a2a; border-radius: 10px; padding: 10px 6px;
-          border: 1px solid #333;
-          min-width: 0; /* Allows grid items to shrink properly if needed */
-        }
-        .stat-val { font-size: 1.2em; color: #00ffcc; font-weight: bold; word-wrap: break-word; }
-        .stat-lbl { font-size: 0.72em; color: #888; margin-top: 3px; }
-    
-        /* ── next pass strip ── */
-        #next-pass-bar {
-          background: #2a2a2a; border-radius: 10px; padding: 10px 14px;
-          margin: 10px 0; font-size: 0.9em; border: 1px solid #333;
-          display: flex; justify-content: space-between; align-items: center;
-          flex-wrap: wrap; /* Allows stacking on extremely narrow screens */
-          gap: 10px;
-        }
-        #next-pass-bar .label { font-size: 0.8em; }
-      </style>
-    </head>
-    <body>
-      <div class="card">
-    
-        <p id="target-name">---</p>
-    
-        <div id="map"></div>
-    
-        <p>
-          <span class="label">Az</span> <span id="az" class="data">0</span>&deg;&nbsp;&nbsp;
-          <span class="label">El</span> <span id="el" class="data">0</span>&deg;
-        </p>
-    
-        <div class="stats-grid">
-          <div class="stat-box">
-            <div class="stat-val"><span id="speed">--</span></div>
-            <div class="stat-lbl">km/s speed</div>
-          </div>
-          <div class="stat-box">
-            <div class="stat-val"><span id="alt">--</span></div>
-            <div class="stat-lbl" data-lbl="alt">km altitude</div>
-          </div>
-          <div class="stat-box">
-            <div class="stat-val"><span id="dist">--</span></div>
-            <div class="stat-lbl" data-lbl="dist">km distance</div>
-          </div>
-        </div>
-    
-        <div id="next-pass-bar">
-          <span><span class="label" data-lbl="pass">Next pass</span> <span id="nextPass" class="data">--:--</span></span>
-          <span><span class="label" data-lbl="lose">Max el</span> <span id="nextPassEl" class="data">--</span></span>
-        </div>
-    
-        <button class="btn" style="background:#e67e22" onclick="syncGPS()">Sync Phone GPS</button>
-    
-        <div class="input-group">
-          <select id="commonSats" onchange="if(this.value) setTarget(0, this.options[this.selectedIndex].text, this.value)">
-            <option value="">-- Choose Satellite --</option>
-            <option value="25544">ISS (Space Station)</option>
-            <option value="20580">Hubble Telescope</option>
-            <option value="48274">Tiangong (China)</option>
-            <option value="25867">NOAA 15 (Weather)</option>
-          </select>
-          <button class="btn" onclick="setTarget(1, 'Moon', 10)">Moon</button>
-          <button class="btn" onclick="setTarget(1, 'Mars', 3)">Mars</button>
-          <button class="btn" onclick="setTarget(1, 'Jupiter', 4)">Jupiter</button>
-          <button class="btn" onclick="setTarget(1, 'Saturn', 5)">Saturn</button>
-        </div>
-    
-        <div class="input-group">
-          <input type="number" id="norad" placeholder="Custom NORAD ID">
-          <button class="btn" onclick="setCustomSat()">Track ID</button>
-        </div>
-      </div>
-    
-      <script>
-        var map = L.map('map').setView([0, 0], 2);
-        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png').addTo(map);
-        var marker = L.marker([0, 0]).addTo(map);
-    
-        function setTarget(type, name, val) {
-          fetch('/set?type='+type+'&name='+encodeURIComponent(name)+'&val='+val)
-            .then(function(r) { if (!r.ok) throw new Error('Target update failed: '+r.status); })
-            .catch(function(e) { alert(e.message); });
-        }
-        function setCustomSat() {
-          var id = document.getElementById('norad').value;
-          if(id) setTarget(0, 'Custom', id);
-        }
-        function syncGPS() {
-          navigator.geolocation.getCurrentPosition(function(p) {
-            fetch('/updateLoc?lat='+p.coords.latitude+'&lon='+p.coords.longitude+'&alt='+(p.coords.altitude||50))
-              .then(function(r) { if (!r.ok) throw new Error('Location update failed: '+r.status); alert("GPS Updated!"); })
-              .catch(function(e) { alert(e.message); });
-          });
-        }
-    
-        setInterval(function() {
-          fetch('/data').then(function(res) { return res.json(); }).then(function(d) {
-            var isSat = d.type === 0;
-    
-            // name + pointing
-            document.getElementById('target-name').innerText = d.name;
-            document.getElementById('az').innerText = d.az.toFixed(2);
-            document.getElementById('el').innerText = d.el.toFixed(2);
-    
-            // speed (same for both — always km/s)
-            document.getElementById('speed').innerText = d.speed > 0 ? d.speed.toFixed(2) : '--';
-    
-            // altitude label: "km altitude" for sats, "km from Earth" for planets
-            document.querySelector('[data-lbl="alt"]').innerText  = isSat ? 'km altitude' : 'km from observer';
-            document.getElementById('alt').innerText = d.alt > 0 ? Math.round(d.alt) : '--';                // distance label: "km distance" for sats, same "km from Earth" for planets
-            document.querySelector('[data-lbl="dist"]').innerText = isSat ? 'km distance'   : 'km from observer';
-            document.getElementById('dist').innerText = d.dist > 0 ? Math.round(d.dist) : '--';
-    
-            // next pass row: labels and value format differ by type
-            document.querySelector('[data-lbl="pass"]').innerText = isSat ? 'Next pass' : 'Rises at';
-            document.querySelector('[data-lbl="lose"]').innerText = isSat ? 'Max el'    : 'Sets at';
-            document.getElementById('nextPass').innerText = d.nextPass || '--:--';
-            if (isSat) {
-              document.getElementById('nextPassEl').innerText = d.nextPassEl > 0 ? d.nextPassEl + '\u00b0' : '--';
-            } else {
-              document.getElementById('nextPassEl').innerText = d.nextPassLOS || '--:--';
-            }
-    
-            // map: only move for satellites
-            if (isSat) {
-              marker.setLatLng([d.sLat, d.sLon]);
-              map.panTo([d.sLat, d.sLon]);
-            }
-          });
-        }, 2000);
-      </script>
-    </body>
-  </html>
-  )rawliteral";
+
 
 
 void setup() {
@@ -361,6 +218,14 @@ void setup() {
       while (1) { delay(1000); }
   }
 
+  // Create the TLE worker once during startup. HTTP handlers only notify this
+  // task; they never allocate a new task for each target selection.
+  if (xTaskCreate(TLEFetchTask, "TLEFetch", 10000, NULL, 1,
+                  &tleFetchTaskHandle) != pdPASS) {
+      tleFetchTaskHandle = NULL;
+      Serial.println("WARNING: Could not create TLE worker; satellite refreshes will be unavailable.");
+  }
+
   // ── 3. Hardware Initialization ─────────────────────────────────────
   pinMode(AZ_STEP_PIN, OUTPUT); pinMode(AZ_DIR_PIN, OUTPUT);
   pinMode(EL_STEP_PIN, OUTPUT); pinMode(EL_DIR_PIN, OUTPUT);
@@ -368,8 +233,8 @@ void setup() {
   // After startup, MotorTask is the only task allowed to write motor GPIOs.
   pinMode(AZ_EN_PIN, OUTPUT);   digitalWrite(AZ_EN_PIN, HIGH); // disabled
   pinMode(EL_EN_PIN, OUTPUT);   digitalWrite(EL_EN_PIN, HIGH); // disabled
-  pinMode(AZ_STEP_PIN, OUTPUT); digitalWrite(AZ_STEP_PIN, LOW);
-  pinMode(EL_STEP_PIN, OUTPUT); digitalWrite(EL_STEP_PIN, LOW);
+  digitalWrite(AZ_STEP_PIN, LOW);
+  digitalWrite(EL_STEP_PIN, LOW);
 
   // ESP32-S3 DevKitC-1 I2C mapping; all three peripherals share this bus.
   Wire.begin(8, 9); // SDA=GPIO8, SCL=GPIO9
@@ -408,9 +273,13 @@ void setup() {
       r->send(200, "text/html", index_html);
   });
 
-  server.on("/updateLoc", HTTP_GET, [](AsyncWebServerRequest *r){
+  server.on("/updateLoc", HTTP_POST, [](AsyncWebServerRequest *r){
       if (!r->authenticate(CONTROL_USER, CONTROL_PASSWORD)) {
           r->requestAuthentication();
+          return;
+      }
+      if (!hasValidMutationRequest(r)) {
+          r->send(403, "text/plain", "Forbidden: missing same-origin request header.");
           return;
       }
       double lat, lon, alt;
@@ -425,14 +294,15 @@ void setup() {
           return;
       }
       sys.lat = lat; sys.lon = lon; sys.alt = alt;
+      ++observerGeneration;
+      if (observerGeneration == 0) ++observerGeneration; // Reserve zero for an invalid snapshot.
       xSemaphoreGive(sysMutex);
       observerReady = true;
-      targetCalculationReady = false;
+      invalidateCalculationReadiness();
 
       TargetState target = getTargetSnapshot();
       if (target.type == TYPE_SATELLITE) {
           tleReady = false;   // invalidate the old observer's SGP4 state immediately
-          targetCalculationReady = false;
           if (!startTLEFetchTask()) {
               r->send(503, "text/plain", "Could not start TLE refresh; motors remain disabled.");
               return;
@@ -441,26 +311,28 @@ void setup() {
       r->send(202, "text/plain", "Location accepted.");
   });
 
-  server.on("/set", HTTP_GET, [](AsyncWebServerRequest *r){
+  server.on("/set", HTTP_POST, [](AsyncWebServerRequest *r){
       if (!r->authenticate(CONTROL_USER, CONTROL_PASSWORD)) {
           r->requestAuthentication();
+          return;
+      }
+      if (!hasValidMutationRequest(r)) {
+          r->send(403, "text/plain", "Forbidden: missing same-origin request header.");
           return;
       }
       if (!r->hasArg("type") || !r->hasArg("val")) {
           r->send(400, "text/plain", "Missing target type or value.");
           return;
       }
-      char *end = nullptr;
       const String typeArg = r->arg("type");
       const String valArg = r->arg("val");
-      long type = strtol(typeArg.c_str(), &end, 10);
-      if (end == typeArg.c_str() || *end != '\0' || (type != 0 && type != 1)) {
+      long type = 0, val = 0;
+      if (!TrackingMath::parseLongInteger(typeArg.c_str(), type) ||
+          (type != 0 && type != 1)) {
           r->send(400, "text/plain", "Invalid target type.");
           return;
       }
-      end = nullptr;
-      long val = strtol(valArg.c_str(), &end, 10);
-      if (end == valArg.c_str() || *end != '\0') {
+      if (!TrackingMath::parseLongInteger(valArg.c_str(), val)) {
           r->send(400, "text/plain", "Invalid target ID.");
           return;
       }
@@ -498,8 +370,10 @@ void setup() {
       if (next.type == TYPE_SATELLITE) {
           tleReady = false;   // never track a newly selected NORAD ID with the previous TLE
       }
-      targetCalculationReady = false;
+      calculationReadiness.clear(); // targetMutex is already held here.
       current = next;
+      ++targetGeneration;
+      if (targetGeneration == 0) ++targetGeneration; // Reserve zero for an invalid snapshot.
       motorTarget.az = 0;
       motorTarget.el = 0;
       xSemaphoreGive(targetMutex);
@@ -514,8 +388,17 @@ void setup() {
   });
 
   server.on("/data", HTTP_GET, [](AsyncWebServerRequest *r){
-      const TargetState target = getTargetSnapshot();
-      const TelemetrySnapshot data = getTelemetrySnapshot();
+      TargetState target = {};
+      TelemetrySnapshot data = {};
+      // Read target + telemetry as one versioned snapshot. A target switch or
+      // location update can otherwise pair the new name with old coordinates,
+      // distances, or pass times. Return a temporary response until PhysicsTask
+      // publishes telemetry for the exact current target/location pair.
+      if (!getVersionedTelemetrySnapshot(target, data)) {
+          r->send(503, "text/plain",
+                  "Telemetry is updating for the selected target or location; please retry.");
+          return;
+      }
       StaticJsonDocument<512> doc;
       doc["name"]  = target.name;
       doc["type"]  = target.type;
@@ -589,44 +472,98 @@ void loop() {
 
 
 
-TargetState getTargetSnapshot() {
-  TargetState result = {};
-  if (targetMutex != NULL && xSemaphoreTake(targetMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-      result = current;
+void invalidateCalculationReadiness() {
+  // Call only when sysMutex is not held. Nested locking always follows
+  // targetMutex -> sysMutex, preventing a reverse-order deadlock.
+  if (targetMutex != NULL &&
+      xSemaphoreTake(targetMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+      calculationReadiness.clear();
       xSemaphoreGive(targetMutex);
   }
+}
+
+VersionedTargetSnapshot getVersionedTargetSnapshot() {
+  VersionedTargetSnapshot result = {};
+  if (targetMutex != NULL && xSemaphoreTake(targetMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+      result.target = current;
+      result.generation = targetGeneration;
+      xSemaphoreGive(targetMutex);
+  }
+  // A zero generation means the mutex could not be acquired; callers must
+  // treat that snapshot as unavailable instead of calculating with defaults.
   return result;
 }
 
-TelemetrySnapshot getTelemetrySnapshot() {
-  TelemetrySnapshot result = {};
+TargetState getTargetSnapshot() {
+  return getVersionedTargetSnapshot().target;
+}
+
+bool getVersionedTelemetrySnapshot(TargetState &target, TelemetrySnapshot &snapshot) {
+  // Lock target first, then system state. This is the same order used by
+  // PhysicsTask and updateNextPass, so the API cannot observe half a target switch.
+  if (targetMutex == NULL ||
+      xSemaphoreTake(targetMutex, pdMS_TO_TICKS(20)) != pdTRUE) {
+      return false;
+  }
+
+  bool snapshotReady = false;
   if (sysMutex != NULL && xSemaphoreTake(sysMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-      result.lat = sys.lat; result.lon = sys.lon; result.alt = sys.alt;
-      result.targetAz = sys.targetAz; result.targetEl = sys.targetEl;
-      result.satLat = sys.satLat; result.satLon = sys.satLon;
-      result.satSpeed = sys.satSpeed; result.satAltKm = sys.satAltKm;
-      result.satDist = sys.satDist;
-      result.nextPassValid = sys.nextPassValid;
-      result.nextPassAOS = sys.nextPassAOS; result.nextPassLOS = sys.nextPassLOS;
-      result.nextPassMaxEl = sys.nextPassMaxEl;
+      // The target and observer versions must both match the versions that
+      // produced the pointing/position telemetry. Old data is never labelled
+      // with the newly selected target's name.
+      if (sys.telemetrySourceVersions.matches(targetGeneration, observerGeneration)) {
+          target = current;
+          snapshot.targetAz = sys.targetAz; snapshot.targetEl = sys.targetEl;
+          snapshot.satLat = sys.satLat; snapshot.satLon = sys.satLon;
+          snapshot.satSpeed = sys.satSpeed; snapshot.satAltKm = sys.satAltKm;
+          snapshot.satDist = sys.satDist;
+
+          // Pass predictions are refreshed on their own schedule. Until the
+          // matching version is available, show no prediction rather than
+          // carrying a rise/set time over from a previous target/location.
+          snapshot.nextPassValid =
+              sys.passSourceVersions.matches(targetGeneration, observerGeneration) &&
+              sys.nextPassValid;
+          snapshot.nextPassAOS = snapshot.nextPassValid ? sys.nextPassAOS : 0;
+          snapshot.nextPassLOS = snapshot.nextPassValid ? sys.nextPassLOS : 0;
+          snapshot.nextPassMaxEl = snapshot.nextPassValid ? sys.nextPassMaxEl : 0;
+          snapshotReady = true;
+      }
       xSemaphoreGive(sysMutex);
   }
-  return result;
+
+  xSemaphoreGive(targetMutex);
+  return snapshotReady;
 }
 
-bool getObserverSnapshot(double &lat, double &lon, double &alt) {
-  if (sysMutex == NULL || xSemaphoreTake(sysMutex, pdMS_TO_TICKS(20)) != pdTRUE) return false;
-  lat = sys.lat; lon = sys.lon; alt = sys.alt;
+bool getVersionedObserverSnapshot(double &lat, double &lon, double &alt,
+                                  uint32_t &generation) {
+  // Read the coordinates and their version under the same lock. This ensures
+  // the version always describes the exact location copied into this snapshot.
+  if (sysMutex == NULL || xSemaphoreTake(sysMutex, pdMS_TO_TICKS(20)) != pdTRUE) {
+      return false;
+  }
+
+  lat = sys.lat;
+  lon = sys.lon;
+  alt = sys.alt;
+  generation = observerGeneration;
   xSemaphoreGive(sysMutex);
-  return TrackingMath::validObserver(lat, lon, alt);
+
+  return generation != 0 && TrackingMath::validObserver(lat, lon, alt);
+}
+
+bool hasValidMutationRequest(AsyncWebServerRequest *request) {
+  // Cross-origin HTML forms cannot set this custom header. Cross-origin fetch
+  // requests must pass a CORS preflight, which this device does not enable.
+  return request->hasHeader("X-SpacePointer-Request") &&
+         request->getHeader("X-SpacePointer-Request")->value() == "1";
 }
 
 bool parseDoubleArg(AsyncWebServerRequest *request, const char *name, double &value) {
   if (!request->hasArg(name)) return false;
   const String arg = request->arg(name);
-  char *end = nullptr;
-  value = strtod(arg.c_str(), &end);
-  return end != arg.c_str() && *end == '\0' && isfinite(value);
+  return TrackingMath::parseFiniteDouble(arg.c_str(), value);
 }
 
 const char *planetName(int body) {
@@ -645,39 +582,38 @@ void disableMotors() {
   motorStopRequested = true;
 }
 
+// Ask the persistent worker to refresh TLE data. FreeRTOS task notifications
+// are counted, but the worker clears pending notifications when it wakes; this
+// intentionally coalesces a burst of requests into one refresh of the latest target.
 bool startTLEFetchTask() {
   tleReady = false;
-  targetCalculationReady = false;
-  return xTaskCreate([](void *) {
-      fetchTLE();
-      vTaskDelete(NULL);
-  }, "TLE", 10000, NULL, 1, NULL) == pdPASS;
+  invalidateCalculationReadiness();
+  if (tleFetchTaskHandle == NULL) return false;
+  xTaskNotifyGive(tleFetchTaskHandle);
+  return true;
 }
 
-float wrapAngle(float e) {
-  return TrackingMath::wrapAngle(e);
+// The worker sleeps without consuming CPU until a refresh is requested. If
+// several requests arrive during a download, the next wake handles the latest
+// selected target rather than spawning additional tasks.
+void TLEFetchTask(void * p) {
+  for (;;) {
+      ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+      fetchTLE();
+  }
 }
 
 int pidOutput(const PController &p, float error) {
-    // Invalid sensor/target math must never turn into a motor command.
-    if (!isfinite(error)) return 0;
-
-    // Ignore tiny errors so sensor noise does not make the mount chatter.
-    if (fabsf(error) <= p.deadband) return 0;
-
-    // Round to the nearest whole step rather than truncating toward zero.
-    const long requestedSteps = lroundf(p.kp * error);
-
-    // Keep a hard ceiling for abnormal errors; this is not a speed ramp.
-    // Normal tracking corrections should be only a few steps per control tick.
-    return (int)constrain((float)requestedSteps,
-                          -(float)MAX_STEPS_PER_TICK,
-                          (float)MAX_STEPS_PER_TICK);
+    // Keep the motor controller thin: the math is isolated in a portable,
+    // hardware-independent helper so its edge cases can be unit-tested.
+    return TrackingMath::proportionalSteps(
+        p.kp, p.deadband, error, MAX_STEPS_PER_TICK);
 }
 
 // Calculate the next satellite pass or planetary rise/set independently of
 // any display. The web API reads the result from the shared telemetry state.
-void updateNextPass(const TargetState &target, time_t now,
+void updateNextPass(const TargetState &target, uint32_t targetVersion,
+                    uint32_t observerVersion, time_t now,
                     double lat, double lon, double alt) {
     bool passValid = false;
     time_t aosTime = 0;
@@ -686,17 +622,21 @@ void updateNextPass(const TargetState &target, time_t now,
 
     if (target.type == TYPE_SATELLITE && tleReady &&
         xSemaphoreTake(sgp4Mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        // Search for a pass that reaches at least 20 degrees above the horizon.
-        // The second argument is the search iteration limit, not the elevation.
-        const bool predictionReady =
-            satSgp4.initpredpoint((unsigned long)now, 0.0);
-        passinfo overpass = {};
-        passValid = predictionReady &&
-                    satSgp4.nextpass(&overpass, 20, false, 20.0);
-        if (passValid) {
-            aosTime = (time_t)((overpass.jdstart - 2440587.5) * 86400.0);
-            losTime = (time_t)((overpass.jdstop  - 2440587.5) * 86400.0);
-            maxElevation = overpass.maxelevation;
+        // Never calculate a pass with SGP4 data belonging to an older target
+        // or observer location. The source token is protected by this mutex.
+        if (tleSourceVersions.matches(targetVersion, observerVersion)) {
+            // Search for a pass that reaches at least 20 degrees above the horizon.
+            // The second argument is the search iteration limit, not the elevation.
+            const bool predictionReady =
+                satSgp4.initpredpoint((unsigned long)now, 0.0);
+            passinfo overpass = {};
+            passValid = predictionReady &&
+                        satSgp4.nextpass(&overpass, 20, false, 20.0);
+            if (passValid) {
+                aosTime = (time_t)((overpass.jdstart - 2440587.5) * 86400.0);
+                losTime = (time_t)((overpass.jdstop  - 2440587.5) * 86400.0);
+                maxElevation = overpass.maxelevation;
+            }
         }
         xSemaphoreGive(sgp4Mutex);
     } else if (target.type == TYPE_PLANET) {
@@ -706,24 +646,47 @@ void updateNextPass(const TargetState &target, time_t now,
                 utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday,
                 utc.tm_hour, utc.tm_min, (double)utc.tm_sec);
             const astro_observer_t observer = {lat, lon, alt};
+            // Find the next rise first, then search for the set after that rise.
+            // Independent searches can pair tomorrow's rise with today's set
+            // when the object is already above the horizon. Sequential searches
+            // keep the displayed pair chronological without calculating the
+            // object's current altitude or sky position separately.
             const astro_search_result_t rise = Astronomy_SearchRiseSet(
                 (astro_body_t)target.body, observer, DIRECTION_RISE, start, 1.0);
-            const astro_search_result_t set = Astronomy_SearchRiseSet(
-                (astro_body_t)target.body, observer, DIRECTION_SET, start, 1.0);
-            if (rise.status == ASTRO_SUCCESS && set.status == ASTRO_SUCCESS) {
-                aosTime = (time_t)(rise.time.ut * 86400.0 + 946728000.0);
-                losTime = (time_t)(set.time.ut * 86400.0 + 946728000.0);
-                passValid = true;
+            if (rise.status == ASTRO_SUCCESS) {
+                // Start one second after the rise so the set search cannot return
+                // an event at the same instant due to boundary/rounding behavior.
+                const astro_time_t afterRise = Astronomy_AddDays(rise.time, 1.0 / 86400.0);
+                const astro_search_result_t set = Astronomy_SearchRiseSet(
+                    (astro_body_t)target.body, observer, DIRECTION_SET, afterRise, 1.0);
+                if (set.status == ASTRO_SUCCESS &&
+                    TrackingMath::chronologicalEventPair(rise.time.ut, set.time.ut)) {
+                    aosTime = (time_t)(rise.time.ut * 86400.0 + 946728000.0);
+                    losTime = (time_t)(set.time.ut * 86400.0 + 946728000.0);
+                    passValid = losTime > aosTime;
+                }
             }
         }
     }
 
-    if (xSemaphoreTake(sysMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-        sys.nextPassValid = passValid;
-        sys.nextPassAOS = aosTime;
-        sys.nextPassLOS = losTime;
-        sys.nextPassMaxEl = maxElevation;
-        xSemaphoreGive(sysMutex);
+    // A pass prediction can take noticeable time. Publish it only if neither
+    // the selected target nor the observer location changed during the search.
+    // Lock order stays targetMutex -> sysMutex, matching the physics commit path.
+    if (xSemaphoreTake(targetMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+        if (targetGeneration == targetVersion &&
+            xSemaphoreTake(sysMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+            if (observerGeneration == observerVersion) {
+                sys.nextPassValid = passValid;
+                sys.nextPassAOS = aosTime;
+                sys.nextPassLOS = losTime;
+                sys.nextPassMaxEl = maxElevation;
+                // Tag this independently refreshed group so it cannot leak
+                // rise/set times across a target or observer-location change.
+                sys.passSourceVersions.publish(targetVersion, observerVersion);
+            }
+            xSemaphoreGive(sysMutex);
+        }
+        xSemaphoreGive(targetMutex);
     }
 }
 
@@ -740,15 +703,25 @@ void PhysicsTask(void * p) {
           }
       }
       if (!timeReady || !observerReady) {
-          targetCalculationReady = false;
+          // MotorTask checks these prerequisites independently. A delayed
+          // physics iteration must not erase a newer successful token.
           vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(500));
           continue;
       }
 
-      const TargetState target = getTargetSnapshot();
+      const VersionedTargetSnapshot targetSnapshot = getVersionedTargetSnapshot();
+      if (targetSnapshot.generation == 0) {
+          // No consistent target snapshot was available; do not publish a token.
+          vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(500));
+          continue;
+      }
+      const TargetState target = targetSnapshot.target;
+      const uint32_t calculationGeneration = targetSnapshot.generation;
       double lat, lon, alt;
-      if (!getObserverSnapshot(lat, lon, alt)) {
-          targetCalculationReady = false;
+      uint32_t calculationObserverGeneration = 0;
+      if (!getVersionedObserverSnapshot(lat, lon, alt,
+                                        calculationObserverGeneration)) {
+          // No observer snapshot was available; the motor task will fail safe.
           vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(500));
           continue;
       }
@@ -756,7 +729,7 @@ void PhysicsTask(void * p) {
       time_t now;
       time(&now);
       if (now < 1000000000) {
-          targetCalculationReady = false;
+          // MotorTask independently checks timeReady before enabling the drivers.
           vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(500));
           continue;
       }
@@ -765,7 +738,8 @@ void PhysicsTask(void * p) {
       // rather than tying their calculation to a physical display task.
       static uint32_t lastPassCalc = 0;
       if (millis() - lastPassCalc > 30000) {
-          updateNextPass(target, now, lat, lon, alt);
+          updateNextPass(target, calculationGeneration,
+                         calculationObserverGeneration, now, lat, lon, alt);
           lastPassCalc = millis();
       }
 
@@ -776,30 +750,33 @@ void PhysicsTask(void * p) {
 
       if (target.type == TYPE_SATELLITE) {
           if (tleReady && xSemaphoreTake(sgp4Mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-              satSgp4.findsat((unsigned long)now);
-              const double lat1 = satSgp4.satLat;
-              const double lon1 = satSgp4.satLon;
-              const double alt1 = satSgp4.satAlt;
-              const double dist1 = satSgp4.satDist;
-              targetAz = satSgp4.satAz;
-              targetEl = satSgp4.satEl;
+              if (tleSourceVersions.matches(calculationGeneration,
+                                            calculationObserverGeneration)) {
+                  satSgp4.findsat((unsigned long)now);
+                  targetAz = satSgp4.satAz;
+                  targetEl = satSgp4.satEl;
+                  satLat = satSgp4.satLat;
+                  satLon = satSgp4.satLon;
+                  satAltKm = satSgp4.satAlt;
+                  satDist = satSgp4.satDist;
 
-              satSgp4.findsat((unsigned long)(now + 1));
-              const double dlat = (satSgp4.satLat - lat1) * DEG_TO_RAD * 6371.0;
-              const double dlon = wrapAngle((float)(satSgp4.satLon - lon1)) *
-                                  DEG_TO_RAD * 6371.0 * cos(lat1 * DEG_TO_RAD);
-              const double dalt = satSgp4.satAlt - alt1;
-              satSpeed = sqrt(dlat*dlat + dlon*dlon + dalt*dalt);
-
-              satSgp4.findsat((unsigned long)now);
-              satLat = lat1;
-              satLon = lon1;
-              satAltKm = alt1;
-              satDist = dist1;
+                  // The library's SGP4 core already calculates the velocity
+                  // vector in km/s. Use its magnitude instead of estimating
+                  // speed from latitude/longitude/altitude differences.
+                  const double tsinceMinutes =
+                      (satSgp4.satJd - satSgp4.satrec.jdsatepoch) * 1440.0;
+                  double position[3], velocity[3];
+                  if (sgp4(wgs84, satSgp4.satrec, tsinceMinutes,
+                           position, velocity)) {
+                      satSpeed = sqrt(velocity[0] * velocity[0] +
+                                      velocity[1] * velocity[1] +
+                                      velocity[2] * velocity[2]);
+                      calculationOK = isfinite(targetAz) && isfinite(targetEl) &&
+                                      isfinite(satSpeed) && isfinite(satAltKm) &&
+                                      isfinite(satDist);
+                  }
+              } // End exact TLE source-generation match.
               xSemaphoreGive(sgp4Mutex);
-              calculationOK = isfinite(targetAz) && isfinite(targetEl) &&
-                              isfinite(satSpeed) && isfinite(satAltKm) &&
-                              isfinite(satDist);
           }
       } else {
           struct tm utc;
@@ -815,67 +792,63 @@ void PhysicsTask(void * p) {
                   astro_horizon_t hor1 = Astronomy_Horizon(
                       &aTime, obs, equ1.ra, equ1.dec, REFRACTION_NORMAL);
 
-                  astro_time_t aTime2 = Astronomy_AddDays(aTime, 1.0 / 86400.0);
-                  astro_equatorial_t equ2 = Astronomy_Equator(
-                      (astro_body_t)target.body, &aTime2, obs,
-                      EQUATOR_OF_DATE, ABERRATION);
-                  if (equ2.status == ASTRO_SUCCESS) {
-                      astro_horizon_t hor2 = Astronomy_Horizon(
-                          &aTime2, obs, equ2.ra, equ2.dec, REFRACTION_NORMAL);
+                  const double distanceKm = equ1.dist * 149597870.7;
 
-                      const double distanceKm = equ1.dist * 149597870.7;
-                      const double dDistance = (equ2.dist - equ1.dist) * 149597870.7;
-                      const double dAz = wrapAngle((float)(hor2.azimuth - hor1.azimuth)) *
-                                         DEG_TO_RAD * distanceKm;
-                      const double dEl = (hor2.altitude - hor1.altitude) *
-                                         DEG_TO_RAD * distanceKm;
+                  targetAz = hor1.azimuth;
+                  targetEl = hor1.altitude;
+                  // Planetary speed is intentionally not calculated; the UI
+                  // marks this field as unavailable for non-satellite targets.
+                  satAltKm = distanceKm;
+                  satDist = distanceKm;
+                  calculationOK = isfinite(targetAz) && isfinite(targetEl) &&
+                                  isfinite(distanceKm);
+              }
 
-                      targetAz = hor1.azimuth;
-                      targetEl = hor1.altitude;
-                      satSpeed = sqrt(dAz*dAz + dEl*dEl + dDistance*dDistance);
-                      satAltKm = distanceKm;
-                      satDist = distanceKm;
-                      calculationOK = isfinite(targetAz) && isfinite(targetEl) &&
-                                      isfinite(satSpeed) && isfinite(distanceKm);
+          }
+      }
+
+      bool resultCommitted = false;
+      if (calculationOK &&
+          xSemaphoreTake(targetMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+          // Keep targetMutex while committing both telemetry and motor target.
+          // A target change cannot slip between the generation check and write.
+          if (targetGeneration == calculationGeneration) {
+              if (xSemaphoreTake(sysMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+                  // Location updates also take sysMutex, so this check and the
+                  // telemetry write are atomic with respect to /updateLoc and
+                  // the automatic IP-geolocation update.
+                  if (observerGeneration == calculationObserverGeneration) {
+                      sys.targetAz = targetAz;
+                      sys.targetEl = targetEl;
+                      sys.satLat = satLat;
+                      sys.satLon = satLon;
+                      sys.satSpeed = satSpeed;
+                      sys.satAltKm = satAltKm;
+                      sys.satDist = satDist;
+                      // Publish source versions in the same locked transaction
+                      // as the values. /data rejects every older generation pair.
+                      sys.telemetrySourceVersions.publish(
+                          calculationGeneration, calculationObserverGeneration);
+                      resultCommitted = true;
+                      // Publish inside the same critical section as telemetry
+                      // and motorTarget, while both source generations are locked.
+                      calculationReadiness.publish(calculationGeneration,
+                                                   calculationObserverGeneration);
+                  }
+                  xSemaphoreGive(sysMutex);
+
+                  // Publish the motor target only after both versions have
+                  // been validated while their protecting locks are held.
+                  if (resultCommitted) {
+                      motorTarget.az = (float)targetAz;
+                      motorTarget.el = (float)targetEl;
                   }
               }
-
           }
+          xSemaphoreGive(targetMutex);
       }
-
-      const TargetState latestTarget = getTargetSnapshot();
-      const bool sameTarget = latestTarget.type == target.type &&
-          ((target.type == TYPE_SATELLITE && latestTarget.noradID == target.noradID) ||
-           (target.type == TYPE_PLANET && latestTarget.body == target.body));
-
-      if (calculationOK && sameTarget &&
-          xSemaphoreTake(sysMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-          sys.targetAz = targetAz;
-          sys.targetEl = targetEl;
-          sys.satLat = satLat;
-          sys.satLon = satLon;
-          sys.satSpeed = satSpeed;
-          sys.satAltKm = satAltKm;
-          sys.satDist = satDist;
-          xSemaphoreGive(sysMutex);
-
-          bool motorTargetWritten = false;
-          if (xSemaphoreTake(targetMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-              const bool stillSelected =
-                  current.type == target.type &&
-                  ((target.type == TYPE_SATELLITE && current.noradID == target.noradID) ||
-                   (target.type == TYPE_PLANET && current.body == target.body));
-              if (stillSelected) {
-                  motorTarget.az = (float)targetAz;
-                  motorTarget.el = (float)targetEl;
-                  motorTargetWritten = true;
-              }
-              xSemaphoreGive(targetMutex);
-          }
-          targetCalculationReady = motorTargetWritten;
-      } else {
-          targetCalculationReady = false;
-      }
+      // Failed/stale calculations do not clear readiness: an older failed
+      // iteration must never erase a newer successful generation pair.
 
       vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(500));
   }
@@ -892,18 +865,29 @@ void MotorTask(void * p) {
       float targetAz = 0.0f, targetEl = 0.0f;
       TargetState activeTarget = {};
       bool targetRead = false;
+      bool calculationReady = false;
+      uint32_t activeGeneration = 0;
       if (xSemaphoreTake(targetMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
           activeTarget = current;
+          activeGeneration = targetGeneration;
           targetAz = motorTarget.az;
           targetEl = motorTarget.el;
-          targetRead = true;
+
+          // Read the live observer generation under the global lock order:
+          // targetMutex first, then sysMutex.
+          if (xSemaphoreTake(sysMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+              calculationReady = calculationReadiness.matches(
+                  targetGeneration, observerGeneration);
+              targetRead = true;
+              xSemaphoreGive(sysMutex);
+          }
           xSemaphoreGive(targetMutex);
       }
 
-      const bool orbitalDataReady = activeTarget.type != TYPE_SATELLITE || tleReady;
-      if (!targetRead || !timeReady || !observerReady || !targetCalculationReady ||
-          !orbitalDataReady || !bnoReady || !encoderReady || !isfinite(targetAz) ||
-          !isfinite(targetEl) || targetEl < 0.0f || targetEl > 90.0f) {
+      if (!TrackingMath::motorControlReady(
+              targetRead, timeReady, observerReady, calculationReady,
+              activeTarget.type == TYPE_SATELLITE, tleReady,
+              bnoReady, encoderReady, targetAz, targetEl)) {
           // Only this task changes the driver ENABLE pins during operation.
           if (driversEnabled) {
               digitalWrite(AZ_EN_PIN, HIGH);
@@ -929,21 +913,22 @@ void MotorTask(void * p) {
 
       sensors_event_t event = {};
       uint16_t encoderRaw = 0;
-      bool sensorsRead = false;
+      uint8_t systemCal = 0, gyroCal = 0, accelCal = 0, magCal = 0;
+      bool headingRead = false;
+      bool encoderHealthy = false;
       if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-          const bool headingRead = bno.getEvent(&event);
-          uint8_t systemCal = 0, gyroCal = 0, accelCal = 0, magCal = 0;
+          headingRead = bno.getEvent(&event);
           bno.getCalibration(&systemCal, &gyroCal, &accelCal, &magCal);
           encoderRaw = encoder.rawAngle();
-          // Magnetic heading must be fully calibrated before pointing from true-north targets.
-          sensorsRead = headingRead && systemCal == 3 && magCal == 3 &&
-                        (encoder.lastError() == AS5600_OK);
+          encoderHealthy = encoder.lastError() == AS5600_OK;
           xSemaphoreGive(i2cMutex);
       }
 
       const float headingNow = event.orientation.x;
-      if (!sensorsRead || !isfinite(headingNow) || headingNow < 0.0f ||
-          headingNow >= 360.0f || encoderRaw > 4095) {
+      // Keep the exact sensor acceptance rule in one testable helper.
+      if (!TrackingMath::validMotorSensorSample(
+              headingRead, encoderHealthy, systemCal, magCal,
+              headingNow, encoderRaw)) {
           if (driversEnabled) {
               digitalWrite(AZ_EN_PIN, HIGH);
               digitalWrite(EL_EN_PIN, HIGH);
@@ -955,35 +940,70 @@ void MotorTask(void * p) {
       // Convert the 12-bit encoder reading into elevation relative to the
       // calibrated level position. Wrap the difference so small movements
       // across the sensor's 0/4095 boundary remain continuous.
-      int32_t encoderDelta = (int32_t)encoderRaw - ENCODER_ZERO_RAW;
-      if (encoderDelta > 2048) encoderDelta -= 4096;
-      if (encoderDelta < -2048) encoderDelta += 4096;
-
-      const float elNow = ENCODER_DIRECTION *
-                          encoderDelta * (360.0f / 4096.0f);
-
-      if (!driversEnabled) {
-          digitalWrite(AZ_EN_PIN, LOW);
-          digitalWrite(EL_EN_PIN, LOW);
-          driversEnabled = true;
+      float elNow = NAN;
+      // The encoder is circular, but the telescope's elevation axis is not.
+      // Reject invalid calibration/raw data and any reading outside 0–90 degrees.
+      if (!TrackingMath::encoderElevation(encoderRaw, ENCODER_ZERO_RAW,
+                                         ENCODER_DIRECTION, elNow)) {
+          if (driversEnabled) {
+              digitalWrite(AZ_EN_PIN, HIGH);
+              digitalWrite(EL_EN_PIN, HIGH);
+              driversEnabled = false;
+          }
+          vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(MOTOR_TASK_MS));
+          continue;
       }
 
       // Convert the BNO055 magnetic heading to true north before comparing
       // it with Astronomy Engine's true-north target azimuth.
-      float headingTrue = fmodf(headingNow + MAGNETIC_DECLINATION_DEG, 360.0f);
-      if (headingTrue < 0.0f) headingTrue += 360.0f;
+      const float headingTrue = TrackingMath::trueHeading(
+          headingNow, MAGNETIC_DECLINATION_DEG);
 
-      const int azSteps = pidOutput(pidAz, wrapAngle(targetAz - headingTrue));
-      const int elSteps = pidOutput(pidEl, wrapAngle(targetEl - elNow));
+      const int azSteps = pidOutput(
+          pAz, TrackingMath::azimuthError(targetAz, headingTrue));
+      // Elevation is linear and bounded; only azimuth uses circular wrapping.
+      const int elSteps = pidOutput(
+          pEl, TrackingMath::elevationError(targetEl, elNow));
       const bool azFwd = azSteps > 0;
       const bool elFwd = elSteps > 0;
       const int azN = abs(azSteps);
       const int elN = abs(elSteps);
       const int maxN = max(azN, elN);
 
-      for (int i = 0; i < maxN; i++) {
-          if (i < azN) stepMotor(AZ_STEP_PIN, AZ_DIR_PIN, azFwd);
-          if (i < elN) stepMotor(EL_STEP_PIN, EL_DIR_PIN, elFwd);
+      // Revalidate immediately before touching the motors. Keep targetMutex
+      // for this short, bounded step batch so a new target cannot be selected
+      // halfway through executing a command from the previous target.
+      if (xSemaphoreTake(targetMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+          // Hold both locks through this short bounded pulse batch. This keeps
+          // observerGeneration stable from validation until the motor steps end.
+          const bool systemStateLocked =
+              xSemaphoreTake(sysMutex, pdMS_TO_TICKS(10)) == pdTRUE;
+          const bool commandStillCurrent = systemStateLocked &&
+              targetGeneration == activeGeneration &&
+              calculationReadiness.matches(targetGeneration, observerGeneration) &&
+              !motorStopRequested;
+          if (commandStillCurrent) {
+              if (!driversEnabled) {
+                  digitalWrite(AZ_EN_PIN, LOW);
+                  digitalWrite(EL_EN_PIN, LOW);
+                  driversEnabled = true;
+              }
+              for (int i = 0; i < maxN; i++) {
+                  if (i < azN) stepMotor(AZ_STEP_PIN, AZ_DIR_PIN, azFwd);
+                  if (i < elN) stepMotor(EL_STEP_PIN, EL_DIR_PIN, elFwd);
+              }
+          } else if (driversEnabled) {
+              digitalWrite(AZ_EN_PIN, HIGH);
+              digitalWrite(EL_EN_PIN, HIGH);
+              driversEnabled = false;
+          }
+          if (systemStateLocked) xSemaphoreGive(sysMutex);
+          xSemaphoreGive(targetMutex);
+      } else if (driversEnabled) {
+          // If we cannot verify the command's generation, fail safe and stop.
+          digitalWrite(AZ_EN_PIN, HIGH);
+          digitalWrite(EL_EN_PIN, HIGH);
+          driversEnabled = false;
       }
       vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(MOTOR_TASK_MS));
   }
@@ -1022,6 +1042,8 @@ bool updateIPLocation() {
                     sys.lat = lat;
                     sys.lon = lon;
                     sys.alt = 50.0;
+                    ++observerGeneration;
+                    if (observerGeneration == 0) ++observerGeneration;
                     xSemaphoreGive(sysMutex);
                     valid = true;
                 }
@@ -1029,6 +1051,9 @@ bool updateIPLocation() {
         }
     }
     http.end();
+    // Keep this path safe if IP geolocation is ever requested after startup.
+    // The observer generation already rejects stale tokens; clearing is explicit.
+    if (valid) invalidateCalculationReadiness();
     return valid;
 }
 
@@ -1036,19 +1061,29 @@ void fetchTLE() {
     if (tleFetchMutex == NULL ||
         xSemaphoreTake(tleFetchMutex, pdMS_TO_TICKS(20000)) != pdTRUE) {
         tleReady = false;
-        targetCalculationReady = false;
+        invalidateCalculationReadiness();
         disableMotors();
         return;
     }
 
-    tleReady = false;
-    targetCalculationReady = false;
-    const TargetState requested = getTargetSnapshot();
+    // Read the latest request first. A queued notification can outlive the
+    // satellite selection that created it; if the current target is a planet,
+    // this worker must leave that planet's calculation readiness untouched.
+    const VersionedTargetSnapshot requestedSnapshot = getVersionedTargetSnapshot();
+    const TargetState requested = requestedSnapshot.target;
     double lat, lon, alt;
+    uint32_t observerVersion = 0;
     bool success = false;
 
-    if (requested.type == TYPE_SATELLITE &&
-        getObserverSnapshot(lat, lon, alt) && requested.noradID > 0) {
+    if (requestedSnapshot.generation != 0 &&
+        requested.type == TYPE_SATELLITE &&
+        getVersionedObserverSnapshot(lat, lon, alt, observerVersion) &&
+        requested.noradID > 0) {
+        // A real satellite refresh is now underway. Invalidate any prior
+        // calculation before downloading replacement orbital elements.
+        tleReady = false;
+        invalidateCalculationReadiness();
+
         HTTPClient http;
         http.setTimeout(12000);
         const String url = "https://tle.ivanstanojevic.me/api/tle/" + String(requested.noradID);
@@ -1068,17 +1103,43 @@ void fetchTLE() {
                     strlcpy(line1, rawLine1, sizeof(line1));
                     strlcpy(line2, rawLine2, sizeof(line2));
 
-                    const TargetState latest = getTargetSnapshot();
-                    const bool stillCurrent = latest.type == TYPE_SATELLITE &&
-                                              latest.noradID == requested.noradID;
-                    if (stillCurrent &&
-                        xSemaphoreTake(sgp4Mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+                    // Installation is the critical point: while holding the
+                    // target and observer locks, prove that neither input
+                    // changed during the network request. This follows the
+                    // global lock order targetMutex -> sysMutex -> sgp4Mutex.
+                    bool targetLocked =
+                        xSemaphoreTake(targetMutex, pdMS_TO_TICKS(100)) == pdTRUE;
+                    bool observerLocked = false;
+                    bool sgp4Locked = false;
+                    if (targetLocked) {
+                        observerLocked =
+                            xSemaphoreTake(sysMutex, pdMS_TO_TICKS(100)) == pdTRUE;
+                    }
+                    const bool sameTarget = targetLocked &&
+                        targetGeneration == requestedSnapshot.generation &&
+                        current.type == TYPE_SATELLITE &&
+                        current.noradID == requested.noradID;
+                    const bool sameObserver = observerLocked &&
+                        observerGeneration == observerVersion;
+                    if (sameTarget && sameObserver) {
+                        sgp4Locked =
+                            xSemaphoreTake(sgp4Mutex, pdMS_TO_TICKS(500)) == pdTRUE;
+                    }
+
+                    if (sameTarget && sameObserver && sgp4Locked) {
                         satSgp4.site(lat, lon, alt);
                         satSgp4.init(requested.name, line1, line2);
-                        xSemaphoreGive(sgp4Mutex);
+                        // Record which exact inputs produced this SGP4 model.
+                        // PhysicsTask and updateNextPass reject any other pair.
+                        tleSourceVersions.publish(requestedSnapshot.generation,
+                                                  observerVersion);
                         tleReady = true;
                         success = true;
                     }
+
+                    if (sgp4Locked) xSemaphoreGive(sgp4Mutex);
+                    if (observerLocked) xSemaphoreGive(sysMutex);
+                    if (targetLocked) xSemaphoreGive(targetMutex);
                 } else {
                     Serial.println("ERROR: TLE response was invalid or incomplete.");
                 }
@@ -1090,10 +1151,38 @@ void fetchTLE() {
     }
 
     if (!success) {
-        tleReady = false;
-        targetCalculationReady = false;
-        disableMotors();
-        Serial.println("WARNING: TLE update failed; satellite motors remain disabled.");
+        // The request may have become obsolete while the HTTP call was in
+        // progress (for example, the user selected a planet or another satellite).
+        // Only apply failure handling if both original inputs are still current.
+        // Otherwise an old failed request could clear readiness for a newer target.
+        bool targetLocked =
+            xSemaphoreTake(targetMutex, pdMS_TO_TICKS(50)) == pdTRUE;
+        bool observerLocked = false;
+        if (targetLocked) {
+            observerLocked =
+                xSemaphoreTake(sysMutex, pdMS_TO_TICKS(50)) == pdTRUE;
+        }
+
+        const bool requestStillCurrent = targetLocked && observerLocked &&
+            requestedSnapshot.generation != 0 &&
+            targetGeneration == requestedSnapshot.generation &&
+            current.type == TYPE_SATELLITE &&
+            current.noradID == requested.noradID &&
+            observerGeneration == observerVersion;
+
+        if (observerLocked) xSemaphoreGive(sysMutex);
+        if (targetLocked) xSemaphoreGive(targetMutex);
+
+        if (requestStillCurrent) {
+            // This is a genuine failure for the active satellite/location.
+            tleReady = false;
+            invalidateCalculationReadiness();
+            disableMotors();
+            Serial.println("WARNING: TLE update failed; satellite motors remain disabled.");
+        } else {
+            // A newer request/state owns readiness now. Do not touch it.
+            Serial.println("INFO: Discarded stale TLE result after target/location changed.");
+        }
     }
     xSemaphoreGive(tleFetchMutex);
 }

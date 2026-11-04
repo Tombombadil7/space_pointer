@@ -1,6 +1,6 @@
 # PlatformIO tests
 
-This folder contains hardware-independent tests for the tracking helpers.
+This folder contains hardware-independent tests for the tracking math and motor-control helpers.
 
 Run the tests from the repository root:
 
@@ -8,6 +8,52 @@ Run the tests from the repository root:
 pio test -e native
 ```
 
-The current suite checks angular wrapping, finite-value handling, observer-coordinate and altitude limits, NORAD ID ranges, and the accepted Astronomy Engine body IDs.
+The native suite currently contains 53 test cases covering:
+- Angular wrapping, exact half-turn boundaries, multiple revolutions, and non-finite inputs.
+- Observer latitude, longitude, and altitude validation, including exact limits and out-of-range values.
+- NORAD ID boundaries and supported planetary-body IDs.
+- Proportional motor-step rounding, deadband behavior, correction limits, zero gain, extreme finite inputs, invalid gains/deadbands/limits, non-finite errors, and preservation of the original float-rounding behavior.
+- Generation-based calculation readiness: initial invalid state, exact target/observer pair matching, stale-pair rejection, explicit clearing, zero-generation rejection, and replacement of an older pair.
+- TLE source-version matching: reject an SGP4 model when either the selected target or observer-location generation changes.
+- Versioned telemetry and pass-prediction snapshots: reject telemetry from an older target/location pair and keep less-frequent pass predictions independently versioned.
+- Chronological planetary event pairs: accept rise-before-set timestamps and reject reversed, equal, or non-finite event times.
+- Actual Astronomy Engine integration: finite/bounded equatorial-to-horizon coordinates for the Moon, Mars, Jupiter, and Saturn; chronological rise/set searches for all supported bodies; and validation of the J2000-to-Unix timestamp conversion used by firmware.
+- Bounded elevation feedback: accept 0–90 degree values, reject out-of-range/non-finite encoder readings, and calculate elevation error linearly without circular wrapping.
+- Motor sensor math: exhaustively test all 4096 AS5600 raw readings in both calibration directions, reject invalid raw/calibration values, normalize magnetic heading with east/west declination, and verify shortest-path azimuth correction.
+- Motor safety gates: require all startup/tracking prerequisites, require TLE data only for satellites, and reject incomplete BNO055 calibration, failed I2C reads, invalid headings, and invalid encoder samples.
+- HTTP parameter parsing: accept complete finite decimal/exponent and integer strings; reject missing, partial, non-finite, underflow, overflow, and trailing-junk values.
 
-The native tests do not exercise FreeRTOS scheduling, I2C peripherals, motor drivers, the Astronomy Engine library integration, or real SGP4/TLE data. Those still require an ESP32 build and hardware/bench testing.
+The native tests now exercise the Astronomy Engine library directly, but do not exercise FreeRTOS scheduling, I2C peripherals, motor drivers, or live SGP4/TLE data. Those still require dedicated mocks/simulation and ESP32 hardware/bench testing.
+
+## Dashboard tests
+
+The browser-side request and telemetry flow is tested with Node's built-in test
+runner. These tests execute the JavaScript embedded in `include/web_ui.h`
+with small DOM, Leaflet, geolocation, and fetch mocks:
+
+```sh
+node --test test/test_web_ui.js
+```
+
+They cover firmware route method/authentication/CSRF contracts, POST + CSRF
+headers, target and phone-GPS payloads, failed mutation feedback, telemetry-only
+error handling, recovery after a 503, map updates, and the planet speed-unavailable
+display. This is a JavaScript behavior test,
+not a full real-browser or Wi-Fi integration test.
+
+## Sanitizer run
+
+CI also runs the native suite with AddressSanitizer and UndefinedBehaviorSanitizer:
+
+```sh
+pio test -e native-sanitize
+```
+
+This can detect memory errors and undefined behavior in the host-testable code.
+It does not instrument the ESP32 firmware or replace hardware testing.
+
+## Physical hardware
+
+The step-by-step ESP32-S3, I2C sensor, A4988 driver, motor, and phone bench
+procedure is in [HARDWARE_BENCH.md](HARDWARE_BENCH.md). These checks require the
+actual hardware and must be recorded separately; desktop CI cannot verify them.
