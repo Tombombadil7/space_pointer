@@ -177,7 +177,7 @@ inline bool supportedPlanetBody(int body) {
  *
  * This small value type has no RTOS dependency, so its state transitions can
  * be tested on a desktop build. In firmware, the caller must protect every
- * read/write with targetMutex.
+ * read/write with stateMutex.
  */
 struct ConfigurationReadiness {
     uint32_t generation = 1;
@@ -218,6 +218,6 @@ struct ConfigurationReadiness {
         passReady = true;
         return true;
     }
-};;
+};
 
 } // namespace TrackingMath
