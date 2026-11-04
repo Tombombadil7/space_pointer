@@ -44,6 +44,7 @@ function createHarness(fetchHandler) {
       calls.push({ url, options });
       return fetchHandler(url, options);
     },
+    window: { isSecureContext: true },
     navigator: {
       geolocation: {
         getCurrentPosition: (success, failure) => {
@@ -216,6 +217,44 @@ test("phone GPS sync sends coordinates through the same POST helper", async () =
   // The dashboard deliberately falls back when the phone reports null/zero altitude.
   assert.equal(body.get("alt"), "50");
   assert.equal(h.alerts.at(-1), "GPS Updated!");
+});
+
+test("phone GPS sync explains when HTTPS is required", () => {
+  const h = createHarness(async () => ({ ok: true, status: 202 }));
+  h.context.window.isSecureContext = false;
+  h.context.syncGPS();
+
+  assert.equal(h.calls.length, 0);
+  assert.deepEqual(h.alerts, [
+    "Phone GPS requires HTTPS. Open the dashboard through a secure HTTPS connection to use phone GPS."
+  ]);
+});
+
+test("phone GPS sync explains geolocation permission, availability, and timeout errors", () => {
+  const cases = [
+    [1, "Phone GPS permission was denied. Allow location access in your browser and try again."],
+    [2, "Phone location is unavailable. Check that location services are enabled and try again."],
+    [3, "Phone GPS request timed out. Try again where the phone has a clearer view of the sky."]
+  ];
+
+  for (const [code, message] of cases) {
+    const h = createHarness(async () => ({ ok: true, status: 202 }));
+    h.context.navigator.geolocation.getCurrentPosition = (success, failure) => {
+      failure({ code });
+    };
+    h.context.syncGPS();
+    assert.deepEqual(h.alerts, [message]);
+    assert.equal(h.calls.length, 0);
+  }
+});
+
+test("phone GPS sync reports when browser geolocation is unavailable", () => {
+  const h = createHarness(async () => ({ ok: true, status: 202 }));
+  h.context.navigator.geolocation = undefined;
+  h.context.syncGPS();
+
+  assert.deepEqual(h.alerts, ["Phone GPS is not available in this browser."]);
+  assert.equal(h.calls.length, 0);
 });
 
 test("failed target mutation is surfaced to the user", async () => {
