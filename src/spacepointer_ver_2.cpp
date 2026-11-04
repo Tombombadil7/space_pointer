@@ -696,29 +696,29 @@ void PhysicsTask(void * p) {
           if (tleReady && xSemaphoreTake(sgp4Mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
               if (tleSourceVersions.matches(calculationGeneration,
                                             calculationObserverGeneration)) {
-              satSgp4.findsat((unsigned long)now);
-              const double lat1 = satSgp4.satLat;
-              const double lon1 = satSgp4.satLon;
-              const double alt1 = satSgp4.satAlt;
-              const double dist1 = satSgp4.satDist;
-              targetAz = satSgp4.satAz;
-              targetEl = satSgp4.satEl;
+                  satSgp4.findsat((unsigned long)now);
+                  const double lat1 = satSgp4.satLat;
+                  const double lon1 = satSgp4.satLon;
+                  const double alt1 = satSgp4.satAlt;
+                  const double dist1 = satSgp4.satDist;
+                  targetAz = satSgp4.satAz;
+                  targetEl = satSgp4.satEl;
 
-              satSgp4.findsat((unsigned long)(now + 1));
-              const double dlat = (satSgp4.satLat - lat1) * DEG_TO_RAD * 6371.0;
-              const double dlon = TrackingMath::wrapAngle((float)(satSgp4.satLon - lon1)) *
-                                  DEG_TO_RAD * 6371.0 * cos(lat1 * DEG_TO_RAD);
-              const double dalt = satSgp4.satAlt - alt1;
-              satSpeed = sqrt(dlat*dlat + dlon*dlon + dalt*dalt);
+                  satSgp4.findsat((unsigned long)(now + 1));
+                  const double dlat = (satSgp4.satLat - lat1) * DEG_TO_RAD * 6371.0;
+                  const double dlon = TrackingMath::wrapAngle((float)(satSgp4.satLon - lon1)) *
+                                      DEG_TO_RAD * 6371.0 * cos(lat1 * DEG_TO_RAD);
+                  const double dalt = satSgp4.satAlt - alt1;
+                  satSpeed = sqrt(dlat*dlat + dlon*dlon + dalt*dalt);
 
-              satSgp4.findsat((unsigned long)now);
-              satLat = lat1;
-              satLon = lon1;
-              satAltKm = alt1;
-              satDist = dist1;
-              calculationOK = isfinite(targetAz) && isfinite(targetEl) &&
-                              isfinite(satSpeed) && isfinite(satAltKm) &&
-                              isfinite(satDist);
+                  satSgp4.findsat((unsigned long)now);
+                  satLat = lat1;
+                  satLon = lon1;
+                  satAltKm = alt1;
+                  satDist = dist1;
+                  calculationOK = isfinite(targetAz) && isfinite(targetEl) &&
+                                  isfinite(satSpeed) && isfinite(satAltKm) &&
+                                  isfinite(satDist);
               } // End exact TLE source-generation match.
               xSemaphoreGive(sgp4Mutex);
           }
