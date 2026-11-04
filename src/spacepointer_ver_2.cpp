@@ -89,6 +89,11 @@ struct {
   time_t nextPassLOS    = 0;   // unix timestamp — set time or satellite LOS
   double nextPassMaxEl  = 0;   // degrees — satellite only, 0 for planets
 
+  // Each telemetry group records the exact target/location generations that
+  // produced it. Protected by sysMutex and checked before the web API reads it.
+  TrackingMath::GenerationReadiness telemetrySourceVersions;
+  TrackingMath::GenerationReadiness passSourceVersions;
+
 } sys;
 
 enum TargetType {
@@ -172,7 +177,9 @@ bool startTLEFetchTask();
 void TLEFetchTask(void * p);
 TargetState getTargetSnapshot();
 VersionedTargetSnapshot getVersionedTargetSnapshot();
-bool getTelemetrySnapshot(TelemetrySnapshot &snapshot);
+// Returns telemetry only when it belongs to the target and observer snapshots
+// copied atomically under targetMutex -> sysMutex.
+bool getVersionedTelemetrySnapshot(TargetState &target, TelemetrySnapshot &snapshot);
 bool getVersionedObserverSnapshot(double &lat, double &lon, double &alt,
                                   uint32_t &generation);
 bool parseDoubleArg(AsyncWebServerRequest *request, const char *name, double &value);
@@ -373,13 +380,15 @@ void setup() {
   });
 
   server.on("/data", HTTP_GET, [](AsyncWebServerRequest *r){
-      const TargetState target = getTargetSnapshot();
+      TargetState target = {};
       TelemetrySnapshot data = {};
-      // Never serialize a zero-filled snapshot when the telemetry lock is busy.
-      // The dashboard can then show a local telemetry error and keep the rest
-      // of the page (map and target controls) fully available.
-      if (!getTelemetrySnapshot(data)) {
-          r->send(503, "text/plain", "Telemetry temporarily unavailable; please retry.");
+      // Read target + telemetry as one versioned snapshot. A target switch or
+      // location update can otherwise pair the new name with old coordinates,
+      // distances, or pass times. Return a temporary response until PhysicsTask
+      // publishes telemetry for the exact current target/location pair.
+      if (!getVersionedTelemetrySnapshot(target, data)) {
+          r->send(503, "text/plain",
+                  "Telemetry is updating for the selected target or location; please retry.");
           return;
       }
       StaticJsonDocument<512> doc;
@@ -481,22 +490,42 @@ TargetState getTargetSnapshot() {
   return getVersionedTargetSnapshot().target;
 }
 
-bool getTelemetrySnapshot(TelemetrySnapshot &snapshot) {
-  // A failed lock is not valid telemetry. Return false so the HTTP handler
-  // can report a temporary service error instead of publishing fake zeros.
-  if (sysMutex == NULL || xSemaphoreTake(sysMutex, pdMS_TO_TICKS(20)) != pdTRUE) {
+bool getVersionedTelemetrySnapshot(TargetState &target, TelemetrySnapshot &snapshot) {
+  // Lock target first, then system state. This is the same order used by
+  // PhysicsTask and updateNextPass, so the API cannot observe half a target switch.
+  if (targetMutex == NULL ||
+      xSemaphoreTake(targetMutex, pdMS_TO_TICKS(20)) != pdTRUE) {
       return false;
   }
 
-  snapshot.targetAz = sys.targetAz; snapshot.targetEl = sys.targetEl;
-  snapshot.satLat = sys.satLat; snapshot.satLon = sys.satLon;
-  snapshot.satSpeed = sys.satSpeed; snapshot.satAltKm = sys.satAltKm;
-  snapshot.satDist = sys.satDist;
-  snapshot.nextPassValid = sys.nextPassValid;
-  snapshot.nextPassAOS = sys.nextPassAOS; snapshot.nextPassLOS = sys.nextPassLOS;
-  snapshot.nextPassMaxEl = sys.nextPassMaxEl;
-  xSemaphoreGive(sysMutex);
-  return true;
+  bool snapshotReady = false;
+  if (sysMutex != NULL && xSemaphoreTake(sysMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+      // The target and observer versions must both match the versions that
+      // produced the pointing/position telemetry. Old data is never labelled
+      // with the newly selected target's name.
+      if (sys.telemetrySourceVersions.matches(targetGeneration, observerGeneration)) {
+          target = current;
+          snapshot.targetAz = sys.targetAz; snapshot.targetEl = sys.targetEl;
+          snapshot.satLat = sys.satLat; snapshot.satLon = sys.satLon;
+          snapshot.satSpeed = sys.satSpeed; snapshot.satAltKm = sys.satAltKm;
+          snapshot.satDist = sys.satDist;
+
+          // Pass predictions are refreshed on their own schedule. Until the
+          // matching version is available, show no prediction rather than
+          // carrying a rise/set time over from a previous target/location.
+          snapshot.nextPassValid =
+              sys.passSourceVersions.matches(targetGeneration, observerGeneration) &&
+              sys.nextPassValid;
+          snapshot.nextPassAOS = snapshot.nextPassValid ? sys.nextPassAOS : 0;
+          snapshot.nextPassLOS = snapshot.nextPassValid ? sys.nextPassLOS : 0;
+          snapshot.nextPassMaxEl = snapshot.nextPassValid ? sys.nextPassMaxEl : 0;
+          snapshotReady = true;
+      }
+      xSemaphoreGive(sysMutex);
+  }
+
+  xSemaphoreGive(targetMutex);
+  return snapshotReady;
 }
 
 bool getVersionedObserverSnapshot(double &lat, double &lon, double &alt,
@@ -627,6 +656,9 @@ void updateNextPass(const TargetState &target, uint32_t targetVersion,
                 sys.nextPassAOS = aosTime;
                 sys.nextPassLOS = losTime;
                 sys.nextPassMaxEl = maxElevation;
+                // Tag this independently refreshed group so it cannot leak
+                // rise/set times across a target or observer-location change.
+                sys.passSourceVersions.publish(targetVersion, observerVersion);
             }
             xSemaphoreGive(sysMutex);
         }
