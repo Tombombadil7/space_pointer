@@ -884,10 +884,10 @@ void MotorTask(void * p) {
           xSemaphoreGive(targetMutex);
       }
 
-      const bool orbitalDataReady = activeTarget.type != TYPE_SATELLITE || tleReady;
-      if (!targetRead || !timeReady || !observerReady || !calculationReady ||
-          !orbitalDataReady || !bnoReady || !encoderReady || !isfinite(targetAz) ||
-          !TrackingMath::validElevation(targetEl)) {
+      if (!TrackingMath::motorControlReady(
+              targetRead, timeReady, observerReady, calculationReady,
+              activeTarget.type == TYPE_SATELLITE, tleReady,
+              bnoReady, encoderReady, targetAz, targetEl)) {
           // Only this task changes the driver ENABLE pins during operation.
           if (driversEnabled) {
               digitalWrite(AZ_EN_PIN, HIGH);
@@ -913,21 +913,22 @@ void MotorTask(void * p) {
 
       sensors_event_t event = {};
       uint16_t encoderRaw = 0;
-      bool sensorsRead = false;
+      uint8_t systemCal = 0, gyroCal = 0, accelCal = 0, magCal = 0;
+      bool headingRead = false;
+      bool encoderHealthy = false;
       if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-          const bool headingRead = bno.getEvent(&event);
-          uint8_t systemCal = 0, gyroCal = 0, accelCal = 0, magCal = 0;
+          headingRead = bno.getEvent(&event);
           bno.getCalibration(&systemCal, &gyroCal, &accelCal, &magCal);
           encoderRaw = encoder.rawAngle();
-          // Magnetic heading must be fully calibrated before pointing from true-north targets.
-          sensorsRead = headingRead && systemCal == 3 && magCal == 3 &&
-                        (encoder.lastError() == AS5600_OK);
+          encoderHealthy = encoder.lastError() == AS5600_OK;
           xSemaphoreGive(i2cMutex);
       }
 
       const float headingNow = event.orientation.x;
-      if (!sensorsRead || !isfinite(headingNow) || headingNow < 0.0f ||
-          headingNow >= 360.0f || encoderRaw > 4095) {
+      // Keep the exact sensor acceptance rule in one testable helper.
+      if (!TrackingMath::validMotorSensorSample(
+              headingRead, encoderHealthy, systemCal, magCal,
+              headingNow, encoderRaw)) {
           if (driversEnabled) {
               digitalWrite(AZ_EN_PIN, HIGH);
               digitalWrite(EL_EN_PIN, HIGH);
