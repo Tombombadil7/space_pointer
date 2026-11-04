@@ -111,6 +111,35 @@ inline bool encoderElevation(uint16_t rawAngle, int zeroRaw, int direction,
     return validElevation(elevationDegrees);
 }
 
+
+/*
+ * Centralize the exact conditions that must hold before MotorTask may
+ * consider enabling the drivers. A satellite additionally needs valid TLE data.
+ */
+inline bool motorControlReady(bool targetRead, bool timeReady,
+                              bool observerReady, bool calculationReady,
+                              bool isSatellite, bool tleReady,
+                              bool bnoReady, bool encoderReady,
+                              float targetAzimuth, float targetElevation) {
+    return targetRead && timeReady && observerReady && calculationReady &&
+           (!isSatellite || tleReady) && bnoReady && encoderReady &&
+           isfinite(targetAzimuth) && validElevation(targetElevation);
+}
+
+/*
+ * Validate a complete sensor sample before using it to command the motors.
+ * Calibration must be complete, heading must be a finite compass angle, and
+ * the AS5600 must have returned a valid 12-bit reading.
+ */
+inline bool validMotorSensorSample(bool headingRead, bool encoderHealthy,
+                                   int systemCalibration, int magneticCalibration,
+                                   float magneticHeading, uint16_t encoderRaw) {
+    return headingRead && encoderHealthy &&
+           systemCalibration == 3 && magneticCalibration == 3 &&
+           isfinite(magneticHeading) && magneticHeading >= 0.0f &&
+           magneticHeading < 360.0f && encoderRaw <= 4095;
+}
+
 /* Normalize a magnetic heading into true-north degrees. */
 inline float trueHeading(float magneticHeading, float declinationDegrees) {
     if (!isfinite(magneticHeading) || !isfinite(declinationDegrees)) return NAN;
