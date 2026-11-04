@@ -419,8 +419,64 @@ void test_proportional_controller_rejects_invalid_gain_deadband_and_limit() {
 }
 
 
+
+void test_motor_readiness_requires_all_prerequisites_and_satellite_tle() {
+    TEST_ASSERT_TRUE(TrackingMath::motorControlReady(
+        true, true, true, true, false, false, true, true, 180.0f, 45.0f));
+    TEST_ASSERT_TRUE(TrackingMath::motorControlReady(
+        true, true, true, true, true, true, true, true, 180.0f, 45.0f));
+    TEST_ASSERT_FALSE(TrackingMath::motorControlReady(
+        true, true, true, true, true, false, true, true, 180.0f, 45.0f));
+    TEST_ASSERT_FALSE(TrackingMath::motorControlReady(
+        false, true, true, true, false, false, true, true, 180.0f, 45.0f));
+    TEST_ASSERT_FALSE(TrackingMath::motorControlReady(
+        true, false, true, true, false, false, true, true, 180.0f, 45.0f));
+    TEST_ASSERT_FALSE(TrackingMath::motorControlReady(
+        true, true, false, true, false, false, true, true, 180.0f, 45.0f));
+    TEST_ASSERT_FALSE(TrackingMath::motorControlReady(
+        true, true, true, false, false, false, true, true, 180.0f, 45.0f));
+    TEST_ASSERT_FALSE(TrackingMath::motorControlReady(
+        true, true, true, true, false, false, false, true, 180.0f, 45.0f));
+    TEST_ASSERT_FALSE(TrackingMath::motorControlReady(
+        true, true, true, true, false, false, true, false, 180.0f, 45.0f));
+    TEST_ASSERT_FALSE(TrackingMath::motorControlReady(
+        true, true, true, true, false, false, true, true, NAN, 45.0f));
+    TEST_ASSERT_FALSE(TrackingMath::motorControlReady(
+        true, true, true, true, false, false, true, true, 180.0f, 90.1f));
+}
+
+void test_motor_sensor_sample_accepts_calibrated_valid_boundaries() {
+    TEST_ASSERT_TRUE(TrackingMath::validMotorSensorSample(
+        true, true, 3, 3, 0.0f, 0));
+    TEST_ASSERT_TRUE(TrackingMath::validMotorSensorSample(
+        true, true, 3, 3, 359.999f, 4095));
+}
+
+void test_motor_sensor_sample_rejects_missing_or_invalid_sensor_data() {
+    TEST_ASSERT_FALSE(TrackingMath::validMotorSensorSample(
+        false, true, 3, 3, 180.0f, 2048));
+    TEST_ASSERT_FALSE(TrackingMath::validMotorSensorSample(
+        true, false, 3, 3, 180.0f, 2048));
+    TEST_ASSERT_FALSE(TrackingMath::validMotorSensorSample(
+        true, true, 2, 3, 180.0f, 2048));
+    TEST_ASSERT_FALSE(TrackingMath::validMotorSensorSample(
+        true, true, 3, 2, 180.0f, 2048));
+    TEST_ASSERT_FALSE(TrackingMath::validMotorSensorSample(
+        true, true, 3, 3, NAN, 2048));
+    TEST_ASSERT_FALSE(TrackingMath::validMotorSensorSample(
+        true, true, 3, 3, -0.1f, 2048));
+    TEST_ASSERT_FALSE(TrackingMath::validMotorSensorSample(
+        true, true, 3, 3, 360.0f, 2048));
+    TEST_ASSERT_FALSE(TrackingMath::validMotorSensorSample(
+        true, true, 3, 3, 180.0f, 4096));
+}
+
+
 int main(int argc, char **argv) {
     UNITY_BEGIN();
+    RUN_TEST(test_motor_readiness_requires_all_prerequisites_and_satellite_tle);
+    RUN_TEST(test_motor_sensor_sample_accepts_calibrated_valid_boundaries);
+    RUN_TEST(test_motor_sensor_sample_rejects_missing_or_invalid_sensor_data);
     RUN_TEST(test_proportional_controller_clamps_extreme_finite_inputs_before_rounding);
     RUN_TEST(test_proportional_controller_rejects_invalid_gain_deadband_and_limit);
     RUN_TEST(test_finite_double_parser_accepts_valid_decimal_and_exponent_values);
