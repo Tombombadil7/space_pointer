@@ -24,6 +24,20 @@ void test_rejects_non_finite_angles() {
     TEST_ASSERT_FLOAT_WITHIN(0.001f, 0.0f, TrackingMath::wrapAngle(NAN));
 }
 
+void test_chronological_event_pair_accepts_rise_before_set() {
+    TEST_ASSERT_TRUE(TrackingMath::chronologicalEventPair(10.0, 10.5));
+}
+
+void test_chronological_event_pair_rejects_reversed_or_equal_times() {
+    TEST_ASSERT_FALSE(TrackingMath::chronologicalEventPair(10.5, 10.0));
+    TEST_ASSERT_FALSE(TrackingMath::chronologicalEventPair(10.0, 10.0));
+}
+
+void test_chronological_event_pair_rejects_non_finite_times() {
+    TEST_ASSERT_FALSE(TrackingMath::chronologicalEventPair(NAN, 10.0));
+    TEST_ASSERT_FALSE(TrackingMath::chronologicalEventPair(10.0, INFINITY));
+}
+
 void test_validates_observer_coordinates_and_altitude() {
     TEST_ASSERT_TRUE(TrackingMath::validObserver(32.0, 34.8, 50.0));
     TEST_ASSERT_FALSE(TrackingMath::validObserver(91.0, 34.8, 50.0));
@@ -206,6 +220,9 @@ int main(int argc, char **argv) {
     RUN_TEST(test_full_revolution_is_zero);
     RUN_TEST(test_preserves_positive_and_negative_half_turns);
     RUN_TEST(test_rejects_non_finite_angles);
+    RUN_TEST(test_chronological_event_pair_accepts_rise_before_set);
+    RUN_TEST(test_chronological_event_pair_rejects_reversed_or_equal_times);
+    RUN_TEST(test_chronological_event_pair_rejects_non_finite_times);
     RUN_TEST(test_validates_observer_coordinates_and_altitude);
     RUN_TEST(test_validates_norad_ids);
     RUN_TEST(test_accepts_only_supported_bodies);
