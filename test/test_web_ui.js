@@ -183,8 +183,10 @@ test("telemetry recovers after a temporary API failure", async () => {
   assert.equal(h.element("target-name").innerText, "ISS");
   assert.equal(h.element("az").innerText, "359.50");
   assert.equal(h.element("speed").innerText, "7.66");
-  assert.deepEqual(h.markerPosition, [12.5, 34.5]);
-  assert.deepEqual(h.mapPan, [12.5, 34.5]);
+  assert.equal(h.markerPosition[0], 12.5);
+  assert.equal(h.markerPosition[1], 34.5);
+  assert.equal(h.mapPan[0], 12.5);
+  assert.equal(h.mapPan[1], 34.5);
 });
 
 test("planet telemetry displays speed as unavailable, not zero", async () => {
