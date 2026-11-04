@@ -8,7 +8,7 @@ Run the tests from the repository root:
 pio test -e native
 ```
 
-The native suite currently contains 53 test cases covering:
+The native suite currently contains 49 test cases covering:
 - Angular wrapping, exact half-turn boundaries, multiple revolutions, and non-finite inputs.
 - Observer latitude, longitude, and altitude validation, including exact limits and out-of-range values.
 - NORAD ID boundaries and supported planetary-body IDs.
@@ -27,19 +27,22 @@ The native tests now exercise the Astronomy Engine library directly, but do not 
 
 ## Dashboard tests
 
-The browser-side request and telemetry flow is tested with Node's built-in test
-runner. These tests execute the JavaScript embedded in `include/web_ui.h`
-with small DOM, Leaflet, geolocation, and fetch mocks:
+The browser-side suite currently contains 15 tests and uses Node's built-in test
+runner. It executes the JavaScript embedded in `include/web_ui.h` with small
+DOM, Leaflet, geolocation, and fetch mocks:
 
 ```sh
 node --test test/test_web_ui.js
 ```
 
-They cover firmware route method/authentication/CSRF contracts, POST + CSRF
-headers, target and phone-GPS payloads, failed mutation feedback, telemetry-only
-error handling, recovery after a 503, map updates, and the planet speed-unavailable
-display. This is a JavaScript behavior test,
-not a full real-browser or Wi-Fi integration test.
+The tests cover firmware route method/authentication/CSRF contracts, rejecting
+satellite mutations before committing when the TLE worker is unavailable,
+POST + CSRF headers, target and phone-GPS payloads, HTTPS secure-context
+requirements, geolocation permission/unavailable/timeout errors, missing browser
+geolocation support, failed mutation feedback, telemetry-only error handling,
+recovery after a 503, map updates, and the planet speed-unavailable display.
+They test JavaScript behavior with mocks; they are not a full real-browser or
+Wi-Fi integration test.
 
 ## Sanitizer run
 

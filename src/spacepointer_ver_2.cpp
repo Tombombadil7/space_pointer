@@ -89,10 +89,6 @@ struct {
   time_t nextPassLOS    = 0;   // unix timestamp — set time or satellite LOS
   double nextPassMaxEl  = 0;   // degrees — satellite only, 0 for planets
 
-  // Each telemetry group records the exact target/location generations that
-  // produced it. Protected by sysMutex and checked before the web API reads it.
-  TrackingMath::GenerationReadiness telemetrySourceVersions;
-  TrackingMath::GenerationReadiness passSourceVersions;
 
 } sys;
 
@@ -107,18 +103,12 @@ struct TargetState {
   char name[25];
 };
 TargetState current = {TYPE_SATELLITE, {.noradID = 25544}, "ISS"};
-// Incremented whenever the selected target changes. PhysicsTask and MotorTask
-// use this version to reject calculations/commands produced for an older target.
-// Access is protected by targetMutex, just like current and motorTarget.
-uint32_t targetGeneration = 1;
-
-// Incremented whenever the observer's location changes. Protected by sysMutex,
-// alongside sys.lat/lon/alt, so a calculation can verify its location snapshot.
-uint32_t observerGeneration = 1;
-
-struct VersionedTargetSnapshot {
+// One generation represents all inputs that affect tracking.
+struct ConfigurationSnapshot {
   TargetState target;
   uint32_t generation;
+  bool locationReady;
+  double lat, lon, alt;
 };
 // A deliberately simple proportional controller is enough for slow telescope tracking.
 // It avoids derivative kick and integral wind-up when a new target is selected.
@@ -126,35 +116,25 @@ struct PController {
   float kp;
   float deadband;
 };
-struct MotorTarget { float az = 0; float el = 0; } motorTarget;
 
 // Modest gains suit the small, repeated corrections used during normal tracking.
 // A narrow deadband filters sensor noise without allowing a large pointing error.
 PController pAz = {2.5f, 0.05f};
 PController pEl = {3.0f, 0.05f};
-SemaphoreHandle_t targetMutex;   // protects current, motorTarget, and calculationReadiness
+SemaphoreHandle_t stateMutex;    // protects target, location, telemetry, and readiness
 SemaphoreHandle_t i2cMutex;      // protects the shared I2C bus
-SemaphoreHandle_t sysMutex;      // protects observer and telemetry state
-SemaphoreHandle_t sgp4Mutex;
-// The observer/target pair used to initialize satSgp4; protected by sgp4Mutex.
-TrackingMath::GenerationReadiness tleSourceVersions;     // protects the shared SGP4 instance
-SemaphoreHandle_t tleFetchMutex;
+SemaphoreHandle_t sgp4Mutex;     // protects the shared SGP4 instance
 // One long-lived worker handles all TLE refresh requests. Notifications are
 // coalesced while a download is running, so rapid target changes cannot create
 // an unbounded number of short-lived FreeRTOS tasks.
 TaskHandle_t tleFetchTaskHandle = NULL;
+TaskHandle_t motorTaskHandle = NULL;
 
-volatile bool bnoReady = false;
-volatile bool encoderReady = false;
-volatile bool observerReady = false;
-volatile bool timeReady = false;
-volatile bool tleReady = false;
-// Protected by targetMutex. Readiness is valid only for this exact target/location pair.
-TrackingMath::GenerationReadiness calculationReadiness;
-
-// Other tasks may request a safe stop, but only MotorTask writes motor GPIOs.
-// MotorTask consumes this flag and performs the actual ENABLE-pin changes.
-volatile bool motorStopRequested = true;
+// These sensors are initialized once during setup.
+bool sensorsReady = false;
+// Protected by stateMutex; one generation invalidates all derived results.
+TrackingMath::ConfigurationReadiness systemReadiness;
+static const uint32_t MOTOR_STOP_NOTIFICATION = 1UL << 0;
 
 // Change both credentials before deploying outside a trusted test network.
 static const char *CONTROL_USER = "admin";
@@ -175,24 +155,19 @@ bool updateIPLocation();
 void fetchTLE();
 bool startTLEFetchTask();
 void TLEFetchTask(void * p);
-TargetState getTargetSnapshot();
-VersionedTargetSnapshot getVersionedTargetSnapshot();
-// Returns telemetry only when it belongs to the target and observer snapshots
-// copied atomically under targetMutex -> sysMutex.
-bool getVersionedTelemetrySnapshot(TargetState &target, TelemetrySnapshot &snapshot);
-bool getVersionedObserverSnapshot(double &lat, double &lon, double &alt,
-                                  uint32_t &generation);
+ConfigurationSnapshot getConfigurationSnapshot();
+bool getTelemetrySnapshot(TargetState &target, TelemetrySnapshot &snapshot);
+bool isTimeReady();
+bool lockTleForGeneration(uint32_t generation);
 bool parseDoubleArg(AsyncWebServerRequest *request, const char *name, double &value);
 // Require a non-simple custom header on state-changing requests to block browser CSRF.
 bool hasValidMutationRequest(AsyncWebServerRequest *request);
 void disableMotors();
-// Clear readiness after releasing sysMutex; never acquire targetMutex from sysMutex.
-void invalidateCalculationReadiness();
+// Call while stateMutex is held after a target or observer change.
+void advanceConfigurationLocked();
 const char *planetName(int body);
 void PhysicsTask(void * p);
-void updateNextPass(const TargetState &target, uint32_t targetVersion,
-                    uint32_t observerVersion, time_t now,
-                    double lat, double lon, double alt);
+void updateNextPass(const ConfigurationSnapshot &snapshot, time_t now);
 void stepMotor(int stepPin, int dirPin, bool forward);
 int pidOutput(const PController &p, float error);
 void MotorTask(void * p);
@@ -207,13 +182,10 @@ void setup() {
   Serial.println("\nStarting Universal Space Pointer...");
 
   // ── 2. FreeRTOS Primitives ─────────────────────────────────────────
-  targetMutex   = xSemaphoreCreateMutex();
+  stateMutex    = xSemaphoreCreateMutex();
   i2cMutex      = xSemaphoreCreateMutex();
-  sysMutex      = xSemaphoreCreateMutex();
   sgp4Mutex     = xSemaphoreCreateMutex();
-  tleFetchMutex = xSemaphoreCreateMutex();
-  if (targetMutex == NULL || i2cMutex == NULL || sysMutex == NULL ||
-      sgp4Mutex == NULL || tleFetchMutex == NULL) {
+  if (stateMutex == NULL || i2cMutex == NULL || sgp4Mutex == NULL) {
       Serial.println("CRITICAL: Failed to create mutexes! Halting.");
       while (1) { delay(1000); }
   }
@@ -242,16 +214,18 @@ void setup() {
 
   // ── AS5600 encoder ─────────────────────────────────────────────────
   encoder.begin();
-  encoderReady = encoder.isConnected();
-  if (!encoderReady) {
+  const bool encoderDetected = encoder.isConnected();
+  if (!encoderDetected) {
       Serial.println("WARNING: AS5600 not found — motor control will stay disabled");
   }
 
   // ── BNO055 IMU ─────────────────────────────────────────────────────
-  bnoReady = bno.begin();
-  if (!bnoReady) {
+  const bool bnoDetected = bno.begin();
+  if (!bnoDetected) {
       Serial.println("WARNING: BNO055 not found — motor control will stay disabled");
   }
+
+  sensorsReady = encoderDetected && bnoDetected;
 
   // ── 4. Network & Web Services ──────────────────────────────────────
   WiFiManager wm;
@@ -260,8 +234,7 @@ void setup() {
       disableMotors();
       while (1) { delay(1000); }
   }
-  observerReady = updateIPLocation();
-  if (!observerReady) {
+  if (!updateIPLocation()) {
       Serial.println("WARNING: IP geolocation failed; use Sync Phone GPS before tracking.");
   }
 
@@ -289,25 +262,22 @@ void setup() {
           r->send(400, "text/plain", "Invalid location. Check latitude, longitude and altitude.");
           return;
       }
-      if (xSemaphoreTake(sysMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+      if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
           r->send(503, "text/plain", "System busy; retry location update.");
           return;
       }
-      sys.lat = lat; sys.lon = lon; sys.alt = alt;
-      ++observerGeneration;
-      if (observerGeneration == 0) ++observerGeneration; // Reserve zero for an invalid snapshot.
-      xSemaphoreGive(sysMutex);
-      observerReady = true;
-      invalidateCalculationReadiness();
-
-      TargetState target = getTargetSnapshot();
-      if (target.type == TYPE_SATELLITE) {
-          tleReady = false;   // invalidate the old observer's SGP4 state immediately
-          if (!startTLEFetchTask()) {
-              r->send(503, "text/plain", "Could not start TLE refresh; motors remain disabled.");
-              return;
-          }
+      const bool refreshTLE = current.type == TYPE_SATELLITE;
+      // The worker handle is created once at startup and remains valid for the device lifetime.
+      if (refreshTLE && tleFetchTaskHandle == NULL) {
+          xSemaphoreGive(stateMutex);
+          r->send(503, "text/plain", "TLE refresh unavailable; location was not changed.");
+          return;
       }
+      sys.lat = lat; sys.lon = lon; sys.alt = alt;
+      systemReadiness.locationReady = true;
+      advanceConfigurationLocked();
+      xSemaphoreGive(stateMutex);
+      if (refreshTLE) startTLEFetchTask();
       r->send(202, "text/plain", "Location accepted.");
   });
 
@@ -363,27 +333,21 @@ void setup() {
           strlcpy(next.name, planetName((int)val), sizeof(next.name));
       }
 
-      if (xSemaphoreTake(targetMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+      if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
           r->send(503, "text/plain", "Target controller busy; retry.");
           return;
       }
-      if (next.type == TYPE_SATELLITE) {
-          tleReady = false;   // never track a newly selected NORAD ID with the previous TLE
+      const bool refreshTLE = next.type == TYPE_SATELLITE;
+      // Check worker availability before committing a target that needs a TLE.
+      if (refreshTLE && tleFetchTaskHandle == NULL) {
+          xSemaphoreGive(stateMutex);
+          r->send(503, "text/plain", "TLE worker unavailable; target was not changed.");
+          return;
       }
-      calculationReadiness.clear(); // targetMutex is already held here.
       current = next;
-      ++targetGeneration;
-      if (targetGeneration == 0) ++targetGeneration; // Reserve zero for an invalid snapshot.
-      motorTarget.az = 0;
-      motorTarget.el = 0;
-      xSemaphoreGive(targetMutex);
-
-      if (next.type == TYPE_SATELLITE) {
-          if (!startTLEFetchTask()) {
-              r->send(503, "text/plain", "Could not start TLE download; motors remain disabled.");
-              return;
-          }
-      }
+      advanceConfigurationLocked();
+      xSemaphoreGive(stateMutex);
+      if (refreshTLE) startTLEFetchTask();
       r->send(202, "text/plain", "Target accepted.");
   });
 
@@ -394,7 +358,7 @@ void setup() {
       // location update can otherwise pair the new name with old coordinates,
       // distances, or pass times. Return a temporary response until PhysicsTask
       // publishes telemetry for the exact current target/location pair.
-      if (!getVersionedTelemetrySnapshot(target, data)) {
+      if (!getTelemetrySnapshot(target, data)) {
           r->send(503, "text/plain",
                   "Telemetry is updating for the selected target or location; please retry.");
           return;
@@ -441,16 +405,21 @@ void setup() {
       delay(250);
       Serial.print(".");
   }
-  timeReady = (time(&now) >= 1000000000);
-  if (timeReady) {
+  const bool timeSynced = (time(&now) >= 1000000000);
+  if (timeSynced) {
       Serial.println("\nTime synchronized (UTC)!");
   } else {
       Serial.println("\nWARNING: NTP sync timed out; motor tracking remains disabled.");
   }
 
-  // Load the default ISS TLE before the physics task can use the SGP4 object.
-  if (timeReady && observerReady) {
-      fetchTLE();
+  // Request the default ISS TLE through the same worker used for later refreshes.
+  const ConfigurationSnapshot initialConfig = getConfigurationSnapshot();
+  if (timeSynced && initialConfig.locationReady &&
+      TrackingMath::validObserver(initialConfig.lat, initialConfig.lon,
+                                  initialConfig.alt)) {
+      if (!startTLEFetchTask()) {
+          Serial.println("WARNING: Could not request initial TLE refresh; satellite tracking will remain disabled.");
+      }
   }
 
   // ── 6. Task Creation ───────────────────────────────────────────────
@@ -459,7 +428,8 @@ void setup() {
       Serial.println("CRITICAL: Physics task creation failed.");
       disableMotors();
   }
-  if (xTaskCreatePinnedToCore(MotorTask, "Motors", 8000, NULL, 3, NULL, 0) != pdPASS) {
+  if (xTaskCreatePinnedToCore(MotorTask, "Motors", 8000, NULL, 3,
+                              &motorTaskHandle, 0) != pdPASS) {
       Serial.println("CRITICAL: Motor task creation failed.");
       disableMotors();
   }
@@ -472,86 +442,78 @@ void loop() {
 
 
 
-void invalidateCalculationReadiness() {
-  // Call only when sysMutex is not held. Nested locking always follows
-  // targetMutex -> sysMutex, preventing a reverse-order deadlock.
-  if (targetMutex != NULL &&
-      xSemaphoreTake(targetMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-      calculationReadiness.clear();
-      xSemaphoreGive(targetMutex);
-  }
+void advanceConfigurationLocked() {
+  systemReadiness.invalidate();
+  sys.nextPassValid = false;
+  sys.nextPassAOS = 0;
+  sys.nextPassLOS = 0;
+  sys.nextPassMaxEl = 0;
 }
 
-VersionedTargetSnapshot getVersionedTargetSnapshot() {
-  VersionedTargetSnapshot result = {};
-  if (targetMutex != NULL && xSemaphoreTake(targetMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+ConfigurationSnapshot getConfigurationSnapshot() {
+  ConfigurationSnapshot result = {};
+  if (stateMutex != NULL &&
+      xSemaphoreTake(stateMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
       result.target = current;
-      result.generation = targetGeneration;
-      xSemaphoreGive(targetMutex);
+      result.generation = systemReadiness.generation;
+      result.locationReady = systemReadiness.locationReady;
+      result.lat = sys.lat;
+      result.lon = sys.lon;
+      result.alt = sys.alt;
+      xSemaphoreGive(stateMutex);
   }
-  // A zero generation means the mutex could not be acquired; callers must
-  // treat that snapshot as unavailable instead of calculating with defaults.
   return result;
 }
 
-TargetState getTargetSnapshot() {
-  return getVersionedTargetSnapshot().target;
-}
-
-bool getVersionedTelemetrySnapshot(TargetState &target, TelemetrySnapshot &snapshot) {
-  // Lock target first, then system state. This is the same order used by
-  // PhysicsTask and updateNextPass, so the API cannot observe half a target switch.
-  if (targetMutex == NULL ||
-      xSemaphoreTake(targetMutex, pdMS_TO_TICKS(20)) != pdTRUE) {
+bool getTelemetrySnapshot(TargetState &target, TelemetrySnapshot &snapshot) {
+  if (stateMutex == NULL ||
+      xSemaphoreTake(stateMutex, pdMS_TO_TICKS(20)) != pdTRUE) {
       return false;
   }
 
-  bool snapshotReady = false;
-  if (sysMutex != NULL && xSemaphoreTake(sysMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-      // The target and observer versions must both match the versions that
-      // produced the pointing/position telemetry. Old data is never labelled
-      // with the newly selected target's name.
-      if (sys.telemetrySourceVersions.matches(targetGeneration, observerGeneration)) {
-          target = current;
-          snapshot.targetAz = sys.targetAz; snapshot.targetEl = sys.targetEl;
-          snapshot.satLat = sys.satLat; snapshot.satLon = sys.satLon;
-          snapshot.satSpeed = sys.satSpeed; snapshot.satAltKm = sys.satAltKm;
-          snapshot.satDist = sys.satDist;
-
-          // Pass predictions are refreshed on their own schedule. Until the
-          // matching version is available, show no prediction rather than
-          // carrying a rise/set time over from a previous target/location.
-          snapshot.nextPassValid =
-              sys.passSourceVersions.matches(targetGeneration, observerGeneration) &&
-              sys.nextPassValid;
-          snapshot.nextPassAOS = snapshot.nextPassValid ? sys.nextPassAOS : 0;
-          snapshot.nextPassLOS = snapshot.nextPassValid ? sys.nextPassLOS : 0;
-          snapshot.nextPassMaxEl = snapshot.nextPassValid ? sys.nextPassMaxEl : 0;
-          snapshotReady = true;
-      }
-      xSemaphoreGive(sysMutex);
+  const bool ready = systemReadiness.calculationReady;
+  if (ready) {
+      target = current;
+      snapshot.targetAz = sys.targetAz;
+      snapshot.targetEl = sys.targetEl;
+      snapshot.satLat = sys.satLat;
+      snapshot.satLon = sys.satLon;
+      snapshot.satSpeed = sys.satSpeed;
+      snapshot.satAltKm = sys.satAltKm;
+      snapshot.satDist = sys.satDist;
+      snapshot.nextPassValid = systemReadiness.passReady && sys.nextPassValid;
+      snapshot.nextPassAOS = snapshot.nextPassValid ? sys.nextPassAOS : 0;
+      snapshot.nextPassLOS = snapshot.nextPassValid ? sys.nextPassLOS : 0;
+      snapshot.nextPassMaxEl = snapshot.nextPassValid ? sys.nextPassMaxEl : 0;
   }
 
-  xSemaphoreGive(targetMutex);
-  return snapshotReady;
+  xSemaphoreGive(stateMutex);
+  return ready;
 }
 
-bool getVersionedObserverSnapshot(double &lat, double &lon, double &alt,
-                                  uint32_t &generation) {
-  // Read the coordinates and their version under the same lock. This ensures
-  // the version always describes the exact location copied into this snapshot.
-  if (sysMutex == NULL || xSemaphoreTake(sysMutex, pdMS_TO_TICKS(20)) != pdTRUE) {
+bool isTimeReady() {
+  time_t now = 0;
+  time(&now);
+  return now >= 1000000000;
+}
+
+// Lock order is always stateMutex -> sgp4Mutex. This makes checking the TLE
+// generation and acquiring the shared SGP4 model one atomic operation.
+bool lockTleForGeneration(uint32_t generation) {
+  if (stateMutex == NULL ||
+      xSemaphoreTake(stateMutex, pdMS_TO_TICKS(20)) != pdTRUE) {
       return false;
   }
 
-  lat = sys.lat;
-  lon = sys.lon;
-  alt = sys.alt;
-  generation = observerGeneration;
-  xSemaphoreGive(sysMutex);
-
-  return generation != 0 && TrackingMath::validObserver(lat, lon, alt);
+  const bool ready = systemReadiness.isCurrent(generation) &&
+                     systemReadiness.tleReady;
+  const bool locked = ready &&
+      xSemaphoreTake(sgp4Mutex, pdMS_TO_TICKS(100)) == pdTRUE;
+  xSemaphoreGive(stateMutex);
+  return locked;
 }
+
+
 
 bool hasValidMutationRequest(AsyncWebServerRequest *request) {
   // Cross-origin HTML forms cannot set this custom header. Cross-origin fetch
@@ -576,18 +538,16 @@ const char *planetName(int body) {
   }
 }
 
-// Request a stop from any task. This function deliberately does not touch GPIO:
-// MotorTask owns all motor outputs and will disable the drivers on its next tick.
+// The stop bit is latched by FreeRTOS until MotorTask consumes it. Only
+// MotorTask writes motor GPIOs after setup.
 void disableMotors() {
-  motorStopRequested = true;
+  if (motorTaskHandle != NULL) {
+      xTaskNotify(motorTaskHandle, MOTOR_STOP_NOTIFICATION, eSetBits);
+  }
 }
 
-// Ask the persistent worker to refresh TLE data. FreeRTOS task notifications
-// are counted, but the worker clears pending notifications when it wakes; this
-// intentionally coalesces a burst of requests into one refresh of the latest target.
+// Configuration changes invalidate readiness before requesting TLE data.
 bool startTLEFetchTask() {
-  tleReady = false;
-  invalidateCalculationReadiness();
   if (tleFetchTaskHandle == NULL) return false;
   xTaskNotifyGive(tleFetchTaskHandle);
   return true;
@@ -612,31 +572,23 @@ int pidOutput(const PController &p, float error) {
 
 // Calculate the next satellite pass or planetary rise/set independently of
 // any display. The web API reads the result from the shared telemetry state.
-void updateNextPass(const TargetState &target, uint32_t targetVersion,
-                    uint32_t observerVersion, time_t now,
-                    double lat, double lon, double alt) {
+void updateNextPass(const ConfigurationSnapshot &snapshot, time_t now) {
+    const TargetState &target = snapshot.target;
     bool passValid = false;
     time_t aosTime = 0;
     time_t losTime = 0;
     double maxElevation = 0.0;
 
-    if (target.type == TYPE_SATELLITE && tleReady &&
-        xSemaphoreTake(sgp4Mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        // Never calculate a pass with SGP4 data belonging to an older target
-        // or observer location. The source token is protected by this mutex.
-        if (tleSourceVersions.matches(targetVersion, observerVersion)) {
-            // Search for a pass that reaches at least 20 degrees above the horizon.
-            // The second argument is the search iteration limit, not the elevation.
-            const bool predictionReady =
-                satSgp4.initpredpoint((unsigned long)now, 0.0);
-            passinfo overpass = {};
-            passValid = predictionReady &&
-                        satSgp4.nextpass(&overpass, 20, false, 20.0);
-            if (passValid) {
-                aosTime = (time_t)((overpass.jdstart - 2440587.5) * 86400.0);
-                losTime = (time_t)((overpass.jdstop  - 2440587.5) * 86400.0);
-                maxElevation = overpass.maxelevation;
-            }
+    if (target.type == TYPE_SATELLITE &&
+        lockTleForGeneration(snapshot.generation)) {
+        const bool predictionReady =
+            satSgp4.initpredpoint((unsigned long)now, 0.0);
+        passinfo overpass = {};
+        passValid = predictionReady && satSgp4.nextpass(&overpass, 20, false, 20.0);
+        if (passValid) {
+            aosTime = (time_t)((overpass.jdstart - 2440587.5) * 86400.0);
+            losTime = (time_t)((overpass.jdstop  - 2440587.5) * 86400.0);
+            maxElevation = overpass.maxelevation;
         }
         xSemaphoreGive(sgp4Mutex);
     } else if (target.type == TYPE_PLANET) {
@@ -645,18 +597,12 @@ void updateNextPass(const TargetState &target, uint32_t targetVersion,
             astro_time_t start = Astronomy_MakeTime(
                 utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday,
                 utc.tm_hour, utc.tm_min, (double)utc.tm_sec);
-            const astro_observer_t observer = {lat, lon, alt};
-            // Find the next rise first, then search for the set after that rise.
-            // Independent searches can pair tomorrow's rise with today's set
-            // when the object is already above the horizon. Sequential searches
-            // keep the displayed pair chronological without calculating the
-            // object's current altitude or sky position separately.
+            const astro_observer_t observer = {snapshot.lat, snapshot.lon, snapshot.alt};
             const astro_search_result_t rise = Astronomy_SearchRiseSet(
                 (astro_body_t)target.body, observer, DIRECTION_RISE, start, 1.0);
             if (rise.status == ASTRO_SUCCESS) {
-                // Start one second after the rise so the set search cannot return
-                // an event at the same instant due to boundary/rounding behavior.
-                const astro_time_t afterRise = Astronomy_AddDays(rise.time, 1.0 / 86400.0);
+                const astro_time_t afterRise =
+                    Astronomy_AddDays(rise.time, 1.0 / 86400.0);
                 const astro_search_result_t set = Astronomy_SearchRiseSet(
                     (astro_body_t)target.body, observer, DIRECTION_SET, afterRise, 1.0);
                 if (set.status == ASTRO_SUCCESS &&
@@ -669,77 +615,41 @@ void updateNextPass(const TargetState &target, uint32_t targetVersion,
         }
     }
 
-    // A pass prediction can take noticeable time. Publish it only if neither
-    // the selected target nor the observer location changed during the search.
-    // Lock order stays targetMutex -> sysMutex, matching the physics commit path.
-    if (xSemaphoreTake(targetMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-        if (targetGeneration == targetVersion &&
-            xSemaphoreTake(sysMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-            if (observerGeneration == observerVersion) {
-                sys.nextPassValid = passValid;
-                sys.nextPassAOS = aosTime;
-                sys.nextPassLOS = losTime;
-                sys.nextPassMaxEl = maxElevation;
-                // Tag this independently refreshed group so it cannot leak
-                // rise/set times across a target or observer-location change.
-                sys.passSourceVersions.publish(targetVersion, observerVersion);
-            }
-            xSemaphoreGive(sysMutex);
+    if (stateMutex != NULL &&
+        xSemaphoreTake(stateMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+        if (systemReadiness.isCurrent(snapshot.generation)) {
+            sys.nextPassValid = passValid;
+            sys.nextPassAOS = aosTime;
+            sys.nextPassLOS = losTime;
+            sys.nextPassMaxEl = maxElevation;
+            systemReadiness.publishPass(snapshot.generation);
         }
-        xSemaphoreGive(targetMutex);
+        xSemaphoreGive(stateMutex);
     }
 }
+
+
 
 void PhysicsTask(void * p) {
   TickType_t lastWake = xTaskGetTickCount();
 
   for (;;) {
-      if (!timeReady) {
-          time_t syncedTime = 0;
-          time(&syncedTime);
-          if (syncedTime >= 1000000000) {
-              timeReady = true;   // NTP may have synchronized after the startup timeout.
-              Serial.println("NTP time became available; tracking can resume.");
-          }
-      }
-      if (!timeReady || !observerReady) {
-          // MotorTask checks these prerequisites independently. A delayed
-          // physics iteration must not erase a newer successful token.
-          vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(500));
-          continue;
-      }
-
-      const VersionedTargetSnapshot targetSnapshot = getVersionedTargetSnapshot();
-      if (targetSnapshot.generation == 0) {
-          // No consistent target snapshot was available; do not publish a token.
-          vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(500));
-          continue;
-      }
-      const TargetState target = targetSnapshot.target;
-      const uint32_t calculationGeneration = targetSnapshot.generation;
-      double lat, lon, alt;
-      uint32_t calculationObserverGeneration = 0;
-      if (!getVersionedObserverSnapshot(lat, lon, alt,
-                                        calculationObserverGeneration)) {
-          // No observer snapshot was available; the motor task will fail safe.
-          vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(500));
-          continue;
-      }
-
-      time_t now;
+      const ConfigurationSnapshot snapshot = getConfigurationSnapshot();
+      time_t now = 0;
       time(&now);
-      if (now < 1000000000) {
-          // MotorTask independently checks timeReady before enabling the drivers.
+      if (snapshot.generation == 0 || !snapshot.locationReady ||
+          !TrackingMath::validObserver(snapshot.lat, snapshot.lon, snapshot.alt) ||
+          now < 1000000000) {
           vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(500));
           continue;
       }
 
-      // Pass/rise/set predictions are telemetry too, so update them here
-      // rather than tying their calculation to a physical display task.
+      const TargetState &target = snapshot.target;
+      const uint32_t generation = snapshot.generation;
+
       static uint32_t lastPassCalc = 0;
       if (millis() - lastPassCalc > 30000) {
-          updateNextPass(target, calculationGeneration,
-                         calculationObserverGeneration, now, lat, lon, alt);
+          updateNextPass(snapshot, now);
           lastPassCalc = millis();
       }
 
@@ -749,33 +659,26 @@ void PhysicsTask(void * p) {
       bool calculationOK = false;
 
       if (target.type == TYPE_SATELLITE) {
-          if (tleReady && xSemaphoreTake(sgp4Mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-              if (tleSourceVersions.matches(calculationGeneration,
-                                            calculationObserverGeneration)) {
-                  satSgp4.findsat((unsigned long)now);
-                  targetAz = satSgp4.satAz;
-                  targetEl = satSgp4.satEl;
-                  satLat = satSgp4.satLat;
-                  satLon = satSgp4.satLon;
-                  satAltKm = satSgp4.satAlt;
-                  satDist = satSgp4.satDist;
+          if (lockTleForGeneration(generation)) {
+              satSgp4.findsat((unsigned long)now);
+              targetAz = satSgp4.satAz;
+              targetEl = satSgp4.satEl;
+              satLat = satSgp4.satLat;
+              satLon = satSgp4.satLon;
+              satAltKm = satSgp4.satAlt;
+              satDist = satSgp4.satDist;
 
-                  // The library's SGP4 core already calculates the velocity
-                  // vector in km/s. Use its magnitude instead of estimating
-                  // speed from latitude/longitude/altitude differences.
-                  const double tsinceMinutes =
-                      (satSgp4.satJd - satSgp4.satrec.jdsatepoch) * 1440.0;
-                  double position[3], velocity[3];
-                  if (sgp4(wgs84, satSgp4.satrec, tsinceMinutes,
-                           position, velocity)) {
-                      satSpeed = sqrt(velocity[0] * velocity[0] +
-                                      velocity[1] * velocity[1] +
-                                      velocity[2] * velocity[2]);
-                      calculationOK = isfinite(targetAz) && isfinite(targetEl) &&
-                                      isfinite(satSpeed) && isfinite(satAltKm) &&
-                                      isfinite(satDist);
-                  }
-              } // End exact TLE source-generation match.
+              const double tsinceMinutes =
+                  (satSgp4.satJd - satSgp4.satrec.jdsatepoch) * 1440.0;
+              double position[3], velocity[3];
+              if (sgp4(wgs84, satSgp4.satrec, tsinceMinutes, position, velocity)) {
+                  satSpeed = sqrt(velocity[0] * velocity[0] +
+                                  velocity[1] * velocity[1] +
+                                  velocity[2] * velocity[2]);
+                  calculationOK = isfinite(targetAz) && isfinite(targetEl) &&
+                                  isfinite(satSpeed) && isfinite(satAltKm) &&
+                                  isfinite(satDist);
+              }
               xSemaphoreGive(sgp4Mutex);
           }
       } else {
@@ -784,76 +687,43 @@ void PhysicsTask(void * p) {
               astro_time_t aTime = Astronomy_MakeTime(
                   utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday,
                   utc.tm_hour, utc.tm_min, (double)utc.tm_sec);
-              const astro_observer_t obs = {lat, lon, alt};
-              astro_equatorial_t equ1 = Astronomy_Equator(
-                  (astro_body_t)target.body, &aTime, obs,
+              const astro_observer_t observer = {snapshot.lat, snapshot.lon, snapshot.alt};
+              astro_equatorial_t equatorial = Astronomy_Equator(
+                  (astro_body_t)target.body, &aTime, observer,
                   EQUATOR_OF_DATE, ABERRATION);
-              if (equ1.status == ASTRO_SUCCESS) {
-                  astro_horizon_t hor1 = Astronomy_Horizon(
-                      &aTime, obs, equ1.ra, equ1.dec, REFRACTION_NORMAL);
-
-                  const double distanceKm = equ1.dist * 149597870.7;
-
-                  targetAz = hor1.azimuth;
-                  targetEl = hor1.altitude;
-                  // Planetary speed is intentionally not calculated; the UI
-                  // marks this field as unavailable for non-satellite targets.
+              if (equatorial.status == ASTRO_SUCCESS) {
+                  astro_horizon_t horizon = Astronomy_Horizon(
+                      &aTime, observer, equatorial.ra, equatorial.dec, REFRACTION_NORMAL);
+                  const double distanceKm = equatorial.dist * 149597870.7;
+                  targetAz = horizon.azimuth;
+                  targetEl = horizon.altitude;
                   satAltKm = distanceKm;
                   satDist = distanceKm;
                   calculationOK = isfinite(targetAz) && isfinite(targetEl) &&
                                   isfinite(distanceKm);
               }
-
           }
       }
 
-      bool resultCommitted = false;
-      if (calculationOK &&
-          xSemaphoreTake(targetMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-          // Keep targetMutex while committing both telemetry and motor target.
-          // A target change cannot slip between the generation check and write.
-          if (targetGeneration == calculationGeneration) {
-              if (xSemaphoreTake(sysMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-                  // Location updates also take sysMutex, so this check and the
-                  // telemetry write are atomic with respect to /updateLoc and
-                  // the automatic IP-geolocation update.
-                  if (observerGeneration == calculationObserverGeneration) {
-                      sys.targetAz = targetAz;
-                      sys.targetEl = targetEl;
-                      sys.satLat = satLat;
-                      sys.satLon = satLon;
-                      sys.satSpeed = satSpeed;
-                      sys.satAltKm = satAltKm;
-                      sys.satDist = satDist;
-                      // Publish source versions in the same locked transaction
-                      // as the values. /data rejects every older generation pair.
-                      sys.telemetrySourceVersions.publish(
-                          calculationGeneration, calculationObserverGeneration);
-                      resultCommitted = true;
-                      // Publish inside the same critical section as telemetry
-                      // and motorTarget, while both source generations are locked.
-                      calculationReadiness.publish(calculationGeneration,
-                                                   calculationObserverGeneration);
-                  }
-                  xSemaphoreGive(sysMutex);
-
-                  // Publish the motor target only after both versions have
-                  // been validated while their protecting locks are held.
-                  if (resultCommitted) {
-                      motorTarget.az = (float)targetAz;
-                      motorTarget.el = (float)targetEl;
-                  }
-              }
+      // Reject calculations if either target or observer changed while working.
+      if (calculationOK && stateMutex != NULL &&
+          xSemaphoreTake(stateMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+          if (systemReadiness.isCurrent(generation)) {
+              sys.targetAz = targetAz;
+              sys.targetEl = targetEl;
+              sys.satLat = satLat;
+              sys.satLon = satLon;
+              sys.satSpeed = satSpeed;
+              sys.satAltKm = satAltKm;
+              sys.satDist = satDist;
+              systemReadiness.publishCalculation(generation);
           }
-          xSemaphoreGive(targetMutex);
+          xSemaphoreGive(stateMutex);
       }
-      // Failed/stale calculations do not clear readiness: an older failed
-      // iteration must never erase a newer successful generation pair.
 
       vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(500));
   }
 }
-
 
 
 
@@ -862,33 +732,41 @@ void MotorTask(void * p) {
   bool driversEnabled = false;
 
   for (;;) {
+      uint32_t notifications = 0;
+      xTaskNotifyWait(0, MOTOR_STOP_NOTIFICATION, &notifications, 0);
+      const bool stopRequested = (notifications & MOTOR_STOP_NOTIFICATION) != 0;
+      if (stopRequested && driversEnabled) {
+          digitalWrite(AZ_EN_PIN, HIGH);
+          digitalWrite(EL_EN_PIN, HIGH);
+          driversEnabled = false;
+      }
+
       float targetAz = 0.0f, targetEl = 0.0f;
       TargetState activeTarget = {};
-      bool targetRead = false;
-      bool calculationReady = false;
       uint32_t activeGeneration = 0;
-      if (xSemaphoreTake(targetMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-          activeTarget = current;
-          activeGeneration = targetGeneration;
-          targetAz = motorTarget.az;
-          targetEl = motorTarget.el;
+      bool targetRead = false;
+      bool observerReady = false;
+      bool calculationReady = false;
+      bool tleReadyForTarget = false;
 
-          // Read the live observer generation under the global lock order:
-          // targetMutex first, then sysMutex.
-          if (xSemaphoreTake(sysMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-              calculationReady = calculationReadiness.matches(
-                  targetGeneration, observerGeneration);
-              targetRead = true;
-              xSemaphoreGive(sysMutex);
-          }
-          xSemaphoreGive(targetMutex);
+      if (stateMutex != NULL &&
+          xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+          activeTarget = current;
+          activeGeneration = systemReadiness.generation;
+          targetAz = (float)sys.targetAz;
+          targetEl = (float)sys.targetEl;
+          observerReady = systemReadiness.locationReady &&
+                           TrackingMath::validObserver(sys.lat, sys.lon, sys.alt);
+          calculationReady = systemReadiness.calculationReady;
+          tleReadyForTarget = activeTarget.type != TYPE_SATELLITE ||
+                              systemReadiness.tleReady;
+          targetRead = true;
+          xSemaphoreGive(stateMutex);
       }
 
       if (!TrackingMath::motorControlReady(
-              targetRead, timeReady, observerReady, calculationReady,
-              activeTarget.type == TYPE_SATELLITE, tleReady,
-              bnoReady, encoderReady, targetAz, targetEl)) {
-          // Only this task changes the driver ENABLE pins during operation.
+              targetRead, isTimeReady(), observerReady, calculationReady,
+              tleReadyForTarget, sensorsReady, targetAz, targetEl)) {
           if (driversEnabled) {
               digitalWrite(AZ_EN_PIN, HIGH);
               digitalWrite(EL_EN_PIN, HIGH);
@@ -898,15 +776,7 @@ void MotorTask(void * p) {
           continue;
       }
 
-      // Consume stop requests raised by networking, TLE, or other tasks.
-      // The request forces at least one complete motor-control tick to remain stopped.
-      if (motorStopRequested) {
-          motorStopRequested = false;
-          if (driversEnabled) {
-              digitalWrite(AZ_EN_PIN, HIGH);
-              digitalWrite(EL_EN_PIN, HIGH);
-              driversEnabled = false;
-          }
+      if (stopRequested) {
           vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(MOTOR_TASK_MS));
           continue;
       }
@@ -925,7 +795,6 @@ void MotorTask(void * p) {
       }
 
       const float headingNow = event.orientation.x;
-      // Keep the exact sensor acceptance rule in one testable helper.
       if (!TrackingMath::validMotorSensorSample(
               headingRead, encoderHealthy, systemCal, magCal,
               headingNow, encoderRaw)) {
@@ -937,12 +806,8 @@ void MotorTask(void * p) {
           vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(MOTOR_TASK_MS));
           continue;
       }
-      // Convert the 12-bit encoder reading into elevation relative to the
-      // calibrated level position. Wrap the difference so small movements
-      // across the sensor's 0/4095 boundary remain continuous.
+
       float elNow = NAN;
-      // The encoder is circular, but the telescope's elevation axis is not.
-      // Reject invalid calibration/raw data and any reading outside 0–90 degrees.
       if (!TrackingMath::encoderElevation(encoderRaw, ENCODER_ZERO_RAW,
                                          ENCODER_DIRECTION, elNow)) {
           if (driversEnabled) {
@@ -954,14 +819,10 @@ void MotorTask(void * p) {
           continue;
       }
 
-      // Convert the BNO055 magnetic heading to true north before comparing
-      // it with Astronomy Engine's true-north target azimuth.
       const float headingTrue = TrackingMath::trueHeading(
           headingNow, MAGNETIC_DECLINATION_DEG);
-
       const int azSteps = pidOutput(
           pAz, TrackingMath::azimuthError(targetAz, headingTrue));
-      // Elevation is linear and bounded; only azimuth uses circular wrapping.
       const int elSteps = pidOutput(
           pEl, TrackingMath::elevationError(targetEl, elNow));
       const bool azFwd = azSteps > 0;
@@ -970,18 +831,15 @@ void MotorTask(void * p) {
       const int elN = abs(elSteps);
       const int maxN = max(azN, elN);
 
-      // Revalidate immediately before touching the motors. Keep targetMutex
-      // for this short, bounded step batch so a new target cannot be selected
-      // halfway through executing a command from the previous target.
-      if (xSemaphoreTake(targetMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-          // Hold both locks through this short bounded pulse batch. This keeps
-          // observerGeneration stable from validation until the motor steps end.
-          const bool systemStateLocked =
-              xSemaphoreTake(sysMutex, pdMS_TO_TICKS(10)) == pdTRUE;
-          const bool commandStillCurrent = systemStateLocked &&
-              targetGeneration == activeGeneration &&
-              calculationReadiness.matches(targetGeneration, observerGeneration) &&
-              !motorStopRequested;
+      if (stateMutex != NULL &&
+          xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+          uint32_t finalNotifications = 0;
+          xTaskNotifyWait(0, MOTOR_STOP_NOTIFICATION, &finalNotifications, 0);
+          const bool commandStillCurrent =
+              systemReadiness.isCurrent(activeGeneration) &&
+              systemReadiness.calculationReady &&
+              (activeTarget.type != TYPE_SATELLITE || systemReadiness.tleReady) &&
+              (finalNotifications & MOTOR_STOP_NOTIFICATION) == 0;
           if (commandStillCurrent) {
               if (!driversEnabled) {
                   digitalWrite(AZ_EN_PIN, LOW);
@@ -997,18 +855,16 @@ void MotorTask(void * p) {
               digitalWrite(EL_EN_PIN, HIGH);
               driversEnabled = false;
           }
-          if (systemStateLocked) xSemaphoreGive(sysMutex);
-          xSemaphoreGive(targetMutex);
+          xSemaphoreGive(stateMutex);
       } else if (driversEnabled) {
-          // If we cannot verify the command's generation, fail safe and stop.
           digitalWrite(AZ_EN_PIN, HIGH);
           digitalWrite(EL_EN_PIN, HIGH);
           driversEnabled = false;
       }
+
       vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(MOTOR_TASK_MS));
   }
 }
-
 
 
 
@@ -1036,57 +892,38 @@ bool updateIPLocation() {
         if (!error && doc["status"] == "success") {
             const double lat = doc["lat"] | NAN;
             const double lon = doc["lon"] | NAN;
-            if (isfinite(lat) && isfinite(lon) && lat >= -90.0 &&
-                lat <= 90.0 && lon >= -180.0 && lon <= 180.0) {
-                if (xSemaphoreTake(sysMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            if (TrackingMath::validObserver(lat, lon, 50.0)) {
+                if (stateMutex != NULL &&
+                    xSemaphoreTake(stateMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
                     sys.lat = lat;
                     sys.lon = lon;
                     sys.alt = 50.0;
-                    ++observerGeneration;
-                    if (observerGeneration == 0) ++observerGeneration;
-                    xSemaphoreGive(sysMutex);
+                    systemReadiness.locationReady = true;
+                    advanceConfigurationLocked();
+                    xSemaphoreGive(stateMutex);
                     valid = true;
                 }
             }
         }
     }
     http.end();
-    // Keep this path safe if IP geolocation is ever requested after startup.
-    // The observer generation already rejects stale tokens; clearing is explicit.
-    if (valid) invalidateCalculationReadiness();
     return valid;
 }
 
-void fetchTLE() {
-    if (tleFetchMutex == NULL ||
-        xSemaphoreTake(tleFetchMutex, pdMS_TO_TICKS(20000)) != pdTRUE) {
-        tleReady = false;
-        invalidateCalculationReadiness();
-        disableMotors();
-        return;
-    }
 
-    // Read the latest request first. A queued notification can outlive the
-    // satellite selection that created it; if the current target is a planet,
-    // this worker must leave that planet's calculation readiness untouched.
-    const VersionedTargetSnapshot requestedSnapshot = getVersionedTargetSnapshot();
-    const TargetState requested = requestedSnapshot.target;
-    double lat, lon, alt;
-    uint32_t observerVersion = 0;
+
+void fetchTLE() {
+    const ConfigurationSnapshot requested = getConfigurationSnapshot();
     bool success = false;
 
-    if (requestedSnapshot.generation != 0 &&
-        requested.type == TYPE_SATELLITE &&
-        getVersionedObserverSnapshot(lat, lon, alt, observerVersion) &&
-        requested.noradID > 0) {
-        // A real satellite refresh is now underway. Invalidate any prior
-        // calculation before downloading replacement orbital elements.
-        tleReady = false;
-        invalidateCalculationReadiness();
-
+    if (requested.generation != 0 &&
+        requested.target.type == TYPE_SATELLITE &&
+        TrackingMath::validObserver(requested.lat, requested.lon, requested.alt) &&
+        TrackingMath::validNoradId(requested.target.noradID)) {
         HTTPClient http;
         http.setTimeout(12000);
-        const String url = "https://tle.ivanstanojevic.me/api/tle/" + String(requested.noradID);
+        const String url = "https://tle.ivanstanojevic.me/api/tle/" +
+                           String(requested.target.noradID);
         if (http.begin(url)) {
             const int status = http.GET();
             if (status == HTTP_CODE_OK) {
@@ -1095,51 +932,71 @@ void fetchTLE() {
                 const char *rawLine1 = doc["line1"].as<const char *>();
                 const char *rawLine2 = doc["line2"].as<const char *>();
 
-                if (!error && rawLine1 != nullptr && rawLine2 != nullptr &&
-                    strlen(rawLine1) >= 69 && strlen(rawLine2) >= 69 &&
-                    rawLine1[0] == '1' && rawLine2[0] == '2') {
+                bool validTle = !error && rawLine1 != nullptr &&
+                                rawLine2 != nullptr && strlen(rawLine1) >= 69 &&
+                                strlen(rawLine2) >= 69 &&
+                                rawLine1[0] == '1' && rawLine2[0] == '2';
+
+                if (validTle) {
+                    int checksum1 = 0;
+                    int checksum2 = 0;
+                    for (int i = 0; i < 68; ++i) {
+                        if (rawLine1[i] >= '0' && rawLine1[i] <= '9')
+                            checksum1 += rawLine1[i] - '0';
+                        else if (rawLine1[i] == '-') ++checksum1;
+
+                        if (rawLine2[i] >= '0' && rawLine2[i] <= '9')
+                            checksum2 += rawLine2[i] - '0';
+                        else if (rawLine2[i] == '-') ++checksum2;
+                    }
+                    validTle = rawLine1[68] >= '0' && rawLine1[68] <= '9' &&
+                               rawLine2[68] >= '0' && rawLine2[68] <= '9' &&
+                               checksum1 % 10 == rawLine1[68] - '0' &&
+                               checksum2 % 10 == rawLine2[68] - '0';
+                }
+
+                long line1Norad = 0;
+                long line2Norad = 0;
+                if (validTle) {
+                    for (int i = 2; i <= 6; ++i) {
+                        if (rawLine1[i] < '0' || rawLine1[i] > '9' ||
+                            rawLine2[i] < '0' || rawLine2[i] > '9') {
+                            validTle = false;
+                            break;
+                        }
+                        line1Norad = line1Norad * 10 + rawLine1[i] - '0';
+                        line2Norad = line2Norad * 10 + rawLine2[i] - '0';
+                    }
+                    validTle = validTle && line1Norad == line2Norad &&
+                               line1Norad == requested.target.noradID;
+                }
+
+                if (validTle) {
                     char line1[71] = {};
                     char line2[71] = {};
                     strlcpy(line1, rawLine1, sizeof(line1));
                     strlcpy(line2, rawLine2, sizeof(line2));
 
-                    // Installation is the critical point: while holding the
-                    // target and observer locks, prove that neither input
-                    // changed during the network request. This follows the
-                    // global lock order targetMutex -> sysMutex -> sgp4Mutex.
-                    bool targetLocked =
-                        xSemaphoreTake(targetMutex, pdMS_TO_TICKS(100)) == pdTRUE;
-                    bool observerLocked = false;
-                    bool sgp4Locked = false;
-                    if (targetLocked) {
-                        observerLocked =
-                            xSemaphoreTake(sysMutex, pdMS_TO_TICKS(100)) == pdTRUE;
+                    // Global lock order: stateMutex -> sgp4Mutex.
+                    if (stateMutex != NULL &&
+                        xSemaphoreTake(stateMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                        const bool stillCurrent =
+                            systemReadiness.isCurrent(requested.generation) &&
+                            current.type == TYPE_SATELLITE &&
+                            current.noradID == requested.target.noradID;
+                        bool sgp4Locked = false;
+                        if (stillCurrent) {
+                            sgp4Locked =
+                                xSemaphoreTake(sgp4Mutex, pdMS_TO_TICKS(500)) == pdTRUE;
+                        }
+                        if (stillCurrent && sgp4Locked) {
+                            satSgp4.site(requested.lat, requested.lon, requested.alt);
+                            satSgp4.init(requested.target.name, line1, line2);
+                            success = systemReadiness.publishTle(requested.generation);
+                        }
+                        if (sgp4Locked) xSemaphoreGive(sgp4Mutex);
+                        xSemaphoreGive(stateMutex);
                     }
-                    const bool sameTarget = targetLocked &&
-                        targetGeneration == requestedSnapshot.generation &&
-                        current.type == TYPE_SATELLITE &&
-                        current.noradID == requested.noradID;
-                    const bool sameObserver = observerLocked &&
-                        observerGeneration == observerVersion;
-                    if (sameTarget && sameObserver) {
-                        sgp4Locked =
-                            xSemaphoreTake(sgp4Mutex, pdMS_TO_TICKS(500)) == pdTRUE;
-                    }
-
-                    if (sameTarget && sameObserver && sgp4Locked) {
-                        satSgp4.site(lat, lon, alt);
-                        satSgp4.init(requested.name, line1, line2);
-                        // Record which exact inputs produced this SGP4 model.
-                        // PhysicsTask and updateNextPass reject any other pair.
-                        tleSourceVersions.publish(requestedSnapshot.generation,
-                                                  observerVersion);
-                        tleReady = true;
-                        success = true;
-                    }
-
-                    if (sgp4Locked) xSemaphoreGive(sgp4Mutex);
-                    if (observerLocked) xSemaphoreGive(sysMutex);
-                    if (targetLocked) xSemaphoreGive(targetMutex);
                 } else {
                     Serial.println("ERROR: TLE response was invalid or incomplete.");
                 }
@@ -1151,38 +1008,28 @@ void fetchTLE() {
     }
 
     if (!success) {
-        // The request may have become obsolete while the HTTP call was in
-        // progress (for example, the user selected a planet or another satellite).
-        // Only apply failure handling if both original inputs are still current.
-        // Otherwise an old failed request could clear readiness for a newer target.
-        bool targetLocked =
-            xSemaphoreTake(targetMutex, pdMS_TO_TICKS(50)) == pdTRUE;
-        bool observerLocked = false;
-        if (targetLocked) {
-            observerLocked =
-                xSemaphoreTake(sysMutex, pdMS_TO_TICKS(50)) == pdTRUE;
+        bool requestStillCurrent = false;
+        if (stateMutex != NULL &&
+            xSemaphoreTake(stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+            requestStillCurrent =
+                requested.generation != 0 &&
+                systemReadiness.isCurrent(requested.generation) &&
+                current.type == TYPE_SATELLITE &&
+                current.noradID == requested.target.noradID;
+            if (requestStillCurrent) {
+                systemReadiness.clearResults();
+                sys.nextPassValid = false;
+            }
+            xSemaphoreGive(stateMutex);
         }
 
-        const bool requestStillCurrent = targetLocked && observerLocked &&
-            requestedSnapshot.generation != 0 &&
-            targetGeneration == requestedSnapshot.generation &&
-            current.type == TYPE_SATELLITE &&
-            current.noradID == requested.noradID &&
-            observerGeneration == observerVersion;
-
-        if (observerLocked) xSemaphoreGive(sysMutex);
-        if (targetLocked) xSemaphoreGive(targetMutex);
-
         if (requestStillCurrent) {
-            // This is a genuine failure for the active satellite/location.
-            tleReady = false;
-            invalidateCalculationReadiness();
             disableMotors();
             Serial.println("WARNING: TLE update failed; satellite motors remain disabled.");
         } else {
-            // A newer request/state owns readiness now. Do not touch it.
             Serial.println("INFO: Discarded stale TLE result after target/location changed.");
         }
     }
-    xSemaphoreGive(tleFetchMutex);
+
 }
+

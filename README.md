@@ -2,7 +2,7 @@
 
 An experimental ESP32-S3 project for pointing a two-axis motorized mount at selected satellites and solar-system objects. The firmware combines orbital/astronomical calculations with an IMU, a magnetic rotary encoder, stepper-motor drivers, and a browser-based control panel.
 
-> **Project status:** prototype / work in progress. The `fix/satellite-nextpass-minimum-elevation` branch contains the current software remediation pass and automated build/test workflows. The firmware has not yet been verified on the physical mount. Do not connect motor power until the pin map, motor wiring, current limits, mechanics, and emergency-stop arrangement have been checked.
+> **Project status:** prototype / work in progress. Automated build and test workflows are provided, but the firmware has not yet been verified on the physical mount. Do not connect motor power until the pin map, motor wiring, current limits, mechanics, and emergency-stop arrangement have been checked.
 
 ## Intended features
 
@@ -65,9 +65,9 @@ Before operating the mount, review these values near the top of `src/spacepointe
 | `current` initial target | ISS / NORAD `25544` | Optional: change the default satellite name and NORAD catalog ID if you want another initial target. |
 | `MICROSTEPS_PER_REV` | `32768UL` | Check against the actual motor full-step angle, gearbox ratio, and A4988 microstep setting. **This constant is currently not used for angular positioning**, so changing it alone does not calibrate the mount. |
 | `STEP_PULSE_US` / `MOTOR_TASK_MS` / `MAX_STEPS_PER_TICK` | `50` µs / `25` ms / `8` steps | Pulse timing and a conservative per-tick correction cap. The cap limits large target changes; it is not an acceleration ramp. Change it only after unloaded bench testing. |
-| `pidAz.kp` | `2.5` | Proportional gain for the azimuth axis, in **steps per degree**. The controller multiplies the azimuth pointing error (degrees) by this value to calculate a requested number of motor steps. A larger value commands more steps for the same error; a smaller value makes corrections gentler. This is an experimental starting value, not a mechanically calibrated value. |
-| `pidEl.kp` | `3.0` | Proportional gain for the elevation axis, also in **steps per degree**. It has the same role as `pidAz.kp`, but can be tuned independently because the two axes may have different motors, gearing, and loads. This is an experimental starting value, not a mechanically calibrated value. |
-| `pidAz.deadband` / `pidEl.deadband` | `0.05°` / `0.05°` | Minimum error (in degrees) that must be exceeded before that axis requests movement. Errors at or below the deadband are treated as zero, helping prevent motor chatter caused by small sensor fluctuations. A larger deadband reduces unnecessary corrections but allows more pointing error; a smaller one tracks more tightly but may react to noise. |
+| `pAz.kp` | `2.5` | Proportional gain for the azimuth axis, in **steps per degree**. The controller multiplies the azimuth pointing error (degrees) by this value to calculate a requested number of motor steps. A larger value commands more steps for the same error; a smaller value makes corrections gentler. This is an experimental starting value, not a mechanically calibrated value. |
+| `pEl.kp` | `3.0` | Proportional gain for the elevation axis, also in **steps per degree**. It has the same role as `pAz.kp`, but can be tuned independently because the two axes may have different motors, gearing, and loads. This is an experimental starting value, not a mechanically calibrated value. |
+| `pAz.deadband` / `pEl.deadband` | `0.05°` / `0.05°` | Minimum error (in degrees) that must be exceeded before that axis requests movement. Errors at or below the deadband are treated as zero, helping prevent motor chatter caused by small sensor fluctuations. A larger deadband reduces unnecessary corrections but allows more pointing error; a smaller one tracks more tightly but may react to noise. |
 
 ### Safe AS5600 calibration procedure
 
@@ -110,13 +110,21 @@ pio run -t upload
 pio device monitor -b 115200
 ```
 
-Run the native helper tests as well as the ESP32 build:
+Run all automated checks locally:
+
 ```sh
 pio test -e native
+pio test -e native-sanitize
+node --test test/test_web_ui.js
 pio run -e esp32-s3-devkitc-1
 ```
 
-The GitHub Actions workflow runs both commands on pushes to the fix branch and on pull requests. A green CI result verifies compilation and the hardware-independent helper tests; it does not replace bench testing, sensor calibration, or safe motor commissioning.
+GitHub Actions runs native unit tests, native tests with AddressSanitizer and
+UndefinedBehaviorSanitizer, browser-side tests with Node.js 22, and the ESP32-S3
+firmware build. It runs on pushes to `main`, `fix/**`, and `review/**`, and on
+pull requests targeting `main`. A green CI result verifies these automated
+checks; it does not replace bench testing, sensor calibration, or safe motor
+commissioning.
 
 ## First boot and operation
 
@@ -131,7 +139,7 @@ The web server listens on port 80. The dashboard root (`/`), `/set`, and `/updat
 
 ## Implemented fixes and remaining commissioning work
 
-The `fix/satellite-nextpass-minimum-elevation` branch includes these software changes:
+The current firmware includes these software changes:
 
 - Corrected the AS5600 PlatformIO dependency and added the required I2C include.
 - Changed driver ENABLE pins to GPIO16 and GPIO17; explicitly selected I2C GPIO8/GPIO9.
@@ -167,7 +175,7 @@ The `fix/satellite-nextpass-minimum-elevation` branch includes these software ch
 
 ### Validation status
 
-A successful CI build and native test run should be checked on the pull request before merging. No physical ESP32-S3, motor, encoder, or mount test has been performed by this code review.
+Check that all four GitHub Actions jobs pass before merging: native tests, native tests with AddressSanitizer/UBSan, dashboard tests, and the ESP32-S3 firmware build. Passing CI does not imply that physical commissioning has been completed. No physical ESP32-S3, motor, encoder, or mount test has been performed by this code review.
 
 ## Repository layout
 
@@ -181,9 +189,14 @@ A successful CI build and native test run should be checked on the pull request 
 │       ├── astronomy.c
 │       └── astronomy.h
 ├── include/
+│   ├── tracking_math.h
+│   └── web_ui.h
 └── test/
-    └── test_tracking_math/
-        └── test_main.cpp
+    ├── README
+    ├── HARDWARE_BENCH.md
+    ├── test_tracking_math/
+    │   └── test_main.cpp
+    └── test_web_ui.js
 ```
 
 ## References

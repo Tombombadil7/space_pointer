@@ -158,6 +158,15 @@ const char index_html[] PROGMEM = R"rawliteral(
           if(id) setTarget(0, 'Custom', id);
         }
         function syncGPS() {
+          if (window.isSecureContext === false) {
+            alert('Phone GPS requires HTTPS. Open the dashboard through a secure HTTPS connection to use phone GPS.');
+            return;
+          }
+          if (!navigator.geolocation) {
+            alert('Phone GPS is not available in this browser.');
+            return;
+          }
+
           navigator.geolocation.getCurrentPosition(function(p) {
             postMutation('/updateLoc', {
               lat: p.coords.latitude,
@@ -166,6 +175,16 @@ const char index_html[] PROGMEM = R"rawliteral(
             })
               .then(function(r) { if (!r.ok) throw new Error('Location update failed: '+r.status); alert("GPS Updated!"); })
               .catch(function(e) { alert(e.message); });
+          }, function(error) {
+            if (error && error.code === 1) {
+              alert('Phone GPS permission was denied. Allow location access in your browser and try again.');
+            } else if (error && error.code === 2) {
+              alert('Phone location is unavailable. Check that location services are enabled and try again.');
+            } else if (error && error.code === 3) {
+              alert('Phone GPS request timed out. Try again where the phone has a clearer view of the sky.');
+            } else {
+              alert('Could not get phone GPS location. Please try again.');
+            }
           });
         }
     

@@ -146,93 +146,65 @@ void test_proportional_controller_handles_zero_gain_and_zero_step_limit() {
 }
 
 
-void test_generation_readiness_starts_not_ready() {
-    TrackingMath::GenerationReadiness readiness;
-    TEST_ASSERT_FALSE(readiness.matches(1, 1));
+void test_configuration_readiness_starts_invalid() {
+    TrackingMath::ConfigurationReadiness state;
+    TEST_ASSERT_EQUAL_UINT32(1, state.generation);
+    TEST_ASSERT_FALSE(state.locationReady);
+    TEST_ASSERT_FALSE(state.tleReady);
+    TEST_ASSERT_FALSE(state.calculationReady);
+    TEST_ASSERT_FALSE(state.passReady);
 }
 
-void test_generation_readiness_matches_only_published_pair() {
-    TrackingMath::GenerationReadiness readiness;
-    readiness.publish(7, 12);
-    TEST_ASSERT_TRUE(readiness.matches(7, 12));
-    TEST_ASSERT_FALSE(readiness.matches(7, 13));
-    TEST_ASSERT_FALSE(readiness.matches(8, 12));
+void test_configuration_change_increments_one_generation_and_clears_results() {
+    TrackingMath::ConfigurationReadiness state;
+    const uint32_t previous = state.generation;
+    TEST_ASSERT_TRUE(state.publishTle(previous));
+    TEST_ASSERT_TRUE(state.publishCalculation(previous));
+    TEST_ASSERT_TRUE(state.publishPass(previous));
+    state.locationReady = true;
+
+    state.invalidate();
+    TEST_ASSERT_EQUAL_UINT32(previous + 1, state.generation);
+    TEST_ASSERT_TRUE(state.locationReady);
+    TEST_ASSERT_FALSE(state.isCurrent(previous));
+    TEST_ASSERT_FALSE(state.tleReady);
+    TEST_ASSERT_FALSE(state.calculationReady);
+    TEST_ASSERT_FALSE(state.passReady);
 }
 
-void test_generation_readiness_clear_invalidates_previous_pair() {
-    TrackingMath::GenerationReadiness readiness;
-    readiness.publish(4, 9);
-    readiness.clear();
-    TEST_ASSERT_FALSE(readiness.matches(4, 9));
-    TEST_ASSERT_EQUAL_UINT32(0, readiness.targetGeneration);
-    TEST_ASSERT_EQUAL_UINT32(0, readiness.observerGeneration);
+void test_stale_async_results_cannot_be_published_after_configuration_change() {
+    TrackingMath::ConfigurationReadiness state;
+    const uint32_t oldGeneration = state.generation;
+    state.invalidate();
+
+    TEST_ASSERT_FALSE(state.publishTle(oldGeneration));
+    TEST_ASSERT_FALSE(state.publishCalculation(oldGeneration));
+    TEST_ASSERT_FALSE(state.publishPass(oldGeneration));
+    TEST_ASSERT_FALSE(state.tleReady);
+    TEST_ASSERT_FALSE(state.calculationReady);
+    TEST_ASSERT_FALSE(state.passReady);
 }
 
-void test_generation_readiness_rejects_zero_generations() {
-    TrackingMath::GenerationReadiness readiness;
-    readiness.publish(0, 5);
-    TEST_ASSERT_FALSE(readiness.matches(0, 5));
-    readiness.publish(5, 0);
-    TEST_ASSERT_FALSE(readiness.matches(5, 0));
-    TEST_ASSERT_FALSE(readiness.matches(5, 5));
+void test_calculation_and_telemetry_publish_together_but_pass_is_independent() {
+    TrackingMath::ConfigurationReadiness state;
+    const uint32_t generation = state.generation;
+
+    TEST_ASSERT_TRUE(state.publishCalculation(generation));
+    TEST_ASSERT_TRUE(state.calculationReady);
+    TEST_ASSERT_FALSE(state.passReady);
+
+    TEST_ASSERT_TRUE(state.publishPass(generation));
+    TEST_ASSERT_TRUE(state.passReady);
 }
 
-void test_generation_readiness_republish_replaces_both_generations() {
-    TrackingMath::GenerationReadiness readiness;
-    readiness.publish(1, 2);
-    readiness.publish(3, 4);
-    TEST_ASSERT_FALSE(readiness.matches(1, 2));
-    TEST_ASSERT_TRUE(readiness.matches(3, 4));
+void test_configuration_generation_skips_reserved_zero_on_wrap() {
+    TrackingMath::ConfigurationReadiness state;
+    state.generation = UINT32_MAX;
+    state.invalidate();
+    TEST_ASSERT_EQUAL_UINT32(1, state.generation);
+    TEST_ASSERT_FALSE(state.isCurrent(0));
 }
 
-
-/*
- * TLE data is tied to both the selected satellite and the observer location.
- * These tests model the checks used before SGP4 calculations are allowed.
- */
-void test_tle_source_token_rejects_a_new_target_generation() {
-    TrackingMath::GenerationReadiness tleSource;
-    tleSource.publish(12, 4);
-    TEST_ASSERT_TRUE(tleSource.matches(12, 4));
-    TEST_ASSERT_FALSE(tleSource.matches(13, 4));
-}
-
-void test_tle_source_token_rejects_a_new_observer_generation() {
-    TrackingMath::GenerationReadiness tleSource;
-    tleSource.publish(12, 4);
-    TEST_ASSERT_TRUE(tleSource.matches(12, 4));
-    TEST_ASSERT_FALSE(tleSource.matches(12, 5));
-}
-
-
-/*
- * The web API keeps pointing/position telemetry and pass predictions on
- * separate generation pairs because pass calculations run less frequently.
- */
-void test_telemetry_source_pair_rejects_old_target_or_observer() {
-    TrackingMath::GenerationReadiness telemetrySource;
-    telemetrySource.publish(20, 30);
-    TEST_ASSERT_TRUE(telemetrySource.matches(20, 30));
-    TEST_ASSERT_FALSE(telemetrySource.matches(21, 30));
-    TEST_ASSERT_FALSE(telemetrySource.matches(20, 31));
-}
-
-void test_pass_prediction_source_pair_is_independent() {
-    TrackingMath::GenerationReadiness telemetrySource;
-    TrackingMath::GenerationReadiness passSource;
-    telemetrySource.publish(8, 9);
-    passSource.publish(8, 9);
-
-    // A fresh pointing update does not make an old pass prediction current.
-    telemetrySource.publish(8, 10);
-    TEST_ASSERT_TRUE(telemetrySource.matches(8, 10));
-    TEST_ASSERT_FALSE(passSource.matches(8, 10));
-
-    // Once the pass calculation catches up, both groups describe the same
-    // selected target and observer location.
-    passSource.publish(8, 10);
-    TEST_ASSERT_TRUE(passSource.matches(8, 10));
-}
 
 
 /*
@@ -420,29 +392,26 @@ void test_proportional_controller_rejects_invalid_gain_deadband_and_limit() {
 
 
 
-void test_motor_readiness_requires_all_prerequisites_and_satellite_tle() {
+void test_motor_readiness_requires_all_prerequisites_and_sensor_group() {
     TEST_ASSERT_TRUE(TrackingMath::motorControlReady(
-        true, true, true, true, false, false, true, true, 180.0f, 45.0f));
-    TEST_ASSERT_TRUE(TrackingMath::motorControlReady(
-        true, true, true, true, true, true, true, true, 180.0f, 45.0f));
+        true, true, true, true, true, true, 180.0f, 45.0f));
     TEST_ASSERT_FALSE(TrackingMath::motorControlReady(
-        true, true, true, true, true, false, true, true, 180.0f, 45.0f));
+        false, true, true, true, true, true, 180.0f, 45.0f));
     TEST_ASSERT_FALSE(TrackingMath::motorControlReady(
-        false, true, true, true, false, false, true, true, 180.0f, 45.0f));
+        true, false, true, true, true, true, 180.0f, 45.0f));
     TEST_ASSERT_FALSE(TrackingMath::motorControlReady(
-        true, false, true, true, false, false, true, true, 180.0f, 45.0f));
+        true, true, false, true, true, true, 180.0f, 45.0f));
     TEST_ASSERT_FALSE(TrackingMath::motorControlReady(
-        true, true, false, true, false, false, true, true, 180.0f, 45.0f));
+        true, true, true, false, true, true, 180.0f, 45.0f));
+    // A satellite target is not ready until its caller confirms the TLE.
     TEST_ASSERT_FALSE(TrackingMath::motorControlReady(
-        true, true, true, false, false, false, true, true, 180.0f, 45.0f));
+        true, true, true, true, false, true, 180.0f, 45.0f));
     TEST_ASSERT_FALSE(TrackingMath::motorControlReady(
-        true, true, true, true, false, false, false, true, 180.0f, 45.0f));
+        true, true, true, true, true, false, 180.0f, 45.0f));
     TEST_ASSERT_FALSE(TrackingMath::motorControlReady(
-        true, true, true, true, false, false, true, false, 180.0f, 45.0f));
+        true, true, true, true, true, true, NAN, 45.0f));
     TEST_ASSERT_FALSE(TrackingMath::motorControlReady(
-        true, true, true, true, false, false, true, true, NAN, 45.0f));
-    TEST_ASSERT_FALSE(TrackingMath::motorControlReady(
-        true, true, true, true, false, false, true, true, 180.0f, 90.1f));
+        true, true, true, true, true, true, 180.0f, 90.1f));
 }
 
 void test_motor_sensor_sample_accepts_calibrated_valid_boundaries() {
@@ -483,7 +452,7 @@ void test_proportional_controller_preserves_float_rounding_for_normal_inputs() {
 int main(int argc, char **argv) {
     UNITY_BEGIN();
     RUN_TEST(test_proportional_controller_preserves_float_rounding_for_normal_inputs);
-    RUN_TEST(test_motor_readiness_requires_all_prerequisites_and_satellite_tle);
+    RUN_TEST(test_motor_readiness_requires_all_prerequisites_and_sensor_group);
     RUN_TEST(test_motor_sensor_sample_accepts_calibrated_valid_boundaries);
     RUN_TEST(test_motor_sensor_sample_rejects_missing_or_invalid_sensor_data);
     RUN_TEST(test_proportional_controller_clamps_extreme_finite_inputs_before_rounding);
@@ -526,14 +495,10 @@ int main(int argc, char **argv) {
     RUN_TEST(test_observer_validation_rejects_all_out_of_range_edges);
     RUN_TEST(test_norad_validation_accepts_exact_range_edges);
     RUN_TEST(test_proportional_controller_handles_zero_gain_and_zero_step_limit);
-    RUN_TEST(test_generation_readiness_starts_not_ready);
-    RUN_TEST(test_generation_readiness_matches_only_published_pair);
-    RUN_TEST(test_generation_readiness_clear_invalidates_previous_pair);
-    RUN_TEST(test_generation_readiness_rejects_zero_generations);
-    RUN_TEST(test_generation_readiness_republish_replaces_both_generations);
-    RUN_TEST(test_tle_source_token_rejects_a_new_target_generation);
-    RUN_TEST(test_tle_source_token_rejects_a_new_observer_generation);
-    RUN_TEST(test_telemetry_source_pair_rejects_old_target_or_observer);
-    RUN_TEST(test_pass_prediction_source_pair_is_independent);
+    RUN_TEST(test_configuration_readiness_starts_invalid);
+    RUN_TEST(test_configuration_change_increments_one_generation_and_clears_results);
+    RUN_TEST(test_stale_async_results_cannot_be_published_after_configuration_change);
+    RUN_TEST(test_calculation_and_telemetry_publish_together_but_pass_is_independent);
+    RUN_TEST(test_configuration_generation_skips_reserved_zero_on_wrap);
     return UNITY_END();
 }

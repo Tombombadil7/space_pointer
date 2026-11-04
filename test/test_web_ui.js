@@ -44,6 +44,7 @@ function createHarness(fetchHandler) {
       calls.push({ url, options });
       return fetchHandler(url, options);
     },
+    window: { isSecureContext: true },
     navigator: {
       geolocation: {
         getCurrentPosition: (success, failure) => {
@@ -105,8 +106,13 @@ async function flushPromises() {
 function routeSource(path) {
   const start = firmware.indexOf(`server.on("${path}"`);
   assert.notEqual(start, -1, `route ${path} must exist`);
-  const end = firmware.indexOf("\n  });", start);
-  assert.notEqual(end, -1, `route ${path} must have a handler boundary`);
+
+  const nextRoute = firmware.indexOf('\n  server.on("', start + 1);
+  const serverStart = firmware.indexOf("\n  server.begin()", start);
+  const end = nextRoute !== -1 && (serverStart === -1 || nextRoute < serverStart)
+    ? nextRoute
+    : serverStart;
+  assert.notEqual(end, -1, `route ${path} must have a following server boundary`);
   return firmware.slice(start, end);
 }
 
@@ -123,10 +129,57 @@ test("firmware mutation endpoints require POST, authentication, and CSRF header"
   }
 });
 
+
+test("satellite mutations return 503 before committing when the TLE worker is unavailable", () => {
+  const setRoute = routeSource("/set");
+  const setLock = setRoute.indexOf("xSemaphoreTake(stateMutex");
+  const setCheck = setRoute.indexOf("refreshTLE && tleFetchTaskHandle == NULL");
+  const setMutation = setRoute.indexOf("current = next;");
+  const setUnlock = setRoute.indexOf("xSemaphoreGive(stateMutex);", setMutation);
+  const setNotify = setRoute.indexOf("if (refreshTLE) startTLEFetchTask();");
+  const setAccepted = setRoute.indexOf('r->send(202');
+  assert.ok(
+    setLock < setCheck && setCheck < setMutation &&
+    setMutation < setUnlock && setUnlock < setNotify && setNotify < setAccepted
+  );
+  assert.match(setRoute, /TLE worker unavailable; target was not changed/);
+
+  const locationRoute = routeSource("/updateLoc");
+  const locationLock = locationRoute.indexOf("xSemaphoreTake(stateMutex");
+  const locationCheck = locationRoute.indexOf("refreshTLE && tleFetchTaskHandle == NULL");
+  const locationMutation = locationRoute.indexOf("sys.lat = lat");
+  const locationUnlock = locationRoute.indexOf("xSemaphoreGive(stateMutex);", locationMutation);
+  const locationNotify = locationRoute.indexOf("if (refreshTLE) startTLEFetchTask();");
+  const locationAccepted = locationRoute.indexOf('r->send(202');
+  assert.ok(
+    locationLock < locationCheck && locationCheck < locationMutation &&
+    locationMutation < locationUnlock && locationUnlock < locationNotify &&
+    locationNotify < locationAccepted
+  );
+  assert.match(locationRoute, /TLE refresh unavailable; location was not changed/);
+});
+
+test("TLE validation stays inside fetchTLE", () => {
+  const start = firmware.lastIndexOf("void fetchTLE() {");
+  assert.notEqual(start, -1, "fetchTLE implementation must exist");
+  const fetchTLE = firmware.slice(start);
+
+  assert.match(fetchTLE, /strlen\(rawLine1\) >= 69/);
+  assert.match(fetchTLE, /strlen\(rawLine2\) >= 69/);
+  assert.ok(fetchTLE.includes("checksum1 % 10 == rawLine1[68] - '0'"));
+  assert.ok(fetchTLE.includes("checksum2 % 10 == rawLine2[68] - '0'"));
+  assert.ok(fetchTLE.includes("line1Norad == line2Norad"));
+  assert.ok(fetchTLE.includes("line1Norad == requested.target.noradID"));
+  assert.ok(fetchTLE.includes("else if (rawLine1[i] == '-') ++checksum1;"));
+  assert.ok(fetchTLE.includes("else if (rawLine2[i] == '-') ++checksum2;"));
+  assert.equal(firmware.includes("validTlePair("), false);
+  assert.equal(firmware.includes("validTleChecksum("), false);
+});
+
 test("firmware telemetry endpoint remains read-only GET", () => {
   const route = routeSource("/data");
   assert.match(route, /HTTP_GET/);
-  assert.match(route, /getVersionedTelemetrySnapshot\(target, data\)/);
+  assert.match(route, /getTelemetrySnapshot\(target, data\)/);
   assert.match(route, /r->send\(503/);
   assert.match(route, /application\/json/);
 });
@@ -167,6 +220,44 @@ test("phone GPS sync sends coordinates through the same POST helper", async () =
   // The dashboard deliberately falls back when the phone reports null/zero altitude.
   assert.equal(body.get("alt"), "50");
   assert.equal(h.alerts.at(-1), "GPS Updated!");
+});
+
+test("phone GPS sync explains when HTTPS is required", () => {
+  const h = createHarness(async () => ({ ok: true, status: 202 }));
+  h.context.window.isSecureContext = false;
+  h.context.syncGPS();
+
+  assert.equal(h.calls.length, 0);
+  assert.deepEqual(h.alerts, [
+    "Phone GPS requires HTTPS. Open the dashboard through a secure HTTPS connection to use phone GPS."
+  ]);
+});
+
+test("phone GPS sync explains geolocation permission, availability, and timeout errors", () => {
+  const cases = [
+    [1, "Phone GPS permission was denied. Allow location access in your browser and try again."],
+    [2, "Phone location is unavailable. Check that location services are enabled and try again."],
+    [3, "Phone GPS request timed out. Try again where the phone has a clearer view of the sky."]
+  ];
+
+  for (const [code, message] of cases) {
+    const h = createHarness(async () => ({ ok: true, status: 202 }));
+    h.context.navigator.geolocation.getCurrentPosition = (success, failure) => {
+      failure({ code });
+    };
+    h.context.syncGPS();
+    assert.deepEqual(h.alerts, [message]);
+    assert.equal(h.calls.length, 0);
+  }
+});
+
+test("phone GPS sync reports when browser geolocation is unavailable", () => {
+  const h = createHarness(async () => ({ ok: true, status: 202 }));
+  h.context.navigator.geolocation = undefined;
+  h.context.syncGPS();
+
+  assert.deepEqual(h.alerts, ["Phone GPS is not available in this browser."]);
+  assert.equal(h.calls.length, 0);
 });
 
 test("failed target mutation is surfaced to the user", async () => {
@@ -241,4 +332,42 @@ test("planet telemetry displays speed as unavailable, not zero", async () => {
   assert.equal(h.label('[data-lbl="speed"]').innerText, "not calculated");
   assert.equal(h.label('[data-lbl="pass"]').innerText, "Rises at");
   assert.equal(h.label('[data-lbl="lose"]').innerText, "Sets at");
+});
+
+test("firmware system state uses one mutex and one configuration generation", () => {
+  assert.ok(firmware.includes("SemaphoreHandle_t stateMutex;"));
+  for (const oldName of [
+    "targetMutex", "sysMutex", "targetGeneration", "observerGeneration",
+    "GenerationReadiness", "telemetrySourceVersions", "passSourceVersions",
+    "calculationReadiness", "tleSourceVersions"
+  ]) {
+    assert.equal(firmware.includes(oldName), false, oldName + " should be removed");
+  }
+  assert.ok(firmware.includes("systemReadiness.invalidate();"));
+  assert.ok(firmware.includes("bool locationReady;"));
+  assert.ok(firmware.includes("systemReadiness.locationReady = true;"));
+
+  assert.ok(routeSource("/set").includes("advanceConfigurationLocked();"));
+  assert.ok(routeSource("/updateLoc").includes("advanceConfigurationLocked();"));
+});
+
+test("motor stop requests use a latched task notification, not a shared bool", () => {
+  const stopStart = firmware.indexOf("void disableMotors() {");
+  const stopEnd = firmware.indexOf("bool startTLEFetchTask()", stopStart);
+  assert.notEqual(stopStart, -1);
+  assert.notEqual(stopEnd, -1);
+  const disableFunction = firmware.slice(stopStart, stopEnd);
+  assert.ok(disableFunction.includes(
+    "xTaskNotify(motorTaskHandle, MOTOR_STOP_NOTIFICATION, eSetBits)"
+  ));
+
+  const motorStart = firmware.indexOf("void MotorTask(void * p) {");
+  const motorEnd = firmware.indexOf("void stepMotor(", motorStart);
+  assert.notEqual(motorStart, -1);
+  assert.notEqual(motorEnd, -1);
+  const motorTask = firmware.slice(motorStart, motorEnd);
+  assert.ok(motorTask.includes(
+    "xTaskNotifyWait(0, MOTOR_STOP_NOTIFICATION"
+  ));
+  assert.equal(firmware.includes("motorStopRequested"), false);
 });
