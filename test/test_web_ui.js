@@ -3,6 +3,10 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
+const firmware = fs.readFileSync(
+  path.join(__dirname, "../src/spacepointer_ver_2.cpp"),
+  "utf8"
+);
 
 // Execute the exact JavaScript embedded in the dashboard with small browser mocks.
 const header = fs.readFileSync(
@@ -96,6 +100,36 @@ function createHarness(fetchHandler) {
 async function flushPromises() {
   await new Promise((resolve) => setImmediate(resolve));
 }
+
+
+function routeSource(path) {
+  const start = firmware.indexOf(`server.on("${path}"`);
+  assert.notEqual(start, -1, `route ${path} must exist`);
+  const end = firmware.indexOf("\\n  });", start);
+  assert.notEqual(end, -1, `route ${path} must have a handler boundary`);
+  return firmware.slice(start, end);
+}
+
+test("firmware mutation endpoints require POST, authentication, and CSRF header", () => {
+  for (const endpoint of ["/set", "/updateLoc"]) {
+    const route = routeSource(endpoint);
+    assert.match(route, /HTTP_POST/);
+    assert.match(route, /r->authenticate\\(CONTROL_USER, CONTROL_PASSWORD\\)/);
+    assert.match(route, /hasValidMutationRequest\\(r\\)/);
+    assert.ok(
+      route.indexOf("r->authenticate") < route.indexOf("hasValidMutationRequest"),
+      "authentication must be checked before the mutation header"
+    );
+  }
+});
+
+test("firmware telemetry endpoint remains read-only GET", () => {
+  const route = routeSource("/data");
+  assert.match(route, /HTTP_GET/);
+  assert.match(route, /getVersionedTelemetrySnapshot\\(target, data\\)/);
+  assert.match(route, /r->send\\(503/);
+  assert.match(route, /application\\/json/);
+});
 
 test("target changes use POST, form encoding, and the CSRF header", async () => {
   const h = createHarness(async () => ({ ok: true, status: 202 }));
