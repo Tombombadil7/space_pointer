@@ -361,11 +361,11 @@ void test_azimuth_error_uses_shortest_circular_direction() {
 void test_finite_double_parser_accepts_valid_decimal_and_exponent_values() {
     double value = 0.0;
     TEST_ASSERT_TRUE(TrackingMath::parseFiniteDouble("32.5", value));
-    TEST_ASSERT_DOUBLE_WITHIN(0.000001, 32.5, value);
+    TEST_ASSERT_TRUE(fabs(value - 32.5) < 0.000001);
     TEST_ASSERT_TRUE(TrackingMath::parseFiniteDouble("-1.25e2", value));
-    TEST_ASSERT_DOUBLE_WITHIN(0.000001, -125.0, value);
+    TEST_ASSERT_TRUE(fabs(value + 125.0) < 0.000001);
     TEST_ASSERT_TRUE(TrackingMath::parseFiniteDouble(" 50", value));
-    TEST_ASSERT_DOUBLE_WITHIN(0.000001, 50.0, value);
+    TEST_ASSERT_TRUE(fabs(value - 50.0) < 0.000001);
 }
 
 void test_finite_double_parser_rejects_partial_nonfinite_and_range_errors() {
