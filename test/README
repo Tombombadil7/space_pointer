@@ -34,7 +34,8 @@ with small DOM, Leaflet, geolocation, and fetch mocks:
 node --test test/test_web_ui.js
 ```
 
-They cover POST + CSRF headers, target and phone-GPS payloads, failed mutation
-feedback, telemetry-only error handling, recovery after a 503, map updates,
-and the planet speed-unavailable display. This is a JavaScript behavior test,
+They cover firmware route method/authentication/CSRF contracts, POST + CSRF
+headers, target and phone-GPS payloads, failed mutation feedback, telemetry-only
+error handling, recovery after a 503, map updates, and the planet speed-unavailable
+display. This is a JavaScript behavior test,
 not a full real-browser or Wi-Fi integration test.
