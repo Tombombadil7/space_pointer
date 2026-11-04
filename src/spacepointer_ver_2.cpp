@@ -943,17 +943,11 @@ void MotorTask(void * p) {
       // Convert the 12-bit encoder reading into elevation relative to the
       // calibrated level position. Wrap the difference so small movements
       // across the sensor's 0/4095 boundary remain continuous.
-      int32_t encoderDelta = (int32_t)encoderRaw - ENCODER_ZERO_RAW;
-      if (encoderDelta > 2048) encoderDelta -= 4096;
-      if (encoderDelta < -2048) encoderDelta += 4096;
-
-      const float elNow = ENCODER_DIRECTION *
-                          encoderDelta * (360.0f / 4096.0f);
-
-      // The encoder represents a mechanically bounded elevation axis. An
-      // out-of-range reading indicates bad calibration, mounting, or sensor
-      // data; stop rather than interpreting it as a wrapped circular angle.
-      if (!TrackingMath::validElevation(elNow)) {
+      float elNow = NAN;
+      // The encoder is circular, but the telescope's elevation axis is not.
+      // Reject invalid calibration/raw data and any reading outside 0–90 degrees.
+      if (!TrackingMath::encoderElevation(encoderRaw, ENCODER_ZERO_RAW,
+                                         ENCODER_DIRECTION, elNow)) {
           if (driversEnabled) {
               digitalWrite(AZ_EN_PIN, HIGH);
               digitalWrite(EL_EN_PIN, HIGH);
@@ -965,10 +959,11 @@ void MotorTask(void * p) {
 
       // Convert the BNO055 magnetic heading to true north before comparing
       // it with Astronomy Engine's true-north target azimuth.
-      float headingTrue = fmodf(headingNow + MAGNETIC_DECLINATION_DEG, 360.0f);
-      if (headingTrue < 0.0f) headingTrue += 360.0f;
+      const float headingTrue = TrackingMath::trueHeading(
+          headingNow, MAGNETIC_DECLINATION_DEG);
 
-      const int azSteps = pidOutput(pAz, TrackingMath::wrapAngle(targetAz - headingTrue));
+      const int azSteps = pidOutput(
+          pAz, TrackingMath::azimuthError(targetAz, headingTrue));
       // Elevation is linear and bounded; only azimuth uses circular wrapping.
       const int elSteps = pidOutput(
           pEl, TrackingMath::elevationError(targetEl, elNow));
