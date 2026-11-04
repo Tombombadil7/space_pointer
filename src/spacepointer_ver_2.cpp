@@ -887,7 +887,7 @@ void MotorTask(void * p) {
       const bool orbitalDataReady = activeTarget.type != TYPE_SATELLITE || tleReady;
       if (!targetRead || !timeReady || !observerReady || !calculationReady ||
           !orbitalDataReady || !bnoReady || !encoderReady || !isfinite(targetAz) ||
-          !isfinite(targetEl) || targetEl < 0.0f || targetEl > 90.0f) {
+          !TrackingMath::validElevation(targetEl)) {
           // Only this task changes the driver ENABLE pins during operation.
           if (driversEnabled) {
               digitalWrite(AZ_EN_PIN, HIGH);
@@ -946,13 +946,28 @@ void MotorTask(void * p) {
       const float elNow = ENCODER_DIRECTION *
                           encoderDelta * (360.0f / 4096.0f);
 
+      // The encoder represents a mechanically bounded elevation axis. An
+      // out-of-range reading indicates bad calibration, mounting, or sensor
+      // data; stop rather than interpreting it as a wrapped circular angle.
+      if (!TrackingMath::validElevation(elNow)) {
+          if (driversEnabled) {
+              digitalWrite(AZ_EN_PIN, HIGH);
+              digitalWrite(EL_EN_PIN, HIGH);
+              driversEnabled = false;
+          }
+          vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(MOTOR_TASK_MS));
+          continue;
+      }
+
       // Convert the BNO055 magnetic heading to true north before comparing
       // it with Astronomy Engine's true-north target azimuth.
       float headingTrue = fmodf(headingNow + MAGNETIC_DECLINATION_DEG, 360.0f);
       if (headingTrue < 0.0f) headingTrue += 360.0f;
 
       const int azSteps = pidOutput(pAz, TrackingMath::wrapAngle(targetAz - headingTrue));
-      const int elSteps = pidOutput(pEl, TrackingMath::wrapAngle(targetEl - elNow));
+      // Elevation is linear and bounded; only azimuth uses circular wrapping.
+      const int elSteps = pidOutput(
+          pEl, TrackingMath::elevationError(targetEl, elNow));
       const bool azFwd = azSteps > 0;
       const bool elFwd = elSteps > 0;
       const int azN = abs(azSteps);
