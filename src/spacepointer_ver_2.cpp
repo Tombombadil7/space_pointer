@@ -947,9 +947,8 @@ void fetchTLE() {
                 const char *rawLine1 = doc["line1"].as<const char *>();
                 const char *rawLine2 = doc["line2"].as<const char *>();
 
-                if (!error && rawLine1 != nullptr && rawLine2 != nullptr &&
-                    strlen(rawLine1) >= 69 && strlen(rawLine2) >= 69 &&
-                    rawLine1[0] == '1' && rawLine2[0] == '2') {
+                if (!error && TrackingMath::validTlePair(
+                        rawLine1, rawLine2, requested.target.noradID)) {
                     char line1[71] = {};
                     char line2[71] = {};
                     strlcpy(line1, rawLine1, sizeof(line1));
