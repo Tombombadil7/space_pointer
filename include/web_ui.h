@@ -89,7 +89,7 @@ const char index_html[] PROGMEM = R"rawliteral(
           <div class="stats-grid">
           <div class="stat-box">
             <div class="stat-val"><span id="speed">--</span></div>
-            <div class="stat-lbl">km/s speed</div>
+            <div class="stat-lbl" data-lbl="speed">km/s orbital speed</div>
           </div>
           <div class="stat-box">
             <div class="stat-val"><span id="alt">--</span></div>
@@ -185,8 +185,9 @@ const char index_html[] PROGMEM = R"rawliteral(
             document.getElementById('az').innerText = d.az.toFixed(2);
             document.getElementById('el').innerText = d.el.toFixed(2);
     
-            // speed (same for both — always km/s)
-            document.getElementById('speed').innerText = d.speed > 0 ? d.speed.toFixed(2) : '--';
+            // Orbital speed is relevant for satellites; planets do not calculate it.
+            document.getElementById('speed').innerText = isSat && d.speed > 0 ? d.speed.toFixed(2) : '\u2014';
+            document.querySelector('[data-lbl="speed"]').innerText = isSat ? 'km/s orbital speed' : 'not calculated';
     
             // altitude label: "km altitude" for sats, "km from Earth" for planets
             document.querySelector('[data-lbl="alt"]').innerText  = isSat ? 'km altitude' : 'km from observer';
