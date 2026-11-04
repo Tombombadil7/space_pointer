@@ -52,13 +52,22 @@ inline float wrapAngle(float degrees) {
  */
 inline int proportionalSteps(float gain, float deadband,
                              float errorDegrees, int maxSteps) {
-    if (!isfinite(errorDegrees)) return 0;
+    if (!isfinite(gain) || !isfinite(deadband) || deadband < 0.0f ||
+        !isfinite(errorDegrees) || maxSteps <= 0) {
+        return 0;
+    }
     if (fabsf(errorDegrees) <= deadband) return 0;
 
-    const long requestedSteps = lroundf(gain * errorDegrees);
-    if (requestedSteps > maxSteps) return maxSteps;
-    if (requestedSteps < -maxSteps) return -maxSteps;
-    return (int)requestedSteps;
+    // Use double precision for the product, then clamp before lround so even
+    // extreme finite float inputs cannot overflow the integer conversion.
+    const double requestedSteps = (double)gain * (double)errorDegrees;
+    if (requestedSteps >= (double)maxSteps + 0.5) return maxSteps;
+    if (requestedSteps <= -(double)maxSteps - 0.5) return -maxSteps;
+
+    const long roundedSteps = lround(requestedSteps);
+    if (roundedSteps > maxSteps) return maxSteps;
+    if (roundedSteps < -maxSteps) return -maxSteps;
+    return (int)roundedSteps;
 }
 
 /*
