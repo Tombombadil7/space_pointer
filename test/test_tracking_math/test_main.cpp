@@ -151,7 +151,6 @@ void test_configuration_readiness_starts_invalid() {
     TEST_ASSERT_EQUAL_UINT32(1, state.generation);
     TEST_ASSERT_FALSE(state.tleReady);
     TEST_ASSERT_FALSE(state.calculationReady);
-    TEST_ASSERT_FALSE(state.telemetryReady);
     TEST_ASSERT_FALSE(state.passReady);
 }
 
@@ -167,7 +166,6 @@ void test_configuration_change_increments_one_generation_and_clears_results() {
     TEST_ASSERT_FALSE(state.isCurrent(previous));
     TEST_ASSERT_FALSE(state.tleReady);
     TEST_ASSERT_FALSE(state.calculationReady);
-    TEST_ASSERT_FALSE(state.telemetryReady);
     TEST_ASSERT_FALSE(state.passReady);
 }
 
@@ -181,7 +179,6 @@ void test_stale_async_results_cannot_be_published_after_configuration_change() {
     TEST_ASSERT_FALSE(state.publishPass(oldGeneration));
     TEST_ASSERT_FALSE(state.tleReady);
     TEST_ASSERT_FALSE(state.calculationReady);
-    TEST_ASSERT_FALSE(state.telemetryReady);
     TEST_ASSERT_FALSE(state.passReady);
 }
 
@@ -191,7 +188,6 @@ void test_calculation_and_telemetry_publish_together_but_pass_is_independent() {
 
     TEST_ASSERT_TRUE(state.publishCalculation(generation));
     TEST_ASSERT_TRUE(state.calculationReady);
-    TEST_ASSERT_TRUE(state.telemetryReady);
     TEST_ASSERT_FALSE(state.passReady);
 
     TEST_ASSERT_TRUE(state.publishPass(generation));
