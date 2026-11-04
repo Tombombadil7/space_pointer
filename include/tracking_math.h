@@ -181,6 +181,7 @@ inline bool supportedPlanetBody(int body) {
  */
 struct ConfigurationReadiness {
     uint32_t generation = 1;
+    bool locationReady = false;
     bool tleReady = false;
     bool calculationReady = false;
     bool passReady = false;
