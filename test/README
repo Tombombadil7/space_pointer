@@ -40,3 +40,14 @@ headers, target and phone-GPS payloads, failed mutation feedback, telemetry-only
 error handling, recovery after a 503, map updates, and the planet speed-unavailable
 display. This is a JavaScript behavior test,
 not a full real-browser or Wi-Fi integration test.
+
+## Sanitizer run
+
+CI also runs the native suite with AddressSanitizer and UndefinedBehaviorSanitizer:
+
+```sh
+pio test -e native-sanitize
+```
+
+This can detect memory errors and undefined behavior in the host-testable code.
+It does not instrument the ESP32 firmware or replace hardware testing.
