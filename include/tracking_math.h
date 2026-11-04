@@ -186,7 +186,6 @@ inline bool validTleChecksum(const char *line) {
 inline bool validTlePair(const char *line1, const char *line2,
                          long expectedNoradId) {
     if (!validNoradId(expectedNoradId) || line1 == NULL || line2 == NULL ||
-        strlen(line1) < 69 || strlen(line2) < 69 ||
         line1[0] != '1' || line2[0] != '2' ||
         !validTleChecksum(line1) || !validTleChecksum(line2)) {
         return false;
