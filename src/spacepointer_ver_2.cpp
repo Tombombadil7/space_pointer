@@ -1087,10 +1087,38 @@ void fetchTLE() {
     }
 
     if (!success) {
-        tleReady = false;
-        invalidateCalculationReadiness();
-        disableMotors();
-        Serial.println("WARNING: TLE update failed; satellite motors remain disabled.");
+        // The request may have become obsolete while the HTTP call was in
+        // progress (for example, the user selected a planet or another satellite).
+        // Only apply failure handling if both original inputs are still current.
+        // Otherwise an old failed request could clear readiness for a newer target.
+        bool targetLocked =
+            xSemaphoreTake(targetMutex, pdMS_TO_TICKS(50)) == pdTRUE;
+        bool observerLocked = false;
+        if (targetLocked) {
+            observerLocked =
+                xSemaphoreTake(sysMutex, pdMS_TO_TICKS(50)) == pdTRUE;
+        }
+
+        const bool requestStillCurrent = targetLocked && observerLocked &&
+            requestedSnapshot.generation != 0 &&
+            targetGeneration == requestedSnapshot.generation &&
+            current.type == TYPE_SATELLITE &&
+            current.noradID == requested.noradID &&
+            observerGeneration == observerVersion;
+
+        if (observerLocked) xSemaphoreGive(sysMutex);
+        if (targetLocked) xSemaphoreGive(targetMutex);
+
+        if (requestStillCurrent) {
+            // This is a genuine failure for the active satellite/location.
+            tleReady = false;
+            invalidateCalculationReadiness();
+            disableMotors();
+            Serial.println("WARNING: TLE update failed; satellite motors remain disabled.");
+        } else {
+            // A newer request/state owns readiness now. Do not touch it.
+            Serial.println("INFO: Discarded stale TLE result after target/location changed.");
+        }
     }
     xSemaphoreGive(tleFetchMutex);
 }
