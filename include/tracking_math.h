@@ -122,11 +122,10 @@ inline bool encoderElevation(uint16_t rawAngle, int zeroRaw, int direction,
  */
 inline bool motorControlReady(bool targetRead, bool timeReady,
                               bool observerReady, bool calculationReady,
-                              bool isSatellite, bool tleReady,
-                              bool bnoReady, bool encoderReady,
+                              bool tleReadyForTarget, bool sensorsReady,
                               float targetAzimuth, float targetElevation) {
     return targetRead && timeReady && observerReady && calculationReady &&
-           (!isSatellite || tleReady) && bnoReady && encoderReady &&
+           tleReadyForTarget && sensorsReady &&
            isfinite(targetAzimuth) && validElevation(targetElevation);
 }
 
@@ -180,30 +179,48 @@ inline bool supportedPlanetBody(int body) {
  * be tested on a desktop build. In firmware, the caller must protect every
  * read/write with targetMutex.
  */
-struct GenerationReadiness {
-    uint32_t targetGeneration = 0;
-    uint32_t observerGeneration = 0;
+struct ConfigurationReadiness {
+    uint32_t generation = 1;
+    bool tleReady = false;
+    bool calculationReady = false;
+    bool telemetryReady = false;
+    bool passReady = false;
 
-    void clear() {
-        targetGeneration = 0;
-        observerGeneration = 0;
+    void clearResults() {
+        tleReady = false;
+        calculationReady = false;
+        telemetryReady = false;
+        passReady = false;
     }
 
-    void publish(uint32_t target, uint32_t observer) {
-        // Never publish a partial/invalid version pair.
-        if (target == 0 || observer == 0) {
-            clear();
-            return;
-        }
-        targetGeneration = target;
-        observerGeneration = observer;
+    void invalidate() {
+        ++generation;
+        if (generation == 0) ++generation;
+        clearResults();
     }
 
-    bool matches(uint32_t target, uint32_t observer) const {
-        return target != 0 && observer != 0 &&
-               targetGeneration == target &&
-               observerGeneration == observer;
+    bool isCurrent(uint32_t candidate) const {
+        return candidate != 0 && candidate == generation;
     }
-};
+
+    bool publishTle(uint32_t candidate) {
+        if (!isCurrent(candidate)) return false;
+        tleReady = true;
+        return true;
+    }
+
+    bool publishCalculation(uint32_t candidate) {
+        if (!isCurrent(candidate)) return false;
+        calculationReady = true;
+        telemetryReady = true;
+        return true;
+    }
+
+    bool publishPass(uint32_t candidate) {
+        if (!isCurrent(candidate)) return false;
+        passReady = true;
+        return true;
+    }
+};;
 
 } // namespace TrackingMath
