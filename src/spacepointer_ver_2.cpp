@@ -1008,8 +1008,9 @@ void fetchTLE() {
         return;
     }
 
-    tleReady = false;
-    invalidateCalculationReadiness();
+    // Read the latest request first. A queued notification can outlive the
+    // satellite selection that created it; if the current target is a planet,
+    // this worker must leave that planet's calculation readiness untouched.
     const VersionedTargetSnapshot requestedSnapshot = getVersionedTargetSnapshot();
     const TargetState requested = requestedSnapshot.target;
     double lat, lon, alt;
@@ -1020,6 +1021,11 @@ void fetchTLE() {
         requested.type == TYPE_SATELLITE &&
         getVersionedObserverSnapshot(lat, lon, alt, observerVersion) &&
         requested.noradID > 0) {
+        // A real satellite refresh is now underway. Invalidate any prior
+        // calculation before downloading replacement orbital elements.
+        tleReady = false;
+        invalidateCalculationReadiness();
+
         HTTPClient http;
         http.setTimeout(12000);
         const String url = "https://tle.ivanstanojevic.me/api/tle/" + String(requested.noradID);
