@@ -134,8 +134,22 @@ const char index_html[] PROGMEM = R"rawliteral(
         L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png').addTo(map);
         var marker = L.marker([0, 0]).addTo(map);
     
+        // All state-changing requests use POST plus a custom header. Browsers
+        // cannot add this header to a cross-origin form submission, and a
+        // cross-origin fetch would require CORS permission that this device does not grant.
+        function postMutation(path, params) {
+          return fetch(path, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/x-www-form-urlencoded',
+              'X-SpacePointer-Request': '1'
+            },
+            body: new URLSearchParams(params).toString()
+          });
+        }
+
         function setTarget(type, name, val) {
-          fetch('/set?type='+type+'&name='+encodeURIComponent(name)+'&val='+val)
+          postMutation('/set', {type: type, name: name, val: val})
             .then(function(r) { if (!r.ok) throw new Error('Target update failed: '+r.status); })
             .catch(function(e) { alert(e.message); });
         }
@@ -145,7 +159,11 @@ const char index_html[] PROGMEM = R"rawliteral(
         }
         function syncGPS() {
           navigator.geolocation.getCurrentPosition(function(p) {
-            fetch('/updateLoc?lat='+p.coords.latitude+'&lon='+p.coords.longitude+'&alt='+(p.coords.altitude||50))
+            postMutation('/updateLoc', {
+              lat: p.coords.latitude,
+              lon: p.coords.longitude,
+              alt: p.coords.altitude || 50
+            })
               .then(function(r) { if (!r.ok) throw new Error('Location update failed: '+r.status); alert("GPS Updated!"); })
               .catch(function(e) { alert(e.message); });
           });
