@@ -402,8 +402,27 @@ void test_long_integer_parser_rejects_empty_partial_and_overflow_values() {
 }
 
 
+
+void test_proportional_controller_clamps_extreme_finite_inputs_before_rounding() {
+    TEST_ASSERT_EQUAL_INT(8, TrackingMath::proportionalSteps(3.0e30f, 0.0f, 3.0e30f, 8));
+    TEST_ASSERT_EQUAL_INT(-8, TrackingMath::proportionalSteps(3.0e30f, 0.0f, -3.0e30f, 8));
+    TEST_ASSERT_EQUAL_INT(8, TrackingMath::proportionalSteps(1.0f, 0.0f, 8.5f, 8));
+    TEST_ASSERT_EQUAL_INT(-8, TrackingMath::proportionalSteps(1.0f, 0.0f, -8.5f, 8));
+}
+
+void test_proportional_controller_rejects_invalid_gain_deadband_and_limit() {
+    TEST_ASSERT_EQUAL_INT(0, TrackingMath::proportionalSteps(NAN, 0.05f, 1.0f, 8));
+    TEST_ASSERT_EQUAL_INT(0, TrackingMath::proportionalSteps(INFINITY, 0.05f, 1.0f, 8));
+    TEST_ASSERT_EQUAL_INT(0, TrackingMath::proportionalSteps(1.0f, NAN, 1.0f, 8));
+    TEST_ASSERT_EQUAL_INT(0, TrackingMath::proportionalSteps(1.0f, -0.1f, 1.0f, 8));
+    TEST_ASSERT_EQUAL_INT(0, TrackingMath::proportionalSteps(1.0f, 0.05f, 1.0f, -8));
+}
+
+
 int main(int argc, char **argv) {
     UNITY_BEGIN();
+    RUN_TEST(test_proportional_controller_clamps_extreme_finite_inputs_before_rounding);
+    RUN_TEST(test_proportional_controller_rejects_invalid_gain_deadband_and_limit);
     RUN_TEST(test_finite_double_parser_accepts_valid_decimal_and_exponent_values);
     RUN_TEST(test_finite_double_parser_rejects_partial_nonfinite_and_range_errors);
     RUN_TEST(test_long_integer_parser_accepts_only_complete_integer_strings);
