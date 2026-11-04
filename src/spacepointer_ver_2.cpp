@@ -107,6 +107,7 @@ TargetState current = {TYPE_SATELLITE, {.noradID = 25544}, "ISS"};
 struct ConfigurationSnapshot {
   TargetState target;
   uint32_t generation;
+  bool locationReady;
   double lat, lon, alt;
 };
 // A deliberately simple proportional controller is enough for slow telescope tracking.
@@ -270,6 +271,7 @@ void setup() {
           return;
       }
       sys.lat = lat; sys.lon = lon; sys.alt = alt;
+      systemReadiness.locationReady = true;
       advanceConfigurationLocked();
       const TargetState target = current;
       xSemaphoreGive(stateMutex);
@@ -416,9 +418,9 @@ void setup() {
 
   // Load the default ISS TLE before the physics task can use the SGP4 object.
   const ConfigurationSnapshot initialConfig = getConfigurationSnapshot();
-  if (timeSynced && TrackingMath::validObserver(initialConfig.lat,
-                                                initialConfig.lon,
-                                                initialConfig.alt)) {
+  if (timeSynced && initialConfig.locationReady &&
+      TrackingMath::validObserver(initialConfig.lat, initialConfig.lon,
+                                  initialConfig.alt)) {
       fetchTLE();
   }
 
@@ -456,6 +458,7 @@ ConfigurationSnapshot getConfigurationSnapshot() {
       xSemaphoreTake(stateMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
       result.target = current;
       result.generation = systemReadiness.generation;
+      result.locationReady = systemReadiness.locationReady;
       result.lat = sys.lat;
       result.lon = sys.lon;
       result.alt = sys.alt;
@@ -634,7 +637,7 @@ void PhysicsTask(void * p) {
 
   for (;;) {
       const ConfigurationSnapshot snapshot = getConfigurationSnapshot();
-      if (snapshot.generation == 0 ||
+      if (snapshot.generation == 0 || !snapshot.locationReady ||
           !TrackingMath::validObserver(snapshot.lat, snapshot.lon, snapshot.alt) ||
           !isTimeReady()) {
           vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(500));
@@ -760,7 +763,8 @@ void MotorTask(void * p) {
           activeGeneration = systemReadiness.generation;
           targetAz = motorTarget.az;
           targetEl = motorTarget.el;
-          observerReady = TrackingMath::validObserver(sys.lat, sys.lon, sys.alt);
+          observerReady = systemReadiness.locationReady &&
+                           TrackingMath::validObserver(sys.lat, sys.lon, sys.alt);
           calculationReady = systemReadiness.calculationReady;
           tleReadyForTarget = activeTarget.type != TYPE_SATELLITE ||
                               systemReadiness.tleReady;
@@ -903,6 +907,7 @@ bool updateIPLocation() {
                     sys.lat = lat;
                     sys.lon = lon;
                     sys.alt = 50.0;
+                    systemReadiness.locationReady = true;
                     advanceConfigurationLocked();
                     xSemaphoreGive(stateMutex);
                     valid = true;
