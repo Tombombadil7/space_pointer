@@ -125,13 +125,13 @@ test("firmware mutation endpoints require POST, authentication, and CSRF header"
 
 test("TLE validation stays inside fetchTLE", () => {
   const start = firmware.lastIndexOf("void fetchTLE() {");
-  const end = firmware.indexOf("\\n}\\n", start);
+  const end = firmware.indexOf("\n}\n", start);
   assert.notEqual(start, -1, "fetchTLE implementation must exist");
   assert.notEqual(end, -1, "fetchTLE implementation must have an end");
   const fetchTLE = firmware.slice(start, end);
 
-  assert.match(fetchTLE, /strlen\\(rawLine1\\) >= 69/);
-  assert.match(fetchTLE, /strlen\\(rawLine2\\) >= 69/);
+  assert.match(fetchTLE, /strlen\(rawLine1\) >= 69/);
+  assert.match(fetchTLE, /strlen\(rawLine2\) >= 69/);
   assert.ok(fetchTLE.includes("checksum1 % 10 == rawLine1[68] - '0'"));
   assert.ok(fetchTLE.includes("checksum2 % 10 == rawLine2[68] - '0'"));
   assert.ok(fetchTLE.includes("line1Norad == line2Norad"));
