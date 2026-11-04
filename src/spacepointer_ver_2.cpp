@@ -116,7 +116,6 @@ struct PController {
   float kp;
   float deadband;
 };
-struct MotorTarget { float az = 0; float el = 0; } motorTarget;
 
 // Modest gains suit the small, repeated corrections used during normal tracking.
 // A narrow deadband filters sensor noise without allowing a large pointing error.
@@ -125,7 +124,6 @@ PController pEl = {3.0f, 0.05f};
 SemaphoreHandle_t stateMutex;    // protects target, location, telemetry, and readiness
 SemaphoreHandle_t i2cMutex;      // protects the shared I2C bus
 SemaphoreHandle_t sgp4Mutex;     // protects the shared SGP4 instance
-SemaphoreHandle_t tleFetchMutex; // serializes TLE downloads and installation
 // One long-lived worker handles all TLE refresh requests. Notifications are
 // coalesced while a download is running, so rapid target changes cannot create
 // an unbounded number of short-lived FreeRTOS tasks.
@@ -187,9 +185,7 @@ void setup() {
   stateMutex    = xSemaphoreCreateMutex();
   i2cMutex      = xSemaphoreCreateMutex();
   sgp4Mutex     = xSemaphoreCreateMutex();
-  tleFetchMutex = xSemaphoreCreateMutex();
-  if (stateMutex == NULL || i2cMutex == NULL ||
-      sgp4Mutex == NULL || tleFetchMutex == NULL) {
+  if (stateMutex == NULL || i2cMutex == NULL || sgp4Mutex == NULL) {
       Serial.println("CRITICAL: Failed to create mutexes! Halting.");
       while (1) { delay(1000); }
   }
@@ -341,8 +337,6 @@ void setup() {
           return;
       }
       current = next;
-      motorTarget.az = 0;
-      motorTarget.el = 0;
       advanceConfigurationLocked();
       xSemaphoreGive(stateMutex);
 
@@ -416,12 +410,14 @@ void setup() {
       Serial.println("\nWARNING: NTP sync timed out; motor tracking remains disabled.");
   }
 
-  // Load the default ISS TLE before the physics task can use the SGP4 object.
+  // Request the default ISS TLE through the same worker used for later refreshes.
   const ConfigurationSnapshot initialConfig = getConfigurationSnapshot();
   if (timeSynced && initialConfig.locationReady &&
       TrackingMath::validObserver(initialConfig.lat, initialConfig.lon,
                                   initialConfig.alt)) {
-      fetchTLE();
+      if (!startTLEFetchTask()) {
+          Serial.println("WARNING: Could not request initial TLE refresh; satellite tracking will remain disabled.");
+      }
   }
 
   // ── 6. Task Creation ───────────────────────────────────────────────
@@ -722,8 +718,6 @@ void PhysicsTask(void * p) {
               sys.satSpeed = satSpeed;
               sys.satAltKm = satAltKm;
               sys.satDist = satDist;
-              motorTarget.az = (float)targetAz;
-              motorTarget.el = (float)targetEl;
               systemReadiness.publishCalculation(generation);
           }
           xSemaphoreGive(stateMutex);
@@ -761,8 +755,8 @@ void MotorTask(void * p) {
           xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
           activeTarget = current;
           activeGeneration = systemReadiness.generation;
-          targetAz = motorTarget.az;
-          targetEl = motorTarget.el;
+          targetAz = (float)sys.targetAz;
+          targetEl = (float)sys.targetEl;
           observerReady = systemReadiness.locationReady &&
                            TrackingMath::validObserver(sys.lat, sys.lon, sys.alt);
           calculationReady = systemReadiness.calculationReady;
@@ -922,12 +916,6 @@ bool updateIPLocation() {
 
 
 void fetchTLE() {
-    if (tleFetchMutex == NULL ||
-        xSemaphoreTake(tleFetchMutex, pdMS_TO_TICKS(20000)) != pdTRUE) {
-        disableMotors();
-        return;
-    }
-
     const ConfigurationSnapshot requested = getConfigurationSnapshot();
     bool success = false;
 
@@ -1046,6 +1034,5 @@ void fetchTLE() {
         }
     }
 
-    xSemaphoreGive(tleFetchMutex);
 }
 
