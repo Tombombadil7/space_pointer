@@ -58,13 +58,17 @@ inline int proportionalSteps(float gain, float deadband,
     }
     if (fabsf(errorDegrees) <= deadband) return 0;
 
-    // Use double precision for the product, then clamp before lround so even
-    // extreme finite float inputs cannot overflow the integer conversion.
-    const double requestedSteps = (double)gain * (double)errorDegrees;
-    if (requestedSteps >= (double)maxSteps + 0.5) return maxSteps;
-    if (requestedSteps <= -(double)maxSteps - 0.5) return -maxSteps;
+    // Preserve the controller's original float multiplication/rounding,
+    // but clamp before lroundf so extreme inputs cannot overflow conversion.
+    const float requestedSteps = gain * errorDegrees;
+    if (!isfinite(requestedSteps)) {
+        return requestedSteps > 0.0f ? maxSteps :
+               requestedSteps < 0.0f ? -maxSteps : 0;
+    }
+    if ((double)requestedSteps >= (double)maxSteps + 0.5) return maxSteps;
+    if ((double)requestedSteps <= -(double)maxSteps - 0.5) return -maxSteps;
 
-    const long roundedSteps = lround(requestedSteps);
+    const long roundedSteps = lroundf(requestedSteps);
     if (roundedSteps > maxSteps) return maxSteps;
     if (roundedSteps < -maxSteps) return -maxSteps;
     return (int)roundedSteps;
