@@ -303,8 +303,68 @@ void test_astronomy_unix_epoch_conversion_matches_utc_epoch() {
 }
 
 
+
+void test_encoder_elevation_accepts_calibrated_mechanical_boundaries() {
+    float elevation = NAN;
+    TEST_ASSERT_TRUE(TrackingMath::encoderElevation(2048, 2048, 1, elevation));
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, 0.0f, elevation);
+    TEST_ASSERT_TRUE(TrackingMath::encoderElevation(3072, 2048, 1, elevation));
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, 90.0f, elevation);
+    TEST_ASSERT_TRUE(TrackingMath::encoderElevation(1024, 2048, -1, elevation));
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, 90.0f, elevation);
+}
+
+void test_encoder_elevation_rejects_invalid_raw_values_and_calibration() {
+    float elevation = 0.0f;
+    TEST_ASSERT_FALSE(TrackingMath::encoderElevation(4096, 2048, 1, elevation));
+    TEST_ASSERT_FALSE(TrackingMath::encoderElevation(2048, -1, 1, elevation));
+    TEST_ASSERT_FALSE(TrackingMath::encoderElevation(2048, 4096, 1, elevation));
+    TEST_ASSERT_FALSE(TrackingMath::encoderElevation(2048, 2048, 0, elevation));
+    TEST_ASSERT_FALSE(TrackingMath::encoderElevation(2048, 2048, 2, elevation));
+    TEST_ASSERT_FALSE(TrackingMath::encoderElevation(3073, 2048, 1, elevation));
+    TEST_ASSERT_FALSE(TrackingMath::encoderElevation(1023, 2048, -1, elevation));
+}
+
+void test_encoder_elevation_exhaustively_checks_all_12_bit_readings() {
+    float elevation = 0.0f;
+    for (uint16_t raw = 0; raw <= 4095; ++raw) {
+        const bool positiveDirection =
+            TrackingMath::encoderElevation(raw, 2048, 1, elevation);
+        TEST_ASSERT_EQUAL((raw >= 2048 && raw <= 3072), positiveDirection);
+
+        const bool negativeDirection =
+            TrackingMath::encoderElevation(raw, 2048, -1, elevation);
+        TEST_ASSERT_EQUAL((raw >= 1024 && raw <= 2048), negativeDirection);
+    }
+}
+
+void test_true_heading_wraps_east_and_west_declination() {
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, 1.5f, TrackingMath::trueHeading(359.5f, 2.0f));
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, 358.0f, TrackingMath::trueHeading(0.0f, -2.0f));
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, 0.0f, TrackingMath::trueHeading(180.0f, 180.0f));
+}
+
+void test_true_heading_rejects_non_finite_inputs() {
+    TEST_ASSERT_TRUE(isnan(TrackingMath::trueHeading(NAN, 0.0f)));
+    TEST_ASSERT_TRUE(isnan(TrackingMath::trueHeading(10.0f, INFINITY)));
+}
+
+void test_azimuth_error_uses_shortest_circular_direction() {
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, 2.0f, TrackingMath::azimuthError(1.0f, 359.0f));
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, -2.0f, TrackingMath::azimuthError(359.0f, 1.0f));
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, 180.0f, TrackingMath::azimuthError(180.0f, 0.0f));
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, -180.0f, TrackingMath::azimuthError(0.0f, 180.0f));
+}
+
+
 int main(int argc, char **argv) {
     UNITY_BEGIN();
+    RUN_TEST(test_encoder_elevation_accepts_calibrated_mechanical_boundaries);
+    RUN_TEST(test_encoder_elevation_rejects_invalid_raw_values_and_calibration);
+    RUN_TEST(test_encoder_elevation_exhaustively_checks_all_12_bit_readings);
+    RUN_TEST(test_true_heading_wraps_east_and_west_declination);
+    RUN_TEST(test_true_heading_rejects_non_finite_inputs);
+    RUN_TEST(test_azimuth_error_uses_shortest_circular_direction);
     RUN_TEST(test_astronomy_engine_supported_bodies_produce_valid_horizon_coordinates);
     RUN_TEST(test_astronomy_engine_rise_set_search_is_chronological_for_supported_bodies);
     RUN_TEST(test_astronomy_unix_epoch_conversion_matches_utc_epoch);
