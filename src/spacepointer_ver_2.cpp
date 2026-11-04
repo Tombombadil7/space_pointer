@@ -782,6 +782,10 @@ void PhysicsTask(void * p) {
                       sys.satSpeed = satSpeed;
                       sys.satAltKm = satAltKm;
                       sys.satDist = satDist;
+                      // Publish source versions in the same locked transaction
+                      // as the values. /data rejects every older generation pair.
+                      sys.telemetrySourceVersions.publish(
+                          calculationGeneration, calculationObserverGeneration);
                       resultCommitted = true;
                       // Publish inside the same critical section as telemetry
                       // and motorTarget, while both source generations are locked.
