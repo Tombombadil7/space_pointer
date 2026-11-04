@@ -51,3 +51,9 @@ pio test -e native-sanitize
 
 This can detect memory errors and undefined behavior in the host-testable code.
 It does not instrument the ESP32 firmware or replace hardware testing.
+
+## Physical hardware
+
+The step-by-step ESP32-S3, I2C sensor, A4988 driver, motor, and phone bench
+procedure is in [HARDWARE_BENCH.md](HARDWARE_BENCH.md). These checks require the
+actual hardware and must be recorded separately; desktop CI cannot verify them.
