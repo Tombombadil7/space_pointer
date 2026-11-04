@@ -357,8 +357,57 @@ void test_azimuth_error_uses_shortest_circular_direction() {
 }
 
 
+
+void test_finite_double_parser_accepts_valid_decimal_and_exponent_values() {
+    double value = 0.0;
+    TEST_ASSERT_TRUE(TrackingMath::parseFiniteDouble("32.5", value));
+    TEST_ASSERT_DOUBLE_WITHIN(0.000001, 32.5, value);
+    TEST_ASSERT_TRUE(TrackingMath::parseFiniteDouble("-1.25e2", value));
+    TEST_ASSERT_DOUBLE_WITHIN(0.000001, -125.0, value);
+    TEST_ASSERT_TRUE(TrackingMath::parseFiniteDouble(" 50", value));
+    TEST_ASSERT_DOUBLE_WITHIN(0.000001, 50.0, value);
+}
+
+void test_finite_double_parser_rejects_partial_nonfinite_and_range_errors() {
+    double value = 123.0;
+    TEST_ASSERT_FALSE(TrackingMath::parseFiniteDouble(NULL, value));
+    TEST_ASSERT_FALSE(TrackingMath::parseFiniteDouble("", value));
+    TEST_ASSERT_FALSE(TrackingMath::parseFiniteDouble("12.5x", value));
+    TEST_ASSERT_FALSE(TrackingMath::parseFiniteDouble("12.5 ", value));
+    TEST_ASSERT_FALSE(TrackingMath::parseFiniteDouble("nan", value));
+    TEST_ASSERT_FALSE(TrackingMath::parseFiniteDouble("inf", value));
+    TEST_ASSERT_FALSE(TrackingMath::parseFiniteDouble("-inf", value));
+    TEST_ASSERT_FALSE(TrackingMath::parseFiniteDouble("1e9999", value));
+    TEST_ASSERT_FALSE(TrackingMath::parseFiniteDouble("1e-9999", value));
+}
+
+void test_long_integer_parser_accepts_only_complete_integer_strings() {
+    long value = 0;
+    TEST_ASSERT_TRUE(TrackingMath::parseLongInteger("25544", value));
+    TEST_ASSERT_EQUAL_INT(25544, value);
+    TEST_ASSERT_TRUE(TrackingMath::parseLongInteger("-1", value));
+    TEST_ASSERT_EQUAL_INT(-1, value);
+    TEST_ASSERT_TRUE(TrackingMath::parseLongInteger(" 42", value));
+    TEST_ASSERT_EQUAL_INT(42, value);
+}
+
+void test_long_integer_parser_rejects_empty_partial_and_overflow_values() {
+    long value = 0;
+    TEST_ASSERT_FALSE(TrackingMath::parseLongInteger(NULL, value));
+    TEST_ASSERT_FALSE(TrackingMath::parseLongInteger("", value));
+    TEST_ASSERT_FALSE(TrackingMath::parseLongInteger("42.0", value));
+    TEST_ASSERT_FALSE(TrackingMath::parseLongInteger("42x", value));
+    TEST_ASSERT_FALSE(TrackingMath::parseLongInteger("42 ", value));
+    TEST_ASSERT_FALSE(TrackingMath::parseLongInteger("999999999999999999999999999999999", value));
+}
+
+
 int main(int argc, char **argv) {
     UNITY_BEGIN();
+    RUN_TEST(test_finite_double_parser_accepts_valid_decimal_and_exponent_values);
+    RUN_TEST(test_finite_double_parser_rejects_partial_nonfinite_and_range_errors);
+    RUN_TEST(test_long_integer_parser_accepts_only_complete_integer_strings);
+    RUN_TEST(test_long_integer_parser_rejects_empty_partial_and_overflow_values);
     RUN_TEST(test_encoder_elevation_accepts_calibrated_mechanical_boundaries);
     RUN_TEST(test_encoder_elevation_rejects_invalid_raw_values_and_calibration);
     RUN_TEST(test_encoder_elevation_exhaustively_checks_all_12_bit_readings);
