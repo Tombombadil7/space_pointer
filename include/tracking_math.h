@@ -41,6 +41,18 @@ inline bool chronologicalEventPair(double firstEventTime, double secondEventTime
            secondEventTime > firstEventTime;
 }
 
+/*
+ * Elevation is a bounded mechanical axis, not a circular angle.
+ * Keep its validation and error calculation separate from azimuth wrapping.
+ */
+inline bool validElevation(float degrees) {
+    return isfinite(degrees) && degrees >= 0.0f && degrees <= 90.0f;
+}
+
+inline float elevationError(float targetDegrees, float measuredDegrees) {
+    return targetDegrees - measuredDegrees;
+}
+
 inline bool validObserver(double latitude, double longitude, double altitudeMeters) {
     return isfinite(latitude) && isfinite(longitude) && isfinite(altitudeMeters) &&
            latitude >= -90.0 && latitude <= 90.0 &&
