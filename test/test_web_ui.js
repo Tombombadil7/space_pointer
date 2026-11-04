@@ -123,6 +123,36 @@ test("firmware mutation endpoints require POST, authentication, and CSRF header"
   }
 });
 
+
+test("satellite mutations return 503 before committing when the TLE worker is unavailable", () => {
+  const setRoute = routeSource("/set");
+  const setLock = setRoute.indexOf("xSemaphoreTake(stateMutex");
+  const setCheck = setRoute.indexOf("refreshTLE && tleFetchTaskHandle == NULL");
+  const setMutation = setRoute.indexOf("current = next;");
+  const setUnlock = setRoute.indexOf("xSemaphoreGive(stateMutex);", setMutation);
+  const setNotify = setRoute.indexOf("if (refreshTLE) startTLEFetchTask();");
+  const setAccepted = setRoute.indexOf('r->send(202');
+  assert.ok(
+    setLock < setCheck && setCheck < setMutation &&
+    setMutation < setUnlock && setUnlock < setNotify && setNotify < setAccepted
+  );
+  assert.match(setRoute, /TLE worker unavailable; target was not changed/);
+
+  const locationRoute = routeSource("/updateLoc");
+  const locationLock = locationRoute.indexOf("xSemaphoreTake(stateMutex");
+  const locationCheck = locationRoute.indexOf("refreshTLE && tleFetchTaskHandle == NULL");
+  const locationMutation = locationRoute.indexOf("sys.lat = lat");
+  const locationUnlock = locationRoute.indexOf("xSemaphoreGive(stateMutex);", locationMutation);
+  const locationNotify = locationRoute.indexOf("if (refreshTLE) startTLEFetchTask();");
+  const locationAccepted = locationRoute.indexOf('r->send(202');
+  assert.ok(
+    locationLock < locationCheck && locationCheck < locationMutation &&
+    locationMutation < locationUnlock && locationUnlock < locationNotify &&
+    locationNotify < locationAccepted
+  );
+  assert.match(locationRoute, /TLE refresh unavailable; location was not changed/);
+});
+
 test("TLE validation stays inside fetchTLE", () => {
   const start = firmware.lastIndexOf("void fetchTLE() {");
   const end = firmware.indexOf("\n}\n", start);

@@ -266,17 +266,18 @@ void setup() {
           r->send(503, "text/plain", "System busy; retry location update.");
           return;
       }
+      const bool refreshTLE = current.type == TYPE_SATELLITE;
+      // The worker handle is created once at startup and remains valid for the device lifetime.
+      if (refreshTLE && tleFetchTaskHandle == NULL) {
+          xSemaphoreGive(stateMutex);
+          r->send(503, "text/plain", "TLE refresh unavailable; location was not changed.");
+          return;
+      }
       sys.lat = lat; sys.lon = lon; sys.alt = alt;
       systemReadiness.locationReady = true;
       advanceConfigurationLocked();
-      const TargetState target = current;
       xSemaphoreGive(stateMutex);
-      if (target.type == TYPE_SATELLITE) {
-          if (!startTLEFetchTask()) {
-              r->send(503, "text/plain", "Could not start TLE refresh; motors remain disabled.");
-              return;
-          }
-      }
+      if (refreshTLE) startTLEFetchTask();
       r->send(202, "text/plain", "Location accepted.");
   });
 
@@ -336,16 +337,17 @@ void setup() {
           r->send(503, "text/plain", "Target controller busy; retry.");
           return;
       }
+      const bool refreshTLE = next.type == TYPE_SATELLITE;
+      // Check worker availability before committing a target that needs a TLE.
+      if (refreshTLE && tleFetchTaskHandle == NULL) {
+          xSemaphoreGive(stateMutex);
+          r->send(503, "text/plain", "TLE worker unavailable; target was not changed.");
+          return;
+      }
       current = next;
       advanceConfigurationLocked();
       xSemaphoreGive(stateMutex);
-
-      if (next.type == TYPE_SATELLITE) {
-          if (!startTLEFetchTask()) {
-              r->send(503, "text/plain", "Could not start TLE download; motors remain disabled.");
-              return;
-          }
-      }
+      if (refreshTLE) startTLEFetchTask();
       r->send(202, "text/plain", "Target accepted.");
   });
 
