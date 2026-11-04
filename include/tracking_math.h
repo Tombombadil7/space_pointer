@@ -53,6 +53,39 @@ inline float elevationError(float targetDegrees, float measuredDegrees) {
     return targetDegrees - measuredDegrees;
 }
 
+
+/*
+ * Convert the AS5600's 12-bit circular reading into the telescope's bounded
+ * elevation axis. Direction and zero are explicit calibration inputs.
+ */
+inline bool encoderElevation(uint16_t rawAngle, int zeroRaw, int direction,
+                             float &elevationDegrees) {
+    if (rawAngle > 4095 || zeroRaw < 0 || zeroRaw > 4095 ||
+        (direction != 1 && direction != -1)) {
+        return false;
+    }
+
+    int32_t delta = (int32_t)rawAngle - zeroRaw;
+    if (delta > 2048) delta -= 4096;
+    if (delta < -2048) delta += 4096;
+
+    elevationDegrees = direction * delta * (360.0f / 4096.0f);
+    return validElevation(elevationDegrees);
+}
+
+/* Normalize a magnetic heading into true-north degrees. */
+inline float trueHeading(float magneticHeading, float declinationDegrees) {
+    if (!isfinite(magneticHeading) || !isfinite(declinationDegrees)) return NAN;
+    float heading = fmodf(magneticHeading + declinationDegrees, 360.0f);
+    if (heading < 0.0f) heading += 360.0f;
+    return heading;
+}
+
+/* Azimuth is circular, unlike the mechanically bounded elevation axis. */
+inline float azimuthError(float targetDegrees, float measuredDegrees) {
+    return wrapAngle(targetDegrees - measuredDegrees);
+}
+
 inline bool validObserver(double latitude, double longitude, double altitudeMeters) {
     return isfinite(latitude) && isfinite(longitude) && isfinite(altitudeMeters) &&
            latitude >= -90.0 && latitude <= 90.0 &&
