@@ -8,7 +8,7 @@ Run the tests from the repository root:
 pio test -e native
 ```
 
-The native suite currently contains 49 test cases covering:
+The native suite currently contains 52 test cases covering:
 - Angular wrapping, exact half-turn boundaries, multiple revolutions, and non-finite inputs.
 - Observer latitude, longitude, and altitude validation, including exact limits and out-of-range values.
 - NORAD ID boundaries and supported planetary-body IDs.
@@ -20,6 +20,7 @@ The native suite currently contains 49 test cases covering:
 - Actual Astronomy Engine integration: finite/bounded equatorial-to-horizon coordinates for the Moon, Mars, Jupiter, and Saturn; chronological rise/set searches for all supported bodies; and validation of the J2000-to-Unix timestamp conversion used by firmware.
 - Bounded elevation feedback: accept 0–90 degree values, reject out-of-range/non-finite encoder readings, and calculate elevation error linearly without circular wrapping.
 - Motor sensor math: exhaustively test all 4096 AS5600 raw readings in both calibration directions, reject invalid raw/calibration values, normalize magnetic heading with east/west declination, and verify shortest-path azimuth correction.
+- Motor safety gates: require all startup/tracking prerequisites, require TLE data only for satellites, and reject incomplete BNO055 calibration, failed I2C reads, invalid headings, and invalid encoder samples.
 - HTTP parameter parsing: accept complete finite decimal/exponent and integer strings; reject missing, partial, non-finite, underflow, overflow, and trailing-junk values.
 
 The native tests now exercise the Astronomy Engine library directly, but do not exercise FreeRTOS scheduling, I2C peripherals, motor drivers, or live SGP4/TLE data. Those still require dedicated mocks/simulation and ESP32 hardware/bench testing.
