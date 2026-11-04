@@ -38,6 +38,26 @@ void test_chronological_event_pair_rejects_non_finite_times() {
     TEST_ASSERT_FALSE(TrackingMath::chronologicalEventPair(10.0, INFINITY));
 }
 
+void test_elevation_validation_accepts_mechanical_boundaries() {
+    TEST_ASSERT_TRUE(TrackingMath::validElevation(0.0f));
+    TEST_ASSERT_TRUE(TrackingMath::validElevation(90.0f));
+    TEST_ASSERT_TRUE(TrackingMath::validElevation(45.0f));
+}
+
+void test_elevation_validation_rejects_out_of_range_and_non_finite_values() {
+    TEST_ASSERT_FALSE(TrackingMath::validElevation(-0.01f));
+    TEST_ASSERT_FALSE(TrackingMath::validElevation(90.01f));
+    TEST_ASSERT_FALSE(TrackingMath::validElevation(NAN));
+    TEST_ASSERT_FALSE(TrackingMath::validElevation(INFINITY));
+}
+
+void test_elevation_error_is_linear_not_circular() {
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, 25.0f,
+                             TrackingMath::elevationError(45.0f, 20.0f));
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, -70.0f,
+                             TrackingMath::elevationError(10.0f, 80.0f));
+}
+
 void test_validates_observer_coordinates_and_altitude() {
     TEST_ASSERT_TRUE(TrackingMath::validObserver(32.0, 34.8, 50.0));
     TEST_ASSERT_FALSE(TrackingMath::validObserver(91.0, 34.8, 50.0));
@@ -223,6 +243,9 @@ int main(int argc, char **argv) {
     RUN_TEST(test_chronological_event_pair_accepts_rise_before_set);
     RUN_TEST(test_chronological_event_pair_rejects_reversed_or_equal_times);
     RUN_TEST(test_chronological_event_pair_rejects_non_finite_times);
+    RUN_TEST(test_elevation_validation_accepts_mechanical_boundaries);
+    RUN_TEST(test_elevation_validation_rejects_out_of_range_and_non_finite_values);
+    RUN_TEST(test_elevation_error_is_linear_not_circular);
     RUN_TEST(test_validates_observer_coordinates_and_altitude);
     RUN_TEST(test_validates_norad_ids);
     RUN_TEST(test_accepts_only_supported_bodies);
