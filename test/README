@@ -22,3 +22,18 @@ The native suite currently contains 43 test cases covering:
 - Motor sensor math: exhaustively test all 4096 AS5600 raw readings in both calibration directions, reject invalid raw/calibration values, normalize magnetic heading with east/west declination, and verify shortest-path azimuth correction.
 
 The native tests now exercise the Astronomy Engine library directly, but do not exercise FreeRTOS scheduling, I2C peripherals, motor drivers, or live SGP4/TLE data. Those still require dedicated mocks/simulation and ESP32 hardware/bench testing.
+
+## Dashboard tests
+
+The browser-side request and telemetry flow is tested with Node's built-in test
+runner. These tests execute the JavaScript embedded in `include/web_ui.h`
+with small DOM, Leaflet, geolocation, and fetch mocks:
+
+```sh
+node --test test/test_web_ui.js
+```
+
+They cover POST + CSRF headers, target and phone-GPS payloads, failed mutation
+feedback, telemetry-only error handling, recovery after a 503, map updates,
+and the planet speed-unavailable display. This is a JavaScript behavior test,
+not a full real-browser or Wi-Fi integration test.
