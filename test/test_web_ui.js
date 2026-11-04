@@ -105,7 +105,7 @@ async function flushPromises() {
 function routeSource(path) {
   const start = firmware.indexOf(`server.on("${path}"`);
   assert.notEqual(start, -1, `route ${path} must exist`);
-  const end = firmware.indexOf("\\n  });", start);
+  const end = firmware.indexOf("\n  });", start);
   assert.notEqual(end, -1, `route ${path} must have a handler boundary`);
   return firmware.slice(start, end);
 }
@@ -114,8 +114,8 @@ test("firmware mutation endpoints require POST, authentication, and CSRF header"
   for (const endpoint of ["/set", "/updateLoc"]) {
     const route = routeSource(endpoint);
     assert.match(route, /HTTP_POST/);
-    assert.match(route, /r->authenticate\\(CONTROL_USER, CONTROL_PASSWORD\\)/);
-    assert.match(route, /hasValidMutationRequest\\(r\\)/);
+    assert.match(route, /r->authenticate\(CONTROL_USER, CONTROL_PASSWORD\)/);
+    assert.match(route, /hasValidMutationRequest\(r\)/);
     assert.ok(
       route.indexOf("r->authenticate") < route.indexOf("hasValidMutationRequest"),
       "authentication must be checked before the mutation header"
@@ -126,9 +126,9 @@ test("firmware mutation endpoints require POST, authentication, and CSRF header"
 test("firmware telemetry endpoint remains read-only GET", () => {
   const route = routeSource("/data");
   assert.match(route, /HTTP_GET/);
-  assert.match(route, /getVersionedTelemetrySnapshot\\(target, data\\)/);
-  assert.match(route, /r->send\\(503/);
-  assert.match(route, /application\\/json/);
+  assert.match(route, /getVersionedTelemetrySnapshot\(target, data\)/);
+  assert.match(route, /r->send\(503/);
+  assert.match(route, /application\/json/);
 });
 
 test("target changes use POST, form encoding, and the CSRF header", async () => {
