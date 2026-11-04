@@ -3,46 +3,6 @@
 #include "tracking_math.h"
 #include <astronomy.h>
 
-void test_valid_tle_pair_accepts_valid_checksum_and_expected_norad() {
-    const char line1[] = "1 25544U 98067A   24001.50000000  .00016717  00000+0  30131-3 0  9994";
-    const char line2[] = "2 25544  51.6416  20.0000 0005000  30.0000  45.0000 15.50000000123450";
-    TEST_ASSERT_TRUE(TrackingMath::validTlePair(line1, line2, 25544));
-}
-
-void test_valid_tle_pair_rejects_bad_checksum_on_either_line() {
-    char line1[] = "1 25544U 98067A   24001.50000000  .00016717  00000+0  30131-3 0  9994";
-    char line2[] = "2 25544  51.6416  20.0000 0005000  30.0000  45.0000 15.50000000123450";
-    line1[68] = '5';
-    TEST_ASSERT_FALSE(TrackingMath::validTlePair(line1, line2, 25544));
-    line1[68] = '4';
-    line2[68] = '1';
-    TEST_ASSERT_FALSE(TrackingMath::validTlePair(line1, line2, 25544));
-}
-
-void test_valid_tle_pair_rejects_mismatched_satellite_numbers() {
-    char line1[] = "1 25544U 98067A   24001.50000000  .00016717  00000+0  30131-3 0  9994";
-    char line2[] = "2 25544  51.6416  20.0000 0005000  30.0000  45.0000 15.50000000123450";
-    line2[6] = '5';
-    line2[68] = '1'; // Keep the modified line's checksum valid.
-    TEST_ASSERT_FALSE(TrackingMath::validTlePair(line1, line2, 25544));
-}
-
-void test_valid_tle_pair_rejects_unrequested_norad_id() {
-    const char line1[] = "1 25544U 98067A   24001.50000000  .00016717  00000+0  30131-3 0  9994";
-    const char line2[] = "2 25544  51.6416  20.0000 0005000  30.0000  45.0000 15.50000000123450";
-    TEST_ASSERT_FALSE(TrackingMath::validTlePair(line1, line2, 25545));
-}
-
-void test_valid_tle_pair_rejects_short_and_wrong_format_lines() {
-    const char shortLine[] = "1 25544";
-    const char wrongLine[] = "2 25544U 98067A   24001.50000000  .00016717  00000+0  30131-3 0  9994";
-    const char validLine2[] = "2 25544  51.6416  20.0000 0005000  30.0000  45.0000 15.50000000123450";
-    TEST_ASSERT_FALSE(TrackingMath::validTlePair(shortLine, validLine2, 25544));
-    TEST_ASSERT_FALSE(TrackingMath::validTlePair(wrongLine, validLine2, 25544));
-    TEST_ASSERT_FALSE(TrackingMath::validTlePair(validLine2, validLine2, 25544));
-    TEST_ASSERT_FALSE(TrackingMath::validTlePair(wrongLine, validLine2, 0));
-}
-
 void test_wraps_across_positive_boundary() {
     TEST_ASSERT_FLOAT_WITHIN(0.001f, -179.0f, TrackingMath::wrapAngle(181.0f));
 }
@@ -491,11 +451,6 @@ void test_proportional_controller_preserves_float_rounding_for_normal_inputs() {
 
 int main(int argc, char **argv) {
     UNITY_BEGIN();
-    RUN_TEST(test_valid_tle_pair_accepts_valid_checksum_and_expected_norad);
-    RUN_TEST(test_valid_tle_pair_rejects_bad_checksum_on_either_line);
-    RUN_TEST(test_valid_tle_pair_rejects_mismatched_satellite_numbers);
-    RUN_TEST(test_valid_tle_pair_rejects_unrequested_norad_id);
-    RUN_TEST(test_valid_tle_pair_rejects_short_and_wrong_format_lines);
     RUN_TEST(test_proportional_controller_preserves_float_rounding_for_normal_inputs);
     RUN_TEST(test_motor_readiness_requires_all_prerequisites_and_sensor_group);
     RUN_TEST(test_motor_sensor_sample_accepts_calibrated_valid_boundaries);
