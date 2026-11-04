@@ -40,3 +40,15 @@ jobs:
           node-version: 22
       - name: Test dashboard request and telemetry behavior
         run: node --test test/test_web_ui.js
+
+  native-sanitizers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Install PlatformIO
+        run: python -m pip install platformio
+      - name: Run native tests with AddressSanitizer and UBSan
+        run: pio test -e native-sanitize
