@@ -8,11 +8,12 @@ Run the tests from the repository root:
 pio test -e native
 ```
 
-The native suite currently contains 24 test cases covering:
+The native suite currently contains 26 test cases covering:
 - Angular wrapping, exact half-turn boundaries, multiple revolutions, and non-finite inputs.
 - Observer latitude, longitude, and altitude validation, including exact limits and out-of-range values.
 - NORAD ID boundaries and supported planetary-body IDs.
 - Proportional motor-step rounding, deadband behavior, correction limits, zero gain, and non-finite errors.
 - Generation-based calculation readiness: initial invalid state, exact target/observer pair matching, stale-pair rejection, explicit clearing, zero-generation rejection, and replacement of an older pair.
+- TLE source-version matching: reject an SGP4 model when either the selected target or observer-location generation changes.
 
 The native tests do not exercise FreeRTOS scheduling, I2C peripherals, motor drivers, the Astronomy Engine integration, or live SGP4/TLE data. Those still require an ESP32 build and hardware/bench testing.
