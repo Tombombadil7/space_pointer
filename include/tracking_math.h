@@ -183,13 +183,11 @@ struct ConfigurationReadiness {
     uint32_t generation = 1;
     bool tleReady = false;
     bool calculationReady = false;
-    bool telemetryReady = false;
     bool passReady = false;
 
     void clearResults() {
         tleReady = false;
         calculationReady = false;
-        telemetryReady = false;
         passReady = false;
     }
 
@@ -212,7 +210,6 @@ struct ConfigurationReadiness {
     bool publishCalculation(uint32_t candidate) {
         if (!isCurrent(candidate)) return false;
         calculationReady = true;
-        telemetryReady = true;
         return true;
     }
 
