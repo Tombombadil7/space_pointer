@@ -32,6 +32,15 @@ inline int proportionalSteps(float gain, float deadband,
     return (int)requestedSteps;
 }
 
+/*
+ * Validate that a pair of astronomical events is in chronological order.
+ * The firmware uses this after searching for a rise and then the following set.
+ */
+inline bool chronologicalEventPair(double firstEventTime, double secondEventTime) {
+    return isfinite(firstEventTime) && isfinite(secondEventTime) &&
+           secondEventTime > firstEventTime;
+}
+
 inline bool validObserver(double latitude, double longitude, double altitudeMeters) {
     return isfinite(latitude) && isfinite(longitude) && isfinite(altitudeMeters) &&
            latitude >= -90.0 && latitude <= 90.0 &&
